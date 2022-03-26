@@ -41,7 +41,7 @@ import static org.opensearch.search.aggregations.bucket.terms.TermsAggregationBu
  * Todo. MultiTermsAggregationBuilder.
  */
 public class MultiTermsAggregationBuilder extends AbstractAggregationBuilder<MultiTermsAggregationBuilder> {
-    public static final String NAME = "multi-terms";
+    public static final String NAME = "multi_terms";
     public static final ObjectParser<MultiTermsAggregationBuilder, String> PARSER = ObjectParser.fromBuilder(
         NAME,
         MultiTermsAggregationBuilder::new
