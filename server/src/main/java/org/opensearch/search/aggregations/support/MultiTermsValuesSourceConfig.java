@@ -39,6 +39,7 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
     private final ZoneId timeZone;
     private final ValueType userValueTypeHint;
     private final String format;
+    private final IncludeExclude includeExclude;
 
     private static final String NAME = "field_config";
     public static final ParseField FILTER = new ParseField("filter");
@@ -108,6 +109,13 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
             );
         }
 
+        parser.declareField(
+            (b, v) -> b.setIncludeExclude(IncludeExclude.merge(b.getIncludeExclude(), v)),
+            IncludeExclude::parseExclude,
+            IncludeExclude.EXCLUDE_FIELD,
+            ObjectParser.ValueType.STRING_ARRAY
+        );
+
         return parser;
     };
 
@@ -117,7 +125,8 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         Script script,
         ZoneId timeZone,
         ValueType userValueTypeHint,
-        String format
+        String format,
+        IncludeExclude includeExclude
     ) {
         this.fieldName = fieldName;
         this.missing = missing;
@@ -125,6 +134,7 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         this.timeZone = timeZone;
         this.userValueTypeHint = userValueTypeHint;
         this.format = format;
+        this.includeExclude = includeExclude;
     }
 
     public MultiTermsValuesSourceConfig(StreamInput in) throws IOException {
@@ -134,6 +144,7 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         this.timeZone = in.readOptionalZoneId();
         this.userValueTypeHint = in.readOptionalWriteable(ValueType::readFromStream);
         this.format = in.readOptionalString();
+        this.includeExclude = in.readOptionalWriteable(IncludeExclude::new);
     }
 
     public Object getMissing() {
@@ -160,6 +171,13 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         return format;
     }
 
+    /**
+     * Get terms to include and exclude from the aggregation results
+     */
+    public IncludeExclude getIncludeExclude() {
+        return includeExclude;
+    }
+
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeOptionalString(fieldName);
@@ -168,6 +186,7 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         out.writeOptionalZoneId(timeZone);
         out.writeOptionalWriteable(userValueTypeHint);
         out.writeOptionalString(format);
+        out.writeOptionalWriteable(includeExclude);
     }
 
     @Override
@@ -191,6 +210,9 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         if (format != null) {
             builder.field(AggregationBuilder.CommonFields.FORMAT.getPreferredName(), format);
         }
+        if (includeExclude != null) {
+            includeExclude.toXContent(builder, params);
+        }
         builder.endObject();
         return builder;
     }
@@ -205,12 +227,13 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
             && Objects.equals(script, that.script)
             && Objects.equals(timeZone, that.timeZone)
             && Objects.equals(userValueTypeHint, that.userValueTypeHint)
-            && Objects.equals(format, that.format);
+            && Objects.equals(format, that.format)
+            && Objects.equals(includeExclude, that.includeExclude);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(fieldName, missing, script, timeZone, userValueTypeHint, format);
+        return Objects.hash(fieldName, missing, script, timeZone, userValueTypeHint, format, includeExclude);
     }
 
     @Override
@@ -225,7 +248,16 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         private ZoneId timeZone = null;
         private ValueType userValueTypeHint = null;
         private String format;
-        private IncludeExclude includeExclude;
+        private IncludeExclude includeExclude = null;
+
+        public IncludeExclude getIncludeExclude() {
+            return includeExclude;
+        }
+
+        public MultiTermsValuesSourceConfig.Builder setIncludeExclude(IncludeExclude includeExclude) {
+            this.includeExclude = includeExclude;
+            return this;
+        }
 
         public String getFieldName() {
             return fieldName;
@@ -292,7 +324,7 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
                         + "Please specify one or the other."
                 );
             }
-            return new MultiTermsValuesSourceConfig(fieldName, missing, script, timeZone, userValueTypeHint, format);
+            return new MultiTermsValuesSourceConfig(fieldName, missing, script, timeZone, userValueTypeHint, format, includeExclude);
         }
     }
 }

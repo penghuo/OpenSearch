@@ -23,6 +23,7 @@ import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.automaton.RegExp;
 import org.hamcrest.MatcherAssert;
 import org.opensearch.common.CheckedConsumer;
 import org.opensearch.common.network.InetAddresses;
@@ -828,6 +829,43 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
             assertEquals(1, h.getBuckets().size());
             assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
             assertEquals(2, h.getBuckets().get(0).getDocCount());
+        });
+    }
+
+    public void testIncludeExclude() throws IOException {
+        testAggregation(new MatchAllDocsQuery(),
+            asList(new MultiTermsValuesSourceConfig.Builder()
+                    .setFieldName(KEYWORD_FIELD).setIncludeExclude(new IncludeExclude(new RegExp("a"), null)).build(),
+                term(INT_FIELD)), NONE_DECORATOR,
+            iw -> {
+            iw.addDocument(
+                asList(
+                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+                    new NumericDocValuesField(INT_FIELD, 1)
+                )
+            );
+            iw.addDocument(
+                asList(
+                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+                    new NumericDocValuesField(INT_FIELD, 1)
+                )
+            );
+            iw.addDocument(
+                asList(
+                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+                    new NumericDocValuesField(INT_FIELD, 1)
+                )
+            );
+            iw.addDocument(
+                asList(
+                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+                    new NumericDocValuesField(INT_FIELD, 2)
+                )
+            );
+        }, h -> {
+            assertThat(h.getBuckets(), hasSize(1));
+            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
+            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
         });
     }
 

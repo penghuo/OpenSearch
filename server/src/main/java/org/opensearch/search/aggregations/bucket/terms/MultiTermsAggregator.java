@@ -12,8 +12,11 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefBuilder;
+import org.apache.lucene.util.NumericUtils;
 import org.apache.lucene.util.PriorityQueue;
 import org.opensearch.ExceptionsHelper;
+import org.opensearch.common.CheckedFunction;
+import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.bytes.BytesArray;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.io.stream.StreamInput;
@@ -30,6 +33,7 @@ import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.LeafBucketCollector;
 import org.opensearch.search.aggregations.bucket.DeferableBucketAggregator;
+import org.opensearch.search.aggregations.support.AggregationPath;
 import org.opensearch.search.aggregations.support.ValuesSource;
 import org.opensearch.search.internal.SearchContext;
 
@@ -38,10 +42,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
+import static org.opensearch.search.aggregations.bucket.terms.TermsAggregator.descendsFromNestedAggregator;
 
 /**
  * An aggregator that aggregate with multi-terms.
@@ -55,6 +62,8 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
     private final TermsAggregator.BucketCountThresholds bucketCountThresholds;
     private final BucketOrder order;
     private final Comparator<InternalMultiTerms.Bucket> partiallyBuiltBucketComparator;
+    private final SubAggCollectionMode collectMode;
+    private final Set<Aggregator> aggsUsedForSorting = new HashSet<>();
 
     public MultiTermsAggregator(
         String name,
@@ -63,6 +72,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         MultiTermsValuesSource multiTermsValue,
         List<DocValueFormat> formats,
         BucketOrder order,
+        SubAggCollectionMode collectMode,
         TermsAggregator.BucketCountThresholds bucketCountThresholds,
         SearchContext context,
         Aggregator parent,
@@ -77,6 +87,30 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         this.bucketCountThresholds = bucketCountThresholds;
         this.order = order;
         this.partiallyBuiltBucketComparator = order == null ? null : order.partiallyBuiltBucketComparator(b -> b.bucketOrd, this);
+        // Todo, copy from TermsAggregator. need to remove duplicate code.
+        if (subAggsNeedScore() && descendsFromNestedAggregator(parent)) {
+            /**
+             * Force the execution to depth_first because we need to access the score of
+             * nested documents in a sub-aggregation and we are not able to generate this score
+             * while replaying deferred documents.
+             */
+            this.collectMode = SubAggCollectionMode.DEPTH_FIRST;
+        } else {
+            this.collectMode = collectMode;
+        }
+        // Don't defer any child agg if we are dependent on it for pruning results
+        if (order instanceof InternalOrder.Aggregation) {
+            AggregationPath path = ((InternalOrder.Aggregation) order).path();
+            aggsUsedForSorting.add(path.resolveTopmostAggregator(this));
+        } else if (order instanceof InternalOrder.CompoundOrder) {
+            InternalOrder.CompoundOrder compoundOrder = (InternalOrder.CompoundOrder) order;
+            for (BucketOrder orderElement : compoundOrder.orderElements()) {
+                if (orderElement instanceof InternalOrder.Aggregation) {
+                    AggregationPath path = ((InternalOrder.Aggregation) orderElement).path();
+                    aggsUsedForSorting.add(path.resolveTopmostAggregator(this));
+                }
+            }
+        }
     }
 
     @Override
@@ -85,7 +119,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         long[] otherDocCounts = new long[owningBucketOrds.length];
         for (int ordIdx = 0; ordIdx < owningBucketOrds.length; ordIdx++) {
             // todo, what is it?
-            // collectZeroDocEntriesIfNeeded(owningBucketOrds[ordIdx]);
+//             collectZeroDocEntriesIfNeeded(owningBucketOrds[ordIdx]);
             long bucketsInOrd = bucketOrds.bucketsInOrd(owningBucketOrds[ordIdx]);
 
             int size = (int) Math.min(bucketsInOrd, bucketCountThresholds.getShardSize());
@@ -93,7 +127,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
             InternalMultiTerms.Bucket spare = null;
             BytesRef dest = null;
             BytesKeyedBucketOrds.BucketOrdsEnum ordsEnum = bucketOrds.ordsEnum(owningBucketOrds[ordIdx]);
-            Supplier<InternalMultiTerms.Bucket> emptyBucketBuilder = () -> InternalMultiTerms.Bucket.EMPTY(formats);
+            CheckedSupplier<InternalMultiTerms.Bucket, IOException> emptyBucketBuilder = () -> InternalMultiTerms.Bucket.EMPTY(formats);
             while (ordsEnum.next()) {
                 long docCount = bucketDocCount(ordsEnum.ord());
                 otherDocCounts[ordIdx] += docCount;
@@ -201,6 +235,20 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         }
     }
 
+    private boolean subAggsNeedScore() {
+        for (Aggregator subAgg : subAggregators) {
+            if (subAgg.scoreMode().needsScores()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    protected boolean shouldDefer(Aggregator aggregator) {
+        return collectMode == Aggregator.SubAggCollectionMode.BREADTH_FIRST && !aggsUsedForSorting.contains(aggregator);
+    }
+
     /**
      * A collection of {@link InternalValuesSource}
      */
@@ -213,7 +261,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         }
 
         public MultiTermsValuesSourceCollector getValues(LeafReaderContext ctx) throws IOException {
-            List<InternalValuesSourceCollectors> collectors = new ArrayList<>();
+            List<CheckedFunction<Integer, List<Object>, IOException>> collectors = new ArrayList<>();
             for (InternalValuesSource valuesSource : valuesSources) {
                 collectors.add(valuesSource.apply(ctx));
             }
@@ -222,9 +270,9 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
     }
 
     public static class MultiTermsValuesSourceCollector {
-        private final List<InternalValuesSourceCollectors> collectors;
+        private final List<CheckedFunction<Integer, List<Object>, IOException>> collectors;
 
-        public MultiTermsValuesSourceCollector(List<InternalValuesSourceCollectors> collectors) {
+        public MultiTermsValuesSourceCollector(List<CheckedFunction<Integer, List<Object>, IOException>> collectors) {
             this.collectors = collectors;
         }
 
@@ -232,8 +280,8 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
          * Cartesian product of values of each {@link InternalValuesSource}.
          */
         public List<List<Object>> collect(int doc) throws IOException {
-            List<Supplier<List<Object>>> collectedValues = new ArrayList<>();
-            for (InternalValuesSourceCollectors collector : collectors) {
+            List<CheckedSupplier<List<Object>, IOException>> collectedValues = new ArrayList<>();
+            for (CheckedFunction<Integer, List<Object>, IOException> collector : collectors) {
                 collectedValues.add(() -> collector.apply(doc));
             }
             List<List<Object>> ret = new ArrayList<>();
@@ -241,7 +289,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
             return ret;
         }
 
-        public void dfs(int index, List<Supplier<List<Object>>> collectedValues, List<Object> current, List<List<Object>> values)
+        public void dfs(int index, List<CheckedSupplier<List<Object>, IOException>> collectedValues, List<Object> current, List<List<Object>> values)
             throws IOException {
             if (index == collectedValues.size()) {
                 values.add(org.opensearch.common.collect.List.copyOf(current));
@@ -259,26 +307,20 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
      * An adapter of {@link ValuesSource}.
      */
     public interface InternalValuesSource {
-        InternalValuesSourceCollectors apply(LeafReaderContext ctx) throws IOException;
-    }
-
-    public interface InternalValuesSourceCollectors {
-        List<Object> apply(int doc) throws IOException;
-    }
-
-    private interface Supplier<T> {
-        T get() throws IOException;
+        CheckedFunction<Integer, List<Object>, IOException> apply(LeafReaderContext ctx) throws IOException;
     }
 
     public static class BytesInternalValuesSource implements InternalValuesSource {
         private final ValuesSource valuesSource;
+        private final IncludeExclude.StringFilter includeExclude;
 
-        public BytesInternalValuesSource(ValuesSource valuesSource) {
+        public BytesInternalValuesSource(ValuesSource valuesSource, IncludeExclude.StringFilter includeExclude) {
             this.valuesSource = valuesSource;
+            this.includeExclude = includeExclude;
         }
 
         @Override
-        public InternalValuesSourceCollectors apply(LeafReaderContext ctx) throws IOException {
+        public CheckedFunction<Integer, List<Object>, IOException> apply(LeafReaderContext ctx) throws IOException {
             SortedBinaryDocValues values = valuesSource.bytesValues(ctx);
             return doc -> {
                 BytesRefBuilder previous = new BytesRefBuilder();
@@ -294,6 +336,9 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
                 previous.clear();
                 for (int i = 0; i < valuesCount; ++i) {
                     BytesRef bytes = values.nextValue();
+                    if (includeExclude != null && false == includeExclude.accept(bytes)) {
+                        continue;
+                    }
                     if (i > 0 && previous.get().equals(bytes)) {
                         continue;
                     }
@@ -307,24 +352,29 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
 
     public static class LongInternalValuesSource implements InternalValuesSource {
         private final ValuesSource.Numeric valuesSource;
+        private final IncludeExclude.LongFilter longFilter;
 
-        public LongInternalValuesSource(ValuesSource.Numeric valuesSource) {
+        public LongInternalValuesSource(ValuesSource.Numeric valuesSource, IncludeExclude.LongFilter longFilter) {
             this.valuesSource = valuesSource;
+            this.longFilter = longFilter;
         }
 
         @Override
-        public InternalValuesSourceCollectors apply(LeafReaderContext ctx) throws IOException {
+        public CheckedFunction<Integer, List<Object>, IOException> apply(LeafReaderContext ctx) throws IOException {
             SortedNumericDocValues values = valuesSource.longValues(ctx);
             return doc -> {
                 if (values.advanceExact(doc)) {
                     int valuesCount = values.docValueCount();
-                    List<Object> termValues = new ArrayList<>(valuesCount);
+
                     long previous = Long.MAX_VALUE;
+                    List<Object> termValues = new ArrayList<>(valuesCount);
                     for (int i = 0; i < valuesCount; ++i) {
                         long val = values.nextValue();
                         if (previous != val || i == 0) {
+                            if (longFilter == null || longFilter.accept(val)) {
+                                termValues.add(val);
+                            }
                             previous = val;
-                            termValues.add(val);
                         }
                     }
                     return termValues;
@@ -336,24 +386,29 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
 
     public static class DoubleInternalValuesSource implements InternalValuesSource {
         private final ValuesSource.Numeric valuesSource;
+        private final IncludeExclude.LongFilter longFilter;
 
-        public DoubleInternalValuesSource(ValuesSource.Numeric valuesSource) {
+        public DoubleInternalValuesSource(ValuesSource.Numeric valuesSource, IncludeExclude.LongFilter longFilter) {
             this.valuesSource = valuesSource;
+            this.longFilter = longFilter;
         }
 
         @Override
-        public InternalValuesSourceCollectors apply(LeafReaderContext ctx) throws IOException {
+        public CheckedFunction<Integer, List<Object>, IOException> apply(LeafReaderContext ctx) throws IOException {
             SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
             return doc -> {
                 if (values.advanceExact(doc)) {
                     int valuesCount = values.docValueCount();
-                    List<Object> termValues = new ArrayList<>(valuesCount);
+
                     double previous = Double.MAX_VALUE;
+                    List<Object> termValues = new ArrayList<>(valuesCount);
                     for (int i = 0; i < valuesCount; ++i) {
                         double val = values.nextValue();
                         if (previous != val || i == 0) {
+                            if (longFilter == null || longFilter.accept(NumericUtils.doubleToSortableLong(val))) {
+                                termValues.add(val);
+                            }
                             previous = val;
-                            termValues.add(val);
                         }
                     }
                     return termValues;

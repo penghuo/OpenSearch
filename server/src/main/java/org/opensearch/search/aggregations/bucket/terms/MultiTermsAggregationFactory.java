@@ -8,6 +8,7 @@
 
 package org.opensearch.search.aggregations.bucket.terms;
 
+import org.opensearch.common.collect.Tuple;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
@@ -17,7 +18,11 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.CardinalityUpperBound;
 import org.opensearch.search.aggregations.InternalOrder;
 import org.opensearch.search.aggregations.bucket.BucketUtils;
+import org.opensearch.search.aggregations.support.CoreValuesSourceType;
+import org.opensearch.search.aggregations.support.MultiTermsValuesSourceConfig;
+import org.opensearch.search.aggregations.support.ValuesSource;
 import org.opensearch.search.aggregations.support.ValuesSourceConfig;
+import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
 import org.opensearch.search.internal.SearchContext;
 
 import java.io.IOException;
@@ -32,15 +37,62 @@ import static org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregat
  */
 public class MultiTermsAggregationFactory extends AggregatorFactory {
 
-    private final List<ValuesSourceConfig> configs;
+    private final List<Tuple<ValuesSourceConfig, IncludeExclude>> configs;
     private final List<DocValueFormat> formats;
-
     /**
      * Fields inherent from Terms Aggregation Factory.
      */
     private final BucketOrder order;
+    private final Aggregator.SubAggCollectionMode collectMode;
     private final TermsAggregator.BucketCountThresholds bucketCountThresholds;
     private final boolean showTermDocCountError;
+
+    public static void registerAggregators(ValuesSourceRegistry.Builder builder) {
+        builder.register(
+            REGISTRY_KEY,
+            org.opensearch.common.collect.List.of(CoreValuesSourceType.BYTES, CoreValuesSourceType.IP),
+            config -> {
+                final IncludeExclude.StringFilter filter = config.v2() == null ? null : config.v2().convertToStringFilter(config.v1()
+                    .format());
+                return new MultiTermsAggregator.BytesInternalValuesSource(config.v1().getValuesSource(), filter);
+            },
+            true
+        );
+
+        builder.register(REGISTRY_KEY, org.opensearch.common.collect.List.of(CoreValuesSourceType.NUMERIC), config -> {
+            ValuesSourceConfig valuesSourceConfig = config.v1();
+            IncludeExclude includeExclude = config.v2();
+            ValuesSource.Numeric valuesSource = ((ValuesSource.Numeric) valuesSourceConfig.getValuesSource());
+            IncludeExclude.LongFilter longFilter = null;
+            if (valuesSource.isFloatingPoint()) {
+                if (includeExclude != null) {
+                    longFilter = includeExclude.convertToDoubleFilter();
+                }
+                return new MultiTermsAggregator.DoubleInternalValuesSource(valuesSource, longFilter);
+            } else {
+                if (includeExclude != null) {
+                    longFilter = includeExclude.convertToLongFilter(valuesSourceConfig.format());
+                }
+                return new MultiTermsAggregator.LongInternalValuesSource(valuesSource, longFilter);
+            }
+        }, true);
+
+        builder.register(
+            REGISTRY_KEY,
+            org.opensearch.common.collect.List.of(CoreValuesSourceType.BOOLEAN, CoreValuesSourceType.DATE),
+            config -> {
+                ValuesSourceConfig valuesSourceConfig = config.v1();
+                IncludeExclude includeExclude = config.v2();
+                ValuesSource.Numeric valuesSource = ((ValuesSource.Numeric) valuesSourceConfig.getValuesSource());
+                IncludeExclude.LongFilter longFilter = includeExclude == null ? null :
+                    includeExclude.convertToLongFilter(valuesSourceConfig.format());
+                return new MultiTermsAggregator.LongInternalValuesSource(valuesSource, longFilter);
+            },
+            true
+        );
+
+        builder.registerUsage(MultiTermsAggregationBuilder.NAME);
+    }
 
     public MultiTermsAggregationFactory(
         String name,
@@ -48,16 +100,31 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
         AggregatorFactory parent,
         AggregatorFactories.Builder subFactoriesBuilder,
         Map<String, Object> metadata,
-        List<ValuesSourceConfig> configs,
-        List<DocValueFormat> formats,
+        List<MultiTermsValuesSourceConfig> multiTermConfigs,
         BucketOrder order,
+        Aggregator.SubAggCollectionMode collectMode,
         TermsAggregator.BucketCountThresholds bucketCountThresholds,
         boolean showTermDocCountError
     ) throws IOException {
         super(name, queryShardContext, parent, subFactoriesBuilder, metadata);
-        this.configs = configs;
-        this.formats = formats;
+        this.configs = multiTermConfigs.stream()
+            .map(
+                c -> new Tuple<ValuesSourceConfig, IncludeExclude>(ValuesSourceConfig.resolveUnregistered(
+                    queryShardContext,
+                    c.getUserValueTypeHint(),
+                    c.getFieldName(),
+                    c.getScript(),
+                    c.getMissing(),
+                    c.getTimeZone(),
+                    c.getFormat(),
+                    CoreValuesSourceType.BYTES),
+                    c.getIncludeExclude()
+                )
+            )
+            .collect(Collectors.toList());
+        this.formats = this.configs.stream().map(c -> c.v1().format()).collect(Collectors.toList());
         this.order = order;
+        this.collectMode = collectMode;
         this.bucketCountThresholds = bucketCountThresholds;
         this.showTermDocCountError = showTermDocCountError;
     }
@@ -84,11 +151,12 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
             showTermDocCountError,
             new MultiTermsAggregator.MultiTermsValuesSource(
                 configs.stream()
-                    .map(config -> queryShardContext.getValuesSourceRegistry().getAggregator(REGISTRY_KEY, config).build(config))
+                    .map(config -> queryShardContext.getValuesSourceRegistry().getAggregator(REGISTRY_KEY, config.v1()).build(config))
                     .collect(Collectors.toList())
             ),
-            configs.stream().map(ValuesSourceConfig::format).collect(Collectors.toList()),
+            configs.stream().map(c -> c.v1().format()).collect(Collectors.toList()),
             order,
+            collectMode,
             bucketCountThresholds,
             searchContext,
             parent,
@@ -98,6 +166,6 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
     }
 
     public interface InternalValuesSourceSupplier {
-        MultiTermsAggregator.InternalValuesSource build(ValuesSourceConfig valuesSourceConfig);
+        MultiTermsAggregator.InternalValuesSource build(Tuple<ValuesSourceConfig, IncludeExclude> config);
     }
 }

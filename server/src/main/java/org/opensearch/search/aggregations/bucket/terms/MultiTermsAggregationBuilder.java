@@ -95,34 +95,6 @@ public class MultiTermsAggregationBuilder extends AbstractAggregationBuilder<Mul
             MultiTermsAggregationFactory.InternalValuesSourceSupplier.class
         );
 
-    public static void registerAggregators(ValuesSourceRegistry.Builder builder) {
-        builder.register(
-            REGISTRY_KEY,
-            org.opensearch.common.collect.List.of(CoreValuesSourceType.BYTES, CoreValuesSourceType.IP),
-            config -> new MultiTermsAggregator.BytesInternalValuesSource(config.getValuesSource()),
-            true
-        );
-
-        builder.register(REGISTRY_KEY, org.opensearch.common.collect.List.of(CoreValuesSourceType.NUMERIC), config -> {
-            ValuesSource.Numeric valuesSource = ((ValuesSource.Numeric) config.getValuesSource());
-            return valuesSource.isFloatingPoint()
-                ? new MultiTermsAggregator.DoubleInternalValuesSource(valuesSource)
-                : new MultiTermsAggregator.LongInternalValuesSource(valuesSource);
-        }, true);
-
-        builder.register(
-            REGISTRY_KEY,
-            org.opensearch.common.collect.List.of(CoreValuesSourceType.BOOLEAN, CoreValuesSourceType.DATE),
-            config -> {
-                ValuesSource.Numeric valuesSource = ((ValuesSource.Numeric) config.getValuesSource());
-                return new MultiTermsAggregator.LongInternalValuesSource(valuesSource);
-            },
-            true
-        );
-
-        builder.registerUsage(NAME);
-    }
-
     private List<MultiTermsValuesSourceConfig> terms;
 
     private BucketOrder order = BucketOrder.compound(BucketOrder.count(false)); // automatically adds tie-breaker key asc order
@@ -182,29 +154,15 @@ public class MultiTermsAggregationBuilder extends AbstractAggregationBuilder<Mul
         AggregatorFactory parent,
         AggregatorFactories.Builder subfactoriesBuilder
     ) throws IOException {
-        List<ValuesSourceConfig> configs = terms.stream()
-            .map(
-                f -> ValuesSourceConfig.resolveUnregistered(
-                    queryShardContext,
-                    f.getUserValueTypeHint(),
-                    f.getFieldName(),
-                    f.getScript(),
-                    f.getMissing(),
-                    f.getTimeZone(),
-                    f.getFormat(),
-                    CoreValuesSourceType.BYTES
-                )
-            )
-            .collect(Collectors.toList());
         return new MultiTermsAggregationFactory(
             name,
             queryShardContext,
             parent,
             subfactoriesBuilder,
             metadata,
-            configs,
-            configs.stream().map(ValuesSourceConfig::format).collect(Collectors.toList()),
+            terms,
             order,
+            collectMode,
             bucketCountThresholds,
             showTermDocCountError
         );
