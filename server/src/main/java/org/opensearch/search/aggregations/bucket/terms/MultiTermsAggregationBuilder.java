@@ -64,7 +64,6 @@ public class MultiTermsAggregationBuilder extends AbstractAggregationBuilder<Mul
         final ObjectParser<MultiTermsValuesSourceConfig.Builder, Void> parser = MultiTermsValuesSourceConfig.PARSER.apply(
             true,
             true,
-            false,
             true,
             true
         );

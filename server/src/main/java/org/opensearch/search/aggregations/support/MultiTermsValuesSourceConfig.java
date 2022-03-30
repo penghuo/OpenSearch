@@ -8,22 +8,18 @@
 
 package org.opensearch.search.aggregations.support;
 
-import org.opensearch.LegacyESVersion;
-import org.opensearch.Version;
 import org.opensearch.common.ParseField;
 import org.opensearch.common.Strings;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.StreamOutput;
 import org.opensearch.common.io.stream.Writeable;
-import org.opensearch.common.time.DateUtils;
 import org.opensearch.common.xcontent.ObjectParser;
 import org.opensearch.common.xcontent.ToXContentObject;
 import org.opensearch.common.xcontent.XContentBuilder;
 import org.opensearch.common.xcontent.XContentParser;
-import org.opensearch.index.query.AbstractQueryBuilder;
-import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.script.Script;
 import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.bucket.terms.IncludeExclude;
 
 import java.io.IOException;
 import java.time.ZoneId;
@@ -33,14 +29,14 @@ import java.util.Objects;
 /**
  * A configuration that tells multi-terms aggregations how to retrieve data from index
  * in order to run a specific aggregation.
+ *
+ * Similar with {@link MultiValuesSourceFieldConfig}, but support value script.
  */
 public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject {
     private final String fieldName;
     private final Object missing;
     private final Script script;
     private final ZoneId timeZone;
-    private final QueryBuilder filter;
-
     private final ValueType userValueTypeHint;
     private final String format;
 
@@ -51,7 +47,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         ObjectParser<MultiTermsValuesSourceConfig.Builder, Void> apply(
             Boolean scriptable,
             Boolean timezoneAware,
-            Boolean filtered,
             Boolean valueTypeHinted,
             Boolean formatted
         );
@@ -60,7 +55,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
     public static final MultiTermsValuesSourceConfig.ParserSupplier PARSER = (
         scriptable,
         timezoneAware,
-        filtered,
         valueTypeHinted,
         formatted) -> {
 
@@ -96,15 +90,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
             }, ParseField.CommonFields.TIME_ZONE, ObjectParser.ValueType.LONG);
         }
 
-        if (filtered) {
-            parser.declareField(
-                MultiTermsValuesSourceConfig.Builder::setFilter,
-                (p, context) -> AbstractQueryBuilder.parseInnerQueryBuilder(p),
-                FILTER,
-                ObjectParser.ValueType.OBJECT
-            );
-        }
-
         if (valueTypeHinted) {
             parser.declareField(
                 MultiTermsValuesSourceConfig.Builder::setUserValueTypeHint,
@@ -131,7 +116,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         Object missing,
         Script script,
         ZoneId timeZone,
-        QueryBuilder filter,
         ValueType userValueTypeHint,
         String format
     ) {
@@ -139,36 +123,17 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         this.missing = missing;
         this.script = script;
         this.timeZone = timeZone;
-        this.filter = filter;
         this.userValueTypeHint = userValueTypeHint;
         this.format = format;
     }
 
     public MultiTermsValuesSourceConfig(StreamInput in) throws IOException {
-        if (in.getVersion().onOrAfter(LegacyESVersion.V_7_6_0)) {
-            this.fieldName = in.readOptionalString();
-        } else {
-            this.fieldName = in.readString();
-        }
+        this.fieldName = in.readOptionalString();
         this.missing = in.readGenericValue();
         this.script = in.readOptionalWriteable(Script::new);
-        if (in.getVersion().before(LegacyESVersion.V_7_0_0)) {
-            this.timeZone = DateUtils.dateTimeZoneToZoneId(in.readOptionalTimeZone());
-        } else {
-            this.timeZone = in.readOptionalZoneId();
-        }
-        if (in.getVersion().onOrAfter(LegacyESVersion.V_7_8_0)) {
-            this.filter = in.readOptionalNamedWriteable(QueryBuilder.class);
-        } else {
-            this.filter = null;
-        }
-        if (in.getVersion().onOrAfter(Version.V_2_0_0)) {
-            this.userValueTypeHint = in.readOptionalWriteable(ValueType::readFromStream);
-            this.format = in.readOptionalString();
-        } else {
-            this.userValueTypeHint = null;
-            this.format = null;
-        }
+        this.timeZone = in.readOptionalZoneId();
+        this.userValueTypeHint = in.readOptionalWriteable(ValueType::readFromStream);
+        this.format = in.readOptionalString();
     }
 
     public Object getMissing() {
@@ -187,10 +152,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         return fieldName;
     }
 
-    public QueryBuilder getFilter() {
-        return filter;
-    }
-
     public ValueType getUserValueTypeHint() {
         return userValueTypeHint;
     }
@@ -201,25 +162,12 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
-        if (out.getVersion().onOrAfter(LegacyESVersion.V_7_6_0)) {
-            out.writeOptionalString(fieldName);
-        } else {
-            out.writeString(fieldName);
-        }
+        out.writeOptionalString(fieldName);
         out.writeGenericValue(missing);
         out.writeOptionalWriteable(script);
-        if (out.getVersion().before(LegacyESVersion.V_7_0_0)) {
-            out.writeOptionalTimeZone(DateUtils.zoneIdToDateTimeZone(timeZone));
-        } else {
-            out.writeOptionalZoneId(timeZone);
-        }
-        if (out.getVersion().onOrAfter(LegacyESVersion.V_7_8_0)) {
-            out.writeOptionalNamedWriteable(filter);
-        }
-        if (out.getVersion().onOrAfter(Version.V_2_0_0)) {
-            out.writeOptionalWriteable(userValueTypeHint);
-            out.writeOptionalString(format);
-        }
+        out.writeOptionalZoneId(timeZone);
+        out.writeOptionalWriteable(userValueTypeHint);
+        out.writeOptionalString(format);
     }
 
     @Override
@@ -236,10 +184,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         }
         if (timeZone != null) {
             builder.field(ParseField.CommonFields.TIME_ZONE.getPreferredName(), timeZone.getId());
-        }
-        if (filter != null) {
-            builder.field(FILTER.getPreferredName());
-            filter.toXContent(builder, params);
         }
         if (userValueTypeHint != null) {
             builder.field(AggregationBuilder.CommonFields.VALUE_TYPE.getPreferredName(), userValueTypeHint.getPreferredName());
@@ -260,14 +204,13 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
             && Objects.equals(missing, that.missing)
             && Objects.equals(script, that.script)
             && Objects.equals(timeZone, that.timeZone)
-            && Objects.equals(filter, that.filter)
             && Objects.equals(userValueTypeHint, that.userValueTypeHint)
             && Objects.equals(format, that.format);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(fieldName, missing, script, timeZone, filter, userValueTypeHint, format);
+        return Objects.hash(fieldName, missing, script, timeZone, userValueTypeHint, format);
     }
 
     @Override
@@ -280,9 +223,9 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
         private Object missing = null;
         private Script script = null;
         private ZoneId timeZone = null;
-        private QueryBuilder filter = null;
         private ValueType userValueTypeHint = null;
         private String format;
+        private IncludeExclude includeExclude;
 
         public String getFieldName() {
             return fieldName;
@@ -320,11 +263,6 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
             return this;
         }
 
-        public MultiTermsValuesSourceConfig.Builder setFilter(QueryBuilder filter) {
-            this.filter = filter;
-            return this;
-        }
-
         public ValueType getUserValueTypeHint() {
             return userValueTypeHint;
         }
@@ -354,7 +292,7 @@ public class MultiTermsValuesSourceConfig implements Writeable, ToXContentObject
                         + "Please specify one or the other."
                 );
             }
-            return new MultiTermsValuesSourceConfig(fieldName, missing, script, timeZone, filter, userValueTypeHint, format);
+            return new MultiTermsValuesSourceConfig(fieldName, missing, script, timeZone, userValueTypeHint, format);
         }
     }
 }
