@@ -19,6 +19,7 @@ import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.bytes.BytesArray;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.io.stream.NamedWriteable;
 import org.opensearch.common.io.stream.StreamInput;
 import org.opensearch.common.io.stream.StreamOutput;
 import org.opensearch.common.lease.Releasables;
@@ -46,6 +47,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
 import static org.opensearch.search.aggregations.bucket.terms.TermsAggregator.descendsFromNestedAggregator;
@@ -141,7 +144,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
 
                 ordsEnum.readValue(dest);
 
-                spare.termValues = decode(dest);
+                spare.termValues = dest;
                 spare.docCount = docCount;
                 spare.bucketOrd = ordsEnum.ord();
                 spare = ordered.insertWithOverflow(spare);
@@ -196,12 +199,12 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
 
     @Override
     protected LeafBucketCollector getLeafCollector(LeafReaderContext ctx, LeafBucketCollector sub) throws IOException {
-        MultiTermsValuesSourceCollector collector = multiTermsValue.getValues(ctx);
+        CheckedFunction<Integer, List<BytesRef>, IOException> collector = multiTermsValue.getValues(ctx);
         return new LeafBucketCollector() {
             @Override
             public void collect(int doc, long owningBucketOrd) throws IOException {
-                for (List<Object> value : collector.collect(doc)) {
-                    long bucketOrd = bucketOrds.add(owningBucketOrd, encode(value));
+                for (BytesRef value : collector.apply(doc)) {
+                    long bucketOrd = bucketOrds.add(owningBucketOrd, value);
                     if (bucketOrd < 0) {
                         bucketOrd = -1 - bucketOrd;
                         collectExistingBucket(sub, doc, bucketOrd);
@@ -218,22 +221,22 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         Releasables.close(bucketOrds);
     }
 
-    private static BytesRef encode(List<Object> values) {
-        try (BytesStreamOutput output = new BytesStreamOutput()) {
-            output.writeCollection(values, StreamOutput::writeGenericValue);
-            return output.bytes().toBytesRef();
-        } catch (IOException e) {
-            throw ExceptionsHelper.convertToRuntime(e);
-        }
-    }
-
-    private static List<Object> decode(BytesRef bytesRef) {
-        try (StreamInput input = new BytesArray(bytesRef).streamInput()) {
-            return input.readList(StreamInput::readGenericValue);
-        } catch (IOException e) {
-            throw ExceptionsHelper.convertToRuntime(e);
-        }
-    }
+//    private static BytesRef encode(List<Object> values) {
+//        try (BytesStreamOutput output = new BytesStreamOutput()) {
+//            output.writeCollection(values, StreamOutput::writeGenericValue);
+//            return output.bytes().toBytesRef();
+//        } catch (IOException e) {
+//            throw ExceptionsHelper.convertToRuntime(e);
+//        }
+//    }
+//
+//    private static List<Object> decode(BytesRef bytesRef) {
+//        try (StreamInput input = new BytesArray(bytesRef).streamInput()) {
+//            return input.readList(StreamInput::readGenericValue);
+//        } catch (IOException e) {
+//            throw ExceptionsHelper.convertToRuntime(e);
+//        }
+//    }
 
     private boolean subAggsNeedScore() {
         for (Aggregator subAgg : subAggregators) {
@@ -255,51 +258,47 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
     public static class MultiTermsValuesSource {
 
         private final List<InternalValuesSource> valuesSources;
+        private final List<DocValueFormat> formats;
 
-        public MultiTermsValuesSource(List<InternalValuesSource> valuesSources) {
+        public MultiTermsValuesSource(List<InternalValuesSource> valuesSources, List<DocValueFormat> formats) {
             this.valuesSources = valuesSources;
+            this.formats = formats;
         }
 
-        public MultiTermsValuesSourceCollector getValues(LeafReaderContext ctx) throws IOException {
+        public CheckedFunction<Integer, List<BytesRef>, IOException> getValues(LeafReaderContext ctx) throws IOException {
             List<CheckedFunction<Integer, List<Object>, IOException>> collectors = new ArrayList<>();
             for (InternalValuesSource valuesSource : valuesSources) {
                 collectors.add(valuesSource.apply(ctx));
             }
-            return new MultiTermsValuesSourceCollector(collectors);
-        }
-    }
-
-    public static class MultiTermsValuesSourceCollector {
-        private final List<CheckedFunction<Integer, List<Object>, IOException>> collectors;
-
-        public MultiTermsValuesSourceCollector(List<CheckedFunction<Integer, List<Object>, IOException>> collectors) {
-            this.collectors = collectors;
-        }
-
-        /**
-         * Cartesian product of values of each {@link InternalValuesSource}.
-         */
-        public List<List<Object>> collect(int doc) throws IOException {
-            List<CheckedSupplier<List<Object>, IOException>> collectedValues = new ArrayList<>();
-            for (CheckedFunction<Integer, List<Object>, IOException> collector : collectors) {
-                collectedValues.add(() -> collector.apply(doc));
-            }
-            List<List<Object>> ret = new ArrayList<>();
-            dfs(0, collectedValues, new ArrayList<>(), ret);
-            return ret;
-        }
-
-        public void dfs(int index, List<CheckedSupplier<List<Object>, IOException>> collectedValues, List<Object> current, List<List<Object>> values)
-            throws IOException {
-            if (index == collectedValues.size()) {
-                values.add(org.opensearch.common.collect.List.copyOf(current));
-            } else if (null != collectedValues.get(index)) {
-                for (Object value : collectedValues.get(index).get()) {
-                    current.add(value);
-                    dfs(index + 1, collectedValues, current, values);
-                    current.remove(current.size() - 1);
+            return new CheckedFunction<Integer, List<BytesRef>, IOException>() {
+                @Override
+                public List<BytesRef> apply(Integer doc) throws IOException {
+                    List<CheckedSupplier<List<Object>, IOException>> collectedValues = new ArrayList<>();
+                    for (CheckedFunction<Integer, List<Object>, IOException> collector : collectors) {
+                        collectedValues.add(() -> collector.apply(doc));
+                    }
+                    List<BytesRef> ret = new ArrayList<>();
+                    dfs(0, collectedValues, new ArrayList<>(), ret);
+                    return ret;
                 }
-            }
+
+                public void dfs(int index, List<CheckedSupplier<List<Object>, IOException>> collectedValues, List<Object> current,
+                    List<BytesRef> values)
+                    throws IOException {
+                    if (index == collectedValues.size()) {
+                        values.add(new BytesRef(IntStream.range(0, current.size())
+                                                .mapToObj(i -> InternalMultiTerms.formatObject(current.get(i),
+                                                    formats.get(i)).toString())
+                                                .collect(Collectors.joining("|"))));
+                    } else if (null != collectedValues.get(index)) {
+                        for (Object value : collectedValues.get(index).get()) {
+                            current.add(value);
+                            dfs(index + 1, collectedValues, current, values);
+                            current.remove(current.size() - 1);
+                        }
+                    }
+                }
+            };
         }
     }
 
@@ -417,4 +416,23 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
             };
         }
     }
+
+//    public static class MultiTermsValue {
+//        private final BytesRef value;
+//
+//        public MultiTermsValue(List<Object> objects, List<DocValueFormat> formats) {
+//            this.value =
+//                new BytesRef(IntStream.range(0, objects.size())
+//                    .mapToObj(index -> (String) InternalMultiTerms.formatObject(objects.get(index), formats.get(index)))
+//                    .collect(Collectors.joining("|")));
+//        }
+//
+//        public MultiTermsValue(BytesRef value) {
+//            this.value = value;
+//        }
+//
+//        public BytesRef getValue() {
+//            return value;
+//        }
+//    }
 }

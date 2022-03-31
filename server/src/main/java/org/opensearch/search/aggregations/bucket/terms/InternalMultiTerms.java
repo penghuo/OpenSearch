@@ -38,7 +38,7 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
         /**
          * list of terms values.
          */
-        protected List<Object> termValues;
+        protected BytesRef termValues;
         protected long docCount;
         protected InternalAggregations aggregations;
         protected boolean showDocCountError;
@@ -58,7 +58,7 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
         }
 
         public Bucket(
-            List<Object> values,
+            BytesRef values,
             long docCount,
             InternalAggregations aggregations,
             boolean showDocCountError,
@@ -74,7 +74,7 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
         }
 
         public Bucket(StreamInput in, List<DocValueFormat> formats, boolean showDocCountError) throws IOException {
-            this.termValues = in.readList(StreamInput::readGenericValue);
+            this.termValues = in.readBytesRef();
             this.docCount = in.readVLong();
             this.aggregations = InternalAggregations.readFrom(in);
             this.showDocCountError = showDocCountError;
@@ -102,7 +102,8 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeCollection(termValues, StreamOutput::writeGenericValue);
+//            out.writeCollection(termValues, StreamOutput::writeGenericValue);
+            out.writeBytesRef(termValues);
             out.writeVLong(docCount);
             aggregations.writeTo(out);
             if (showDocCountError) {
@@ -111,17 +112,18 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
         }
 
         @Override
-        public List<Object> getKey() {
-            List<Object> keys = new ArrayList<>(termValues.size());
-            for (int i = 0; i < termValues.size(); i++) {
-                keys.add(formatObject(termValues.get(i), termFormats.get(i)));
-            }
-            return keys;
+        public Object getKey() {
+//            List<Object> keys = new ArrayList<>(termValues.size());
+//            for (int i = 0; i < termValues.size(); i++) {
+//                keys.add(formatObject(termValues.get(i), termFormats.get(i)));
+//            }
+//            return keys;
+            return getKeyAsString();
         }
 
         @Override
         public String getKeyAsString() {
-            return getKey().stream().map(Object::toString).collect(Collectors.joining(PIPE));
+            return termValues.utf8ToString();
         }
 
         @Override
@@ -184,7 +186,7 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
 
         @Override
         public int compareKey(Bucket other) {
-            return new BucketComparator().compare(this.termValues, other.termValues);
+            return this.termValues.compareTo(other.termValues);
         }
 
         /**
@@ -196,20 +198,20 @@ public class InternalMultiTerms extends InternalTerms<InternalMultiTerms, Intern
             public int compare(List<Object> thisObjects, List<Object> thatObjects) {
                 if (thisObjects.size() != thatObjects.size()) {
                     throw new AggregationExecutionException(
-                        "[" + MultiTermsAggregationBuilder.NAME + "] aggregations failed due to terms" + " size is different"
+                        "[" + MultiTermsAggregationBuilder.NAME + "] aggregations failed due to terms size is different"
                     );
                 }
                 for (int i = 0; i < thisObjects.size(); i++) {
                     final Object thisObject = thisObjects.get(i);
                     final Object thatObject = thatObjects.get(i);
-                    try {
+//                    try {
                         int ret = ((Comparable) thisObject).compareTo(thatObject);
                         if (ret != 0) {
                             return ret;
                         }
-                    } catch (Exception e) {
-                        throw new RuntimeException();
-                    }
+//                    } catch (Exception e) {
+//                        throw new RuntimeException();
+//                    }
 
                 }
                 return 0;

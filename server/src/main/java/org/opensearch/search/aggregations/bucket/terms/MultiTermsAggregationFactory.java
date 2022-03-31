@@ -145,6 +145,7 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
             bucketCountThresholds.setShardSize(BucketUtils.suggestShardSideQueueSize(bucketCountThresholds.getRequiredSize()));
         }
         bucketCountThresholds.ensureValidity();
+        final List<DocValueFormat> formats = configs.stream().map(c -> c.v1().format()).collect(Collectors.toList());
         return new MultiTermsAggregator(
             name,
             factories,
@@ -152,9 +153,10 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
             new MultiTermsAggregator.MultiTermsValuesSource(
                 configs.stream()
                     .map(config -> queryShardContext.getValuesSourceRegistry().getAggregator(REGISTRY_KEY, config.v1()).build(config))
-                    .collect(Collectors.toList())
+                    .collect(Collectors.toList()),
+                formats
             ),
-            configs.stream().map(c -> c.v1().format()).collect(Collectors.toList()),
+            formats,
             order,
             collectMode,
             bucketCountThresholds,

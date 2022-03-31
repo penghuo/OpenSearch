@@ -194,680 +194,683 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
             },
             h -> {
                 assertEquals(3, h.getBuckets().size());
-                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo(1L), equalTo(1L), equalTo(1.0), equalTo(1.0)));
+//                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo(1L), equalTo(1L), equalTo(1.0), equalTo(1.0)));
+                assertThat(h.getBuckets().get(0).getKey(), equalTo("1|1|1.0|1.0"));
                 assertEquals(2, h.getBuckets().get(0).getDocCount());
-                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo(2L), equalTo(2L), equalTo(3.0), equalTo(3.0)));
+//                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo(2L), equalTo(2L), equalTo(3.0), equalTo(3.0)));
+                assertThat(h.getBuckets().get(1).getKey(), equalTo("2|2|3.0|3.0"));
                 assertEquals(2, h.getBuckets().get(1).getDocCount());
-                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo(2L), equalTo(2L), equalTo(2.0), equalTo(2.0)));
+//                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo(2L), equalTo(2L), equalTo(2.0), equalTo(2.0)));
+                assertThat(h.getBuckets().get(2).getKey(), equalTo("2|2|2.0|2.0"));
                 assertEquals(1, h.getBuckets().get(2).getDocCount());
             }
         );
     }
 
-    public void testMixNumberAndKeywordWithFilter() throws IOException {
-        testAggregation(
-            new TermQuery(new Term(KEYWORD_FIELD, "a")),
-            fieldConfigs(asList(KEYWORD_FIELD, FLOAT_FIELD)),
-            NONE_DECORATOR,
-            iw -> {
-                iw.addDocument(
-                    asList(
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                        new StringField(KEYWORD_FIELD, "a", Field.Store.NO),
-                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                        new StringField(KEYWORD_FIELD, "a", Field.Store.NO),
-                        new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                        new StringField(KEYWORD_FIELD, "b", Field.Store.NO),
-                        new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                        new StringField(KEYWORD_FIELD, "a", Field.Store.NO),
-                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                    )
-                );
-            },
-            h -> {
-                assertEquals(2, h.getBuckets().size());
-                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(2.0)));
-                assertEquals(2, h.getBuckets().get(0).getDocCount());
-                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(1.0)));
-                assertEquals(1, h.getBuckets().get(1).getDocCount());
-            }
-        );
-    }
-
-    public void testMixNumberAndKeyword() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD, FLOAT_FIELD)), NONE_DECORATOR, iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
-                    new NumericDocValuesField(INT_FIELD, 2),
-                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                )
-            );
-        }, h -> {
-            assertThat(h.getBuckets(), hasSize(3));
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(1.0)));
-            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("b"), equalTo(1L), equalTo(2.0)));
-            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(2L), equalTo(2.0)));
-            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-        });
-    }
-
-    public void testMultiValuesField() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), NONE_DECORATOR, iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new SortedNumericDocValuesField(INT_FIELD, 1)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new SortedNumericDocValuesField(INT_FIELD, 1),
-                    new SortedNumericDocValuesField(INT_FIELD, 3)
-                )
-            );
-        }, h -> {
-            assertEquals(3, h.getBuckets().size());
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
-            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(3L)));
-            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("b"), equalTo(1L)));
-        });
-
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), NONE_DECORATOR, iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new SortedNumericDocValuesField(INT_FIELD, 1),
-                    new SortedNumericDocValuesField(INT_FIELD, 2)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
-                    new SortedNumericDocValuesField(INT_FIELD, 1),
-                    new SortedNumericDocValuesField(INT_FIELD, 3)
-                )
-            );
-        }, h -> {
-            assertThat(h.getBuckets(), hasSize(7));
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
-            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(2L)));
-            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("a"), equalTo(3L)));
-            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(3).getKey(), contains(equalTo("b"), equalTo(1L)));
-            assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(4).getKey(), contains(equalTo("b"), equalTo(2L)));
-            assertThat(h.getBuckets().get(4).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(5).getKey(), contains(equalTo("c"), equalTo(1L)));
-            assertThat(h.getBuckets().get(5).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(6).getKey(), contains(equalTo("c"), equalTo(3L)));
-            assertThat(h.getBuckets().get(6).getDocCount(), equalTo(1L));
-        });
-    }
-
-    public void testScripts() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
-                new MultiTermsValuesSourceConfig.Builder().setScript(
-                    new Script(ScriptType.INLINE, MockScriptEngine.NAME, FIELD_SCRIPT_NAME, singletonMap(FIELD_NAME, FIELD_NAME))
-                ).setUserValueTypeHint(ValueType.LONG).build()
-            ),
-            null,
-            iw -> {
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(FIELD_NAME, 1))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(FIELD_NAME, 3))
-                );
-            },
-            h -> {
-                assertEquals(3, h.getBuckets().size());
-                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("b"), equalTo(3L)));
-                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(2L)));
-                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(4L)));
-                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-            }
-        );
-    }
-
-    public void testScriptsWithoutValueTypeHint() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
-                new MultiTermsValuesSourceConfig.Builder().setScript(
-                    new Script(ScriptType.INLINE, MockScriptEngine.NAME, FIELD_SCRIPT_NAME, singletonMap(FIELD_NAME, FIELD_NAME))
-                ).build()
-            ),
-            null,
-            iw -> {
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(FIELD_NAME, 1))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(FIELD_NAME, 3))
-                );
-            },
-            h -> {
-                assertEquals(3, h.getBuckets().size());
-                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("b"), equalTo("3")));
-                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo("2")));
-                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo("4")));
-                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-            }
-        );
-    }
-
-    public void testValueScripts() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(FIELD_NAME)
-                    .setScript(new Script(ScriptType.INLINE, MockScriptEngine.NAME, VALUE_SCRIPT_NAME, emptyMap()))
-                    .build()
-            ),
-            null,
-            iw -> {
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(FIELD_NAME, 1))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(FIELD_NAME, 3))
-                );
-            },
-            h -> {
-                assertEquals(3, h.getBuckets().size());
-                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("b"), equalTo(3.0)));
-                assertEquals(2L, h.getBuckets().get(0).getDocCount());
-                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(2.0)));
-                assertEquals(1L, h.getBuckets().get(1).getDocCount());
-                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(4.0)));
-                assertEquals(1L, h.getBuckets().get(2).getDocCount());
-            }
-        );
-    }
-
-    public void testOrderByMetrics() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), b -> {
-            b.order(BucketOrder.aggregation("max", false));
-            b.subAggregation(new MaxAggregationBuilder("max").field(FLOAT_FIELD));
-        }, iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new NumericDocValuesField(INT_FIELD, 2),
-                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
-                    new NumericDocValuesField(INT_FIELD, 3),
-                    new FloatDocValuesField(FLOAT_FIELD, 3.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 4.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new NumericDocValuesField(INT_FIELD, 2),
-                    new FloatDocValuesField(FLOAT_FIELD, 3.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
-                    new NumericDocValuesField(INT_FIELD, 3),
-                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                )
-            );
-        }, h -> {
-
-            assertEquals(3, h.getBuckets().size());
-            org.hamcrest.MatcherAssert.assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
-            assertEquals(2L, h.getBuckets().get(0).getDocCount());
-            MatcherAssert.assertThat(((InternalMax) (h.getBuckets().get(0).getAggregations().get("max"))).value(), closeTo(4.0f, 0.01));
-            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("b"), equalTo(2L)));
-            assertEquals(2L, h.getBuckets().get(1).getDocCount());
-            assertEquals(3.0f, ((InternalMax) (h.getBuckets().get(1).getAggregations().get("max"))).value(), 0.01);
-            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(3L)));
-            assertEquals(2L, h.getBuckets().get(2).getDocCount());
-            assertEquals(3.0f, ((InternalMax) (h.getBuckets().get(2).getAggregations().get("max"))).value(), 0.01);
-        });
-    }
-
-    public void testNumberFieldFormat() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(term(KEYWORD_FIELD), new MultiTermsValuesSourceConfig.Builder().setFieldName(DOUBLE_FIELD).setFormat("00.00").build()),
-            null,
-            iw -> {
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new DoubleDocValuesField(DOUBLE_FIELD, 1.0d))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new DoubleDocValuesField(DOUBLE_FIELD, 2.0d))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new DoubleDocValuesField(DOUBLE_FIELD, 2.0d))
-                );
-                iw.addDocument(
-                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new DoubleDocValuesField(DOUBLE_FIELD, 1.0d))
-                );
-            },
-            h -> {
-                assertThat(h.getBuckets(), hasSize(3));
-                assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("a|01.00"));
-                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-                assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("a|02.00"));
-                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("b|02.00"));
-                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-            }
-        );
-    }
-
-    public void testDates() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(new MultiTermsValuesSourceConfig.Builder().setFieldName(DATE_FIELD).build(), term(KEYWORD_FIELD)),
-            null,
-            iw -> {
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-22")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-21")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c"))
-                    )
-                );
-            },
-            h -> {
-                MatcherAssert.assertThat(h.getBuckets(), hasSize(4));
-                assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("2022-03-23|a"));
-                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-                assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("2022-03-21|c"));
-                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("2022-03-22|a"));
-                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(3).getKeyAsString(), equalTo("2022-03-23|b"));
-                assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
-            }
-        );
-    }
-
-    public void testDatesFieldFormat() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(DATE_FIELD).setFormat("yyyy/MM/dd").build(),
-                term(KEYWORD_FIELD)
-            ),
-            null,
-            iw -> {
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-22")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-21")),
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c"))
-                    )
-                );
-            },
-            h -> {
-                assertThat(h.getBuckets(), hasSize(4));
-                assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("2022/03/23|a"));
-                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-                assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("2022/03/21|c"));
-                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("2022/03/22|a"));
-                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(3).getKeyAsString(), equalTo("2022/03/23|b"));
-                assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
-            }
-        );
-    }
-
-    public void testIpAndKeyword() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, IP_FIELD)), NONE_DECORATOR, iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.0"))))
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.1"))))
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
-                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.2"))))
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.0"))))
-                )
-            );
-        }, h -> {
-            assertThat(h.getBuckets(), hasSize(3));
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo("192.168.0.0")));
-            assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("a|192.168.0.0"));
-            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("b"), equalTo("192.168.0.1")));
-            assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("b|192.168.0.1"));
-            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo("192.168.0.2")));
-            assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("c|192.168.0.2"));
-            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-        });
-    }
-
-    public void testEmpty() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), NONE_DECORATOR, iw -> {}, h -> {
-            assertThat(h.getName(), equalTo(AGG_NAME));
-            assertThat(h.getBuckets(), hasSize(0));
-        });
-    }
-
-    public void testNull() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD, FLOAT_FIELD)), NONE_DECORATOR, iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1),
-                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                )
-            );
-            iw.addDocument(asList(new NumericDocValuesField(INT_FIELD, 1), new FloatDocValuesField(FLOAT_FIELD, 2.0f)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new FloatDocValuesField(FLOAT_FIELD, 2.0f)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("d")), new NumericDocValuesField(INT_FIELD, 3)));
-
-        }, h -> {
-            assertEquals(1, h.getBuckets().size());
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(1.0)));
-            assertEquals(2, h.getBuckets().get(0).getDocCount());
-        });
-
-    }
-
-    public void testMissing() throws IOException {
-        testAggregation(
-            new MatchAllDocsQuery(),
-            asList(
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).setMissing("a").build(),
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(INT_FIELD).setMissing(1).build(),
-                new MultiTermsValuesSourceConfig.Builder().setFieldName(FLOAT_FIELD).setMissing(2.0f).build()
-            ),
-            NONE_DECORATOR,
-            iw -> {
-                iw.addDocument(
-                    asList(
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                        new NumericDocValuesField(INT_FIELD, 1),
-                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        // missing KEYWORD_FIELD
-                        new NumericDocValuesField(INT_FIELD, 1),
-                        new FloatDocValuesField(FLOAT_FIELD, 1.0f)
-                    )
-                );
-                iw.addDocument(
-                    asList(
-                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                        // missing INT_FIELD
-                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
-                    )
-                );
-                iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(INT_FIELD, 2)
-                // missing FLOAT_FIELD
-                ));
-                iw.addDocument(singletonList(new SortedDocValuesField(UNRELATED_KEYWORD_FIELD, new BytesRef("unrelated"))));
-            },
-            h -> {
-                assertThat(h.getBuckets(), hasSize(4));
-                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(2.0)));
-                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(1.0)));
-                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("b"), equalTo(1L), equalTo(2.0)));
-                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-                assertThat(h.getBuckets().get(3).getKey(), contains(equalTo("c"), equalTo(2L), equalTo(2.0)));
-                assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
-            }
-        );
-    }
-
-    public void testMixKeywordAndBoolean() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, BOOL_FIELD)), NONE_DECORATOR, iw -> {
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(BOOL_FIELD, 1)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(BOOL_FIELD, 0)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(BOOL_FIELD, 0)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(BOOL_FIELD, 1)));
-        }, h -> {
-            assertThat(h.getBuckets(), hasSize(4));
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(false)));
-            assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("a|false"));
-            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(true)));
-            assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("a|true"));
-            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("b"), equalTo(false)));
-            assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("b|false"));
-            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
-            assertThat(h.getBuckets().get(3).getKey(), contains(equalTo("b"), equalTo(true)));
-            assertThat(h.getBuckets().get(3).getKeyAsString(), equalTo("b|true"));
-            assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
-        });
-    }
-
-    public void testGeoPointField() {
-        assertThrows(
-            IllegalArgumentException.class,
-            () -> testAggregation(
-                new MatchAllDocsQuery(),
-                asList(term(KEYWORD_FIELD), term(GEO_POINT_FIELD)),
-                NONE_DECORATOR,
-                iw -> {},
-                f -> fail("should throw exception")
-            )
-        );
-    }
-
-    public void testMinDocCount() throws IOException {
-        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), b -> b.minDocCount(2), iw -> {
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(INT_FIELD, 1)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(INT_FIELD, 1)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(INT_FIELD, 2)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(INT_FIELD, 1)));
-            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(INT_FIELD, 2)));
-        }, h -> {
-            assertEquals(1, h.getBuckets().size());
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
-            assertEquals(2, h.getBuckets().get(0).getDocCount());
-        });
-    }
-
-    public void testIncludeExclude() throws IOException {
-        testAggregation(new MatchAllDocsQuery(),
-            asList(new MultiTermsValuesSourceConfig.Builder()
-                    .setFieldName(KEYWORD_FIELD).setIncludeExclude(new IncludeExclude(new RegExp("a"), null)).build(),
-                term(INT_FIELD)), NONE_DECORATOR,
-            iw -> {
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
-                    new NumericDocValuesField(INT_FIELD, 1)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
-                    new NumericDocValuesField(INT_FIELD, 1)
-                )
-            );
-            iw.addDocument(
-                asList(
-                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
-                    new NumericDocValuesField(INT_FIELD, 2)
-                )
-            );
-        }, h -> {
-            assertThat(h.getBuckets(), hasSize(1));
-            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
-            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
-        });
-    }
+//    public void testMixNumberAndKeywordWithFilter() throws IOException {
+//        testAggregation(
+//            new TermQuery(new Term(KEYWORD_FIELD, "a")),
+//            fieldConfigs(asList(KEYWORD_FIELD, FLOAT_FIELD)),
+//            NONE_DECORATOR,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                        new StringField(KEYWORD_FIELD, "a", Field.Store.NO),
+//                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                        new StringField(KEYWORD_FIELD, "a", Field.Store.NO),
+//                        new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                        new StringField(KEYWORD_FIELD, "b", Field.Store.NO),
+//                        new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                        new StringField(KEYWORD_FIELD, "a", Field.Store.NO),
+//                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                    )
+//                );
+//            },
+//            h -> {
+//                assertEquals(2, h.getBuckets().size());
+//                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(2.0)));
+//                assertEquals(2, h.getBuckets().get(0).getDocCount());
+//                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(1.0)));
+//                assertEquals(1, h.getBuckets().get(1).getDocCount());
+//            }
+//        );
+//    }
+//
+//    public void testMixNumberAndKeyword() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD, FLOAT_FIELD)), NONE_DECORATOR, iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+//                    new NumericDocValuesField(INT_FIELD, 2),
+//                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                )
+//            );
+//        }, h -> {
+//            assertThat(h.getBuckets(), hasSize(3));
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(1.0)));
+//            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("b"), equalTo(1L), equalTo(2.0)));
+//            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(2L), equalTo(2.0)));
+//            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//        });
+//    }
+//
+//    public void testMultiValuesField() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), NONE_DECORATOR, iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new SortedNumericDocValuesField(INT_FIELD, 1)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new SortedNumericDocValuesField(INT_FIELD, 1),
+//                    new SortedNumericDocValuesField(INT_FIELD, 3)
+//                )
+//            );
+//        }, h -> {
+//            assertEquals(3, h.getBuckets().size());
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
+//            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(3L)));
+//            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("b"), equalTo(1L)));
+//        });
+//
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), NONE_DECORATOR, iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new SortedNumericDocValuesField(INT_FIELD, 1),
+//                    new SortedNumericDocValuesField(INT_FIELD, 2)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+//                    new SortedNumericDocValuesField(INT_FIELD, 1),
+//                    new SortedNumericDocValuesField(INT_FIELD, 3)
+//                )
+//            );
+//        }, h -> {
+//            assertThat(h.getBuckets(), hasSize(7));
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
+//            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(2L)));
+//            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("a"), equalTo(3L)));
+//            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(3).getKey(), contains(equalTo("b"), equalTo(1L)));
+//            assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(4).getKey(), contains(equalTo("b"), equalTo(2L)));
+//            assertThat(h.getBuckets().get(4).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(5).getKey(), contains(equalTo("c"), equalTo(1L)));
+//            assertThat(h.getBuckets().get(5).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(6).getKey(), contains(equalTo("c"), equalTo(3L)));
+//            assertThat(h.getBuckets().get(6).getDocCount(), equalTo(1L));
+//        });
+//    }
+//
+//    public void testScripts() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
+//                new MultiTermsValuesSourceConfig.Builder().setScript(
+//                    new Script(ScriptType.INLINE, MockScriptEngine.NAME, FIELD_SCRIPT_NAME, singletonMap(FIELD_NAME, FIELD_NAME))
+//                ).setUserValueTypeHint(ValueType.LONG).build()
+//            ),
+//            null,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(FIELD_NAME, 1))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(FIELD_NAME, 3))
+//                );
+//            },
+//            h -> {
+//                assertEquals(3, h.getBuckets().size());
+//                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("b"), equalTo(3L)));
+//                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(2L)));
+//                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(4L)));
+//                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//            }
+//        );
+//    }
+//
+//    public void testScriptsWithoutValueTypeHint() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
+//                new MultiTermsValuesSourceConfig.Builder().setScript(
+//                    new Script(ScriptType.INLINE, MockScriptEngine.NAME, FIELD_SCRIPT_NAME, singletonMap(FIELD_NAME, FIELD_NAME))
+//                ).build()
+//            ),
+//            null,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(FIELD_NAME, 1))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(FIELD_NAME, 3))
+//                );
+//            },
+//            h -> {
+//                assertEquals(3, h.getBuckets().size());
+//                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("b"), equalTo("3")));
+//                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo("2")));
+//                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo("4")));
+//                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//            }
+//        );
+//    }
+//
+//    public void testValueScripts() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(FIELD_NAME)
+//                    .setScript(new Script(ScriptType.INLINE, MockScriptEngine.NAME, VALUE_SCRIPT_NAME, emptyMap()))
+//                    .build()
+//            ),
+//            null,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(FIELD_NAME, 1))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(FIELD_NAME, 2))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(FIELD_NAME, 3))
+//                );
+//            },
+//            h -> {
+//                assertEquals(3, h.getBuckets().size());
+//                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("b"), equalTo(3.0)));
+//                assertEquals(2L, h.getBuckets().get(0).getDocCount());
+//                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(2.0)));
+//                assertEquals(1L, h.getBuckets().get(1).getDocCount());
+//                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(4.0)));
+//                assertEquals(1L, h.getBuckets().get(2).getDocCount());
+//            }
+//        );
+//    }
+//
+//    public void testOrderByMetrics() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), b -> {
+//            b.order(BucketOrder.aggregation("max", false));
+//            b.subAggregation(new MaxAggregationBuilder("max").field(FLOAT_FIELD));
+//        }, iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new NumericDocValuesField(INT_FIELD, 2),
+//                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+//                    new NumericDocValuesField(INT_FIELD, 3),
+//                    new FloatDocValuesField(FLOAT_FIELD, 3.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 4.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new NumericDocValuesField(INT_FIELD, 2),
+//                    new FloatDocValuesField(FLOAT_FIELD, 3.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+//                    new NumericDocValuesField(INT_FIELD, 3),
+//                    new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                )
+//            );
+//        }, h -> {
+//
+//            assertEquals(3, h.getBuckets().size());
+//            org.hamcrest.MatcherAssert.assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
+//            assertEquals(2L, h.getBuckets().get(0).getDocCount());
+//            MatcherAssert.assertThat(((InternalMax) (h.getBuckets().get(0).getAggregations().get("max"))).value(), closeTo(4.0f, 0.01));
+//            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("b"), equalTo(2L)));
+//            assertEquals(2L, h.getBuckets().get(1).getDocCount());
+//            assertEquals(3.0f, ((InternalMax) (h.getBuckets().get(1).getAggregations().get("max"))).value(), 0.01);
+//            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo(3L)));
+//            assertEquals(2L, h.getBuckets().get(2).getDocCount());
+//            assertEquals(3.0f, ((InternalMax) (h.getBuckets().get(2).getAggregations().get("max"))).value(), 0.01);
+//        });
+//    }
+//
+//    public void testNumberFieldFormat() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(term(KEYWORD_FIELD), new MultiTermsValuesSourceConfig.Builder().setFieldName(DOUBLE_FIELD).setFormat("00.00").build()),
+//            null,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new DoubleDocValuesField(DOUBLE_FIELD, 1.0d))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new DoubleDocValuesField(DOUBLE_FIELD, 2.0d))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new DoubleDocValuesField(DOUBLE_FIELD, 2.0d))
+//                );
+//                iw.addDocument(
+//                    asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new DoubleDocValuesField(DOUBLE_FIELD, 1.0d))
+//                );
+//            },
+//            h -> {
+//                assertThat(h.getBuckets(), hasSize(3));
+//                assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("a|01.00"));
+//                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//                assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("a|02.00"));
+//                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("b|02.00"));
+//                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//            }
+//        );
+//    }
+//
+//    public void testDates() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(new MultiTermsValuesSourceConfig.Builder().setFieldName(DATE_FIELD).build(), term(KEYWORD_FIELD)),
+//            null,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-22")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-21")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c"))
+//                    )
+//                );
+//            },
+//            h -> {
+//                MatcherAssert.assertThat(h.getBuckets(), hasSize(4));
+//                assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("2022-03-23|a"));
+//                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//                assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("2022-03-21|c"));
+//                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("2022-03-22|a"));
+//                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(3).getKeyAsString(), equalTo("2022-03-23|b"));
+//                assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
+//            }
+//        );
+//    }
+//
+//    public void testDatesFieldFormat() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(DATE_FIELD).setFormat("yyyy/MM/dd").build(),
+//                term(KEYWORD_FIELD)
+//            ),
+//            null,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-22")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-23")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a"))
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedNumericDocValuesField(DATE_FIELD, dateFieldType(DATE_FIELD).parse("2022-03-21")),
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c"))
+//                    )
+//                );
+//            },
+//            h -> {
+//                assertThat(h.getBuckets(), hasSize(4));
+//                assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("2022/03/23|a"));
+//                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//                assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("2022/03/21|c"));
+//                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("2022/03/22|a"));
+//                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(3).getKeyAsString(), equalTo("2022/03/23|b"));
+//                assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
+//            }
+//        );
+//    }
+//
+//    public void testIpAndKeyword() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, IP_FIELD)), NONE_DECORATOR, iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.0"))))
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.1"))))
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+//                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.2"))))
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new SortedDocValuesField(IP_FIELD, new BytesRef(InetAddressPoint.encode(InetAddresses.forString("192.168.0.0"))))
+//                )
+//            );
+//        }, h -> {
+//            assertThat(h.getBuckets(), hasSize(3));
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo("192.168.0.0")));
+//            assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("a|192.168.0.0"));
+//            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("b"), equalTo("192.168.0.1")));
+//            assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("b|192.168.0.1"));
+//            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("c"), equalTo("192.168.0.2")));
+//            assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("c|192.168.0.2"));
+//            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//        });
+//    }
+//
+//    public void testEmpty() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), NONE_DECORATOR, iw -> {}, h -> {
+//            assertThat(h.getName(), equalTo(AGG_NAME));
+//            assertThat(h.getBuckets(), hasSize(0));
+//        });
+//    }
+//
+//    public void testNull() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD, FLOAT_FIELD)), NONE_DECORATOR, iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1),
+//                    new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                )
+//            );
+//            iw.addDocument(asList(new NumericDocValuesField(INT_FIELD, 1), new FloatDocValuesField(FLOAT_FIELD, 2.0f)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new FloatDocValuesField(FLOAT_FIELD, 2.0f)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("d")), new NumericDocValuesField(INT_FIELD, 3)));
+//
+//        }, h -> {
+//            assertEquals(1, h.getBuckets().size());
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(1.0)));
+//            assertEquals(2, h.getBuckets().get(0).getDocCount());
+//        });
+//
+//    }
+//
+//    public void testMissing() throws IOException {
+//        testAggregation(
+//            new MatchAllDocsQuery(),
+//            asList(
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).setMissing("a").build(),
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(INT_FIELD).setMissing(1).build(),
+//                new MultiTermsValuesSourceConfig.Builder().setFieldName(FLOAT_FIELD).setMissing(2.0f).build()
+//            ),
+//            NONE_DECORATOR,
+//            iw -> {
+//                iw.addDocument(
+//                    asList(
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                        new NumericDocValuesField(INT_FIELD, 1),
+//                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        // missing KEYWORD_FIELD
+//                        new NumericDocValuesField(INT_FIELD, 1),
+//                        new FloatDocValuesField(FLOAT_FIELD, 1.0f)
+//                    )
+//                );
+//                iw.addDocument(
+//                    asList(
+//                        new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                        // missing INT_FIELD
+//                        new FloatDocValuesField(FLOAT_FIELD, 2.0f)
+//                    )
+//                );
+//                iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(INT_FIELD, 2)
+//                // missing FLOAT_FIELD
+//                ));
+//                iw.addDocument(singletonList(new SortedDocValuesField(UNRELATED_KEYWORD_FIELD, new BytesRef("unrelated"))));
+//            },
+//            h -> {
+//                assertThat(h.getBuckets(), hasSize(4));
+//                assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(2.0)));
+//                assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//                assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(1L), equalTo(1.0)));
+//                assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("b"), equalTo(1L), equalTo(2.0)));
+//                assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//                assertThat(h.getBuckets().get(3).getKey(), contains(equalTo("c"), equalTo(2L), equalTo(2.0)));
+//                assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
+//            }
+//        );
+//    }
+//
+//    public void testMixKeywordAndBoolean() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, BOOL_FIELD)), NONE_DECORATOR, iw -> {
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(BOOL_FIELD, 1)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(BOOL_FIELD, 0)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(BOOL_FIELD, 0)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(BOOL_FIELD, 1)));
+//        }, h -> {
+//            assertThat(h.getBuckets(), hasSize(4));
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(false)));
+//            assertThat(h.getBuckets().get(0).getKeyAsString(), equalTo("a|false"));
+//            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(1).getKey(), contains(equalTo("a"), equalTo(true)));
+//            assertThat(h.getBuckets().get(1).getKeyAsString(), equalTo("a|true"));
+//            assertThat(h.getBuckets().get(1).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(2).getKey(), contains(equalTo("b"), equalTo(false)));
+//            assertThat(h.getBuckets().get(2).getKeyAsString(), equalTo("b|false"));
+//            assertThat(h.getBuckets().get(2).getDocCount(), equalTo(1L));
+//            assertThat(h.getBuckets().get(3).getKey(), contains(equalTo("b"), equalTo(true)));
+//            assertThat(h.getBuckets().get(3).getKeyAsString(), equalTo("b|true"));
+//            assertThat(h.getBuckets().get(3).getDocCount(), equalTo(1L));
+//        });
+//    }
+//
+//    public void testGeoPointField() {
+//        assertThrows(
+//            IllegalArgumentException.class,
+//            () -> testAggregation(
+//                new MatchAllDocsQuery(),
+//                asList(term(KEYWORD_FIELD), term(GEO_POINT_FIELD)),
+//                NONE_DECORATOR,
+//                iw -> {},
+//                f -> fail("should throw exception")
+//            )
+//        );
+//    }
+//
+//    public void testMinDocCount() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(), fieldConfigs(asList(KEYWORD_FIELD, INT_FIELD)), b -> b.minDocCount(2), iw -> {
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(INT_FIELD, 1)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(INT_FIELD, 1)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new NumericDocValuesField(INT_FIELD, 2)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")), new NumericDocValuesField(INT_FIELD, 1)));
+//            iw.addDocument(asList(new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")), new NumericDocValuesField(INT_FIELD, 2)));
+//        }, h -> {
+//            assertEquals(1, h.getBuckets().size());
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
+//            assertEquals(2, h.getBuckets().get(0).getDocCount());
+//        });
+//    }
+//
+//    public void testIncludeExclude() throws IOException {
+//        testAggregation(new MatchAllDocsQuery(),
+//            asList(new MultiTermsValuesSourceConfig.Builder()
+//                    .setFieldName(KEYWORD_FIELD).setIncludeExclude(new IncludeExclude(new RegExp("a"), null)).build(),
+//                term(INT_FIELD)), NONE_DECORATOR,
+//            iw -> {
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("a")),
+//                    new NumericDocValuesField(INT_FIELD, 1)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("b")),
+//                    new NumericDocValuesField(INT_FIELD, 1)
+//                )
+//            );
+//            iw.addDocument(
+//                asList(
+//                    new SortedDocValuesField(KEYWORD_FIELD, new BytesRef("c")),
+//                    new NumericDocValuesField(INT_FIELD, 2)
+//                )
+//            );
+//        }, h -> {
+//            assertThat(h.getBuckets(), hasSize(1));
+//            assertThat(h.getBuckets().get(0).getKey(), contains(equalTo("a"), equalTo(1L)));
+//            assertThat(h.getBuckets().get(0).getDocCount(), equalTo(2L));
+//        });
+//    }
 
     private void testAggregation(
         Query query,

@@ -55,7 +55,8 @@ public class InternalMultiTermsTests extends InternalTermsTestCase {
         for (int i = 0; i < numBuckets; i++) {
             buckets.add(
                 new InternalMultiTerms.Bucket(
-                    types.stream().map(this::value).collect(Collectors.toList()),
+//                    types.stream().map(this::value).collect(Collectors.toList()),
+                    new BytesRef("a"),
                     minDocCount,
                     aggregations,
                     showTermDocCountError,
