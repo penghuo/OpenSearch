@@ -41,6 +41,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -54,7 +55,7 @@ import static org.opensearch.search.aggregations.bucket.terms.TermsAggregator.de
  */
 public class MultiTermsAggregator extends DeferableBucketAggregator {
 
-    private final BytesKeyedBucketOrds bucketOrds;
+    private final LongKeyedBucketOrds bucketOrds;
     private final MultiTermsValuesSource multiTermsValue;
     private final boolean showTermDocCountError;
     private final List<DocValueFormat> formats;
@@ -63,6 +64,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
     private final Comparator<InternalMultiTerms.Bucket> partiallyBuiltBucketComparator;
     private final SubAggCollectionMode collectMode;
     private final Set<Aggregator> aggsUsedForSorting = new HashSet<>();
+    private final Map<Long, BytesRef> bytesMap;
 
     public MultiTermsAggregator(
         String name,
@@ -79,7 +81,8 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         Map<String, Object> metadata
     ) throws IOException {
         super(name, factories, context, parent, metadata);
-        this.bucketOrds = BytesKeyedBucketOrds.build(context.bigArrays(), cardinality);
+//        this.bucketOrds = BytesKeyedBucketOrds.build(context.bigArrays(), cardinality);
+        this.bucketOrds = LongKeyedBucketOrds.build(context.bigArrays(), cardinality);
         this.multiTermsValue = new MultiTermsValuesSource(internalValuesSources);
         this.showTermDocCountError = showTermDocCountError;
         this.formats = formats;
@@ -110,6 +113,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
                 }
             }
         }
+        this.bytesMap = new HashMap<>();
     }
 
     @Override
@@ -124,7 +128,8 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
             PriorityQueue<InternalMultiTerms.Bucket> ordered = new BucketPriorityQueue<>(size, partiallyBuiltBucketComparator);
             InternalMultiTerms.Bucket spare = null;
             BytesRef dest = null;
-            BytesKeyedBucketOrds.BucketOrdsEnum ordsEnum = bucketOrds.ordsEnum(owningBucketOrds[ordIdx]);
+//            BytesKeyedBucketOrds.BucketOrdsEnum ordsEnum = bucketOrds.ordsEnum(owningBucketOrds[ordIdx]);
+            LongKeyedBucketOrds.BucketOrdsEnum ordsEnum = bucketOrds.ordsEnum(owningBucketOrds[ordIdx]);
             CheckedSupplier<InternalMultiTerms.Bucket, IOException> emptyBucketBuilder = () -> InternalMultiTerms.Bucket.EMPTY(
                 showTermDocCountError,
                 formats
@@ -140,9 +145,9 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
                     dest = new BytesRef();
                 }
 
-                ordsEnum.readValue(dest);
+//                ordsEnum.readValue(dest);
 
-                spare.termValues = decode(dest);
+                spare.termValues = decode(bytesMap.get(ordsEnum.value()));
                 spare.docCount = docCount;
                 spare.bucketOrd = ordsEnum.ord();
                 spare = ordered.insertWithOverflow(spare);
@@ -202,12 +207,14 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
             @Override
             public void collect(int doc, long owningBucketOrd) throws IOException {
                 for (List<Object> value : collector.apply(doc)) {
-                    long bucketOrd = bucketOrds.add(owningBucketOrd, encode(value));
+                    long key = value.hashCode();
+                    long bucketOrd = bucketOrds.add(owningBucketOrd, key);
                     if (bucketOrd < 0) {
                         bucketOrd = -1 - bucketOrd;
                         collectExistingBucket(sub, doc, bucketOrd);
                     } else {
                         collectBucket(sub, doc, bucketOrd);
+                        bytesMap.put(key, encode(value));
                     }
                 }
             }
@@ -263,7 +270,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
             // brute force
             for (int docId = 0; docId < ctx.reader().maxDoc(); ++docId) {
                 for (List<Object> value : collector.apply(docId)) {
-                    bucketOrds.add(owningBucketOrd, encode(value));
+                    bucketOrds.add(owningBucketOrd, value.hashCode());
                 }
             }
         }
