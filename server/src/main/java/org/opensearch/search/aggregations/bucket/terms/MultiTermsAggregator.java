@@ -8,8 +8,11 @@
 
 package org.opensearch.search.aggregations.bucket.terms;
 
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefBuilder;
 import org.apache.lucene.util.NumericUtils;
@@ -46,6 +49,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
 import static org.opensearch.search.aggregations.bucket.terms.TermsAggregator.descendsFromNestedAggregator;
@@ -83,7 +87,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         super(name, factories, context, parent, metadata);
 //        this.bucketOrds = BytesKeyedBucketOrds.build(context.bigArrays(), cardinality);
         this.bucketOrds = LongKeyedBucketOrds.build(context.bigArrays(), cardinality);
-        this.multiTermsValue = new MultiTermsValuesSource(internalValuesSources);
+        this.multiTermsValue = new MultiTermsValuesSource(internalValuesSources, ord -> grow(ord));
         this.showTermDocCountError = showTermDocCountError;
         this.formats = formats;
         this.bucketCountThresholds = bucketCountThresholds;
@@ -293,7 +297,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         /**
          * Create {@link InternalValuesSourceCollector} from existing {@link LeafReaderContext}.
          */
-        InternalValuesSourceCollector apply(LeafReaderContext ctx) throws IOException;
+        InternalValuesSourceCollector apply(LeafReaderContext ctx, Consumer<Long> consumer) throws IOException;
     }
 
     /**
@@ -312,15 +316,17 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
      */
     static class MultiTermsValuesSource {
         private final List<InternalValuesSource> valuesSources;
+        private final Consumer<Long> consumer;
 
-        public MultiTermsValuesSource(List<InternalValuesSource> valuesSources) {
+        public MultiTermsValuesSource(List<InternalValuesSource> valuesSources, Consumer<Long> consumer) {
             this.valuesSources = valuesSources;
+            this.consumer = consumer;
         }
 
         public MultiTermsValuesSourceCollector getValues(LeafReaderContext ctx) throws IOException {
             List<InternalValuesSourceCollector> collectors = new ArrayList<>();
             for (InternalValuesSource valuesSource : valuesSources) {
-                collectors.add(valuesSource.apply(ctx));
+                collectors.add(valuesSource.apply(ctx, consumer));
             }
             return new MultiTermsValuesSourceCollector() {
                 @Override
@@ -361,39 +367,29 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
      * Factory for construct {@link InternalValuesSource}.
      */
     static class InternalValuesSourceFactory {
-        static InternalValuesSource bytesValuesSource(ValuesSource valuesSource, IncludeExclude.StringFilter includeExclude) {
-            return ctx -> {
-                SortedBinaryDocValues values = valuesSource.bytesValues(ctx);
+        static InternalValuesSource bytesValuesSource(ValuesSource vs, IncludeExclude.StringFilter includeExclude) {
+            return (ctx, consumer) -> {
+                ValuesSource.Bytes.WithOrdinals valuesSource = (ValuesSource.Bytes.WithOrdinals) vs;
+                SortedSetDocValues globalOrds = valuesSource.globalOrdinalsValues(ctx);
+                consumer.accept(globalOrds.getValueCount());
+                SortedDocValues values = DocValues.unwrapSingleton(globalOrds);
+
+//                SortedBinaryDocValues values = valuesSource.bytesValues(ctx);
                 return doc -> {
                     BytesRefBuilder previous = new BytesRefBuilder();
 
                     if (false == values.advanceExact(doc)) {
                         return Collections.emptyList();
                     }
-                    int valuesCount = values.docValueCount();
-                    List<Object> termValues = new ArrayList<>(valuesCount);
-
-                    // SortedBinaryDocValues don't guarantee uniqueness so we
-                    // need to take care of dups
-                    previous.clear();
-                    for (int i = 0; i < valuesCount; ++i) {
-                        BytesRef bytes = values.nextValue();
-                        if (includeExclude != null && false == includeExclude.accept(bytes)) {
-                            continue;
-                        }
-                        if (i > 0 && previous.get().equals(bytes)) {
-                            continue;
-                        }
-                        previous.copyBytes(bytes);
-                        termValues.add(BytesRef.deepCopyOf(bytes));
-                    }
-                    return termValues;
+                    int globalOrd = values.ordValue();
+//                    List<Object> termValues = new ArrayList<>(valuesCount);
+                    return Arrays.asList(globalOrd);
                 };
             };
         }
 
         static InternalValuesSource longValuesSource(ValuesSource.Numeric valuesSource, IncludeExclude.LongFilter longFilter) {
-            return ctx -> {
+            return (ctx, consumer) -> {
                 SortedNumericDocValues values = valuesSource.longValues(ctx);
                 return doc -> {
                     if (values.advanceExact(doc)) {
@@ -418,7 +414,7 @@ public class MultiTermsAggregator extends DeferableBucketAggregator {
         }
 
         static InternalValuesSource doubleValueSource(ValuesSource.Numeric valuesSource, IncludeExclude.LongFilter longFilter) {
-            return ctx -> {
+            return (ctx, consumer) -> {
                 SortedNumericDoubleValues values = valuesSource.doubleValues(ctx);
                 return doc -> {
                     if (values.advanceExact(doc)) {
