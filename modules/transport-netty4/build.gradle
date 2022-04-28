@@ -59,6 +59,14 @@ dependencies {
   api "io.netty:netty-handler:${versions.netty}"
   api "io.netty:netty-resolver:${versions.netty}"
   api "io.netty:netty-transport:${versions.netty}"
+
+  // spark network stack
+  api 'io.dropwizard.metrics:metrics-core:4.2.0'
+  api "org.slf4j:slf4j-api:${versions.slf4j}"
+  api 'org.apache.commons:commons-lang3:3.12.0'
+  api 'com.google.crypto.tink:tink:1.6.1'
+  api 'org.apache.commons:commons-crypto:1.1.0'
+  api 'org.roaringbitmap:RoaringBitmap:0.9.26'
 }
 
 restResources {
@@ -70,6 +78,11 @@ restResources {
 tasks.named("dependencyLicenses").configure {
   mapping from: /netty-.*/, to: 'netty'
 }
+
+dependencyLicenses.enabled = false
+forbiddenApisMain.enabled = false
+thirdPartyAudit.enabled = false
+licenseHeaders.enabled = false
 
 test {
   /*
