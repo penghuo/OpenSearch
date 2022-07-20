@@ -31,6 +31,7 @@
 
 package org.opensearch.search.aggregations.bucket;
 
+import org.apache.lucene.util.Accountable;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.IntArray;
@@ -52,6 +53,8 @@ import java.io.IOException;
 import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -72,6 +75,70 @@ public abstract class BucketsAggregator extends AggregatorBase {
     private final IntConsumer multiBucketConsumer;
     private IntArray docCounts;
 
+    static class FrequentArray implements IntArray {
+        private int size;
+        private Map<Long, Integer> counter;
+
+        FrequentArray(int size){
+            this.size = size;
+            this.counter = new HashMap<>(size);
+        }
+
+        @Override
+        public int get(long index) {
+            return counter.getOrDefault(index, 0);
+        }
+
+        @Override
+        public int set(long index, int value) {
+            throw new RuntimeException("unsupported operation set");
+        }
+
+        @Override
+        public int increment(long index, int inc) {
+            Integer count = counter.get(index);
+            if (count != null) {
+                counter.put(index, count + 1);
+            } else if (counter.size() < size) {
+                counter.put(index, 1);
+            } else {
+                Map<Long, Integer> temp = new HashMap<>(size);
+                counter.forEach((k, v) -> {
+                    if (v > 1) {
+                        temp.put(k, v - 1);
+                    }
+                });
+                counter = temp;
+            }
+            return count == null ? 0 : count;
+        }
+
+        @Override
+        public void fill(long fromIndex, long toIndex, int value) {
+            throw new RuntimeException("unsupported operation fill");
+        }
+
+        @Override
+        public long size() {
+            return counter.size();
+        }
+
+        @Override
+        public void close() {
+            // do nothing
+        }
+
+        @Override
+        public long ramBytesUsed() {
+            return 0;
+        }
+
+        @Override
+        public Collection<Accountable> getChildResources() {
+            return IntArray.super.getChildResources();
+        }
+    }
+
     public BucketsAggregator(
         String name,
         AggregatorFactories factories,
@@ -87,10 +154,11 @@ public abstract class BucketsAggregator extends AggregatorBase {
         } else {
             multiBucketConsumer = (count) -> {};
         }
-        docCounts = bigArrays.newIntArray(1, true);
+//        docCounts = bigArrays.newIntArray(1, true);
+        docCounts = new FrequentArray(25);
     }
 
-    /**
+    /**`
      * Return an upper bound of the maximum bucket ordinal seen so far.
      */
     public final long maxBucketOrd() {
@@ -108,7 +176,7 @@ public abstract class BucketsAggregator extends AggregatorBase {
      * Utility method to collect the given doc in the given bucket (identified by the bucket ordinal)
      */
     public final void collectBucket(LeafBucketCollector subCollector, int doc, long bucketOrd) throws IOException {
-        grow(bucketOrd + 1);
+//        grow(bucketOrd + 1);
         collectExistingBucket(subCollector, doc, bucketOrd);
     }
 
