@@ -39,6 +39,7 @@ import org.opensearch.action.ActionListener;
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.action.ActionResponse;
 import org.opensearch.action.ActionRunnable;
+import org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotRequest;
 import org.opensearch.action.bulk.BackoffPolicy;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
@@ -69,6 +70,7 @@ import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
 /**
@@ -269,6 +271,12 @@ public abstract class TransportClusterManagerNodeAction<Request extends ClusterM
                         });
                         threadPool.executor(executor)
                             .execute(ActionRunnable.wrap(delegate, l -> clusterManagerOperation(task, request, clusterState, l)));
+
+                        if (request instanceof RestoreSnapshotRequest) {
+                            threadPool.scheduler().scheduleAtFixedRate(ActionRunnable.wrap(delegate,
+                                l -> clusterManagerOperation(task, request, clusterState, l)), 10, 10,
+                                TimeUnit.SECONDS);
+                        }
                     }
                 } else {
                     if (nodes.getClusterManagerNode() == null) {

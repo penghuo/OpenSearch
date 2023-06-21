@@ -64,6 +64,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.service.ClusterManagerTaskThrottler;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.Numbers;
 import org.opensearch.common.SetOnce;
@@ -75,6 +76,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.bytes.BytesArray;
 import org.opensearch.common.bytes.BytesReference;
 import org.opensearch.common.collect.Tuple;
@@ -101,6 +103,7 @@ import org.opensearch.core.common.lease.Releasable;
 import org.opensearch.core.util.BytesRefUtils;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.Index;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.ShardId;
 import org.opensearch.index.snapshots.IndexShardRestoreFailedException;
@@ -139,6 +142,7 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -1491,11 +1495,37 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     @Override
     public IndexMetadata getSnapshotIndexMetaData(RepositoryData repositoryData, SnapshotId snapshotId, IndexId index) throws IOException {
         try {
-            return INDEX_METADATA_FORMAT.read(
+            IndexMetadata indexMetadata = INDEX_METADATA_FORMAT.read(
                 indexContainer(index),
                 repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, index),
                 namedXContentRegistry
             );
+
+            // todo. penghuo, read shards number from translog.
+            String indexPath = indexContainer(index).path().buildAsString();
+            FsBlobStore blobStore = (FsBlobStore) blobStore();
+
+            String latestShardPath = blobStore.path().resolve(indexPath + "shard.latest").toString();
+            logger.info("[FLINT] - load latest shard from {}", latestShardPath);
+            Optional<Integer> numberOfShards = ShardIdTranslog.shardId(latestShardPath);
+            if (numberOfShards.isPresent()) {
+                int shardNumber = numberOfShards.get() + 1;
+                IndexMetadata newMetadata = new IndexMetadata.Builder(indexMetadata.getIndex().getName())
+                    .state(indexMetadata.getState())
+                    .version(indexMetadata.getVersion())
+                    .mappingVersion(indexMetadata.getMappingVersion())
+                    .settingsVersion(indexMetadata.getSettingsVersion())
+                    .aliasesVersion(indexMetadata.getAliasesVersion())
+                    .settings(indexMetadata.getSettings())
+                    .putMapping(indexMetadata.mapping())
+                    .setRoutingNumShards(shardNumber)
+                    .numberOfShards(shardNumber)
+                    .build();
+                logger.info("[FLINT] - latest shard number: {}", shardNumber);
+                return newMetadata;
+            } else {
+                return indexMetadata;
+            }
         } catch (NoSuchFileException e) {
             throw new SnapshotMissingException(metadata.name(), snapshotId, e);
         }

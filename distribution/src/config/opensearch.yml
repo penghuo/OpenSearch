@@ -138,3 +138,7 @@ ${path.logs}
 # index searcher threadpool.
 #
 #opensearch.experimental.feature.concurrent_segment_search.enabled: false
+
+path.repo: [ "/Users/penghuo/tmp/opensearch/flintsnapshot/"]
+node.roles: [ master, search, data]
+node.search.cache.size: 512mb

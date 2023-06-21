@@ -425,7 +425,7 @@ public class RestoreService implements ClusterStateApplier {
                         RoutingTable.Builder rtBuilder = RoutingTable.builder(currentState.routingTable());
                         final Map<ShardId, RestoreInProgress.ShardRestoreStatus> shards;
                         Set<String> aliases = new HashSet<>();
-
+                        int latestShardNumber = 0;
                         if (indices.isEmpty() == false) {
                             // We have some indices to restore
                             Map<ShardId, RestoreInProgress.ShardRestoreStatus> shardsBuilder = new HashMap<>();
@@ -519,28 +519,38 @@ public class RestoreService implements ClusterStateApplier {
                                     mdBuilder.put(updatedIndexMetadata, true);
                                     renamedIndex = updatedIndexMetadata.getIndex();
                                 } else {
-                                    validateExistingIndex(currentIndexMetadata, snapshotIndexMetadata, renamedIndexName, partial);
+//                                    validateExistingIndex(currentIndexMetadata, snapshotIndexMetadata, renamedIndexName, partial);
+                                    latestShardNumber = currentIndexMetadata.getNumberOfShards();
+
+
                                     // Index exists and it's closed - open it in metadata and start recovery
                                     IndexMetadata.Builder indexMdBuilder = IndexMetadata.builder(snapshotIndexMetadata)
                                         .state(IndexMetadata.State.OPEN);
                                     indexMdBuilder.version(
-                                        Math.max(snapshotIndexMetadata.getVersion(), 1 + currentIndexMetadata.getVersion())
+                                        currentIndexMetadata.getVersion()
                                     );
                                     indexMdBuilder.mappingVersion(
-                                        Math.max(snapshotIndexMetadata.getMappingVersion(), 1 + currentIndexMetadata.getMappingVersion())
+                                        currentIndexMetadata.getMappingVersion()
                                     );
                                     indexMdBuilder.settingsVersion(
-                                        Math.max(snapshotIndexMetadata.getSettingsVersion(), 1 + currentIndexMetadata.getSettingsVersion())
+                                        currentIndexMetadata.getSettingsVersion()
                                     );
                                     indexMdBuilder.aliasesVersion(
-                                        Math.max(snapshotIndexMetadata.getAliasesVersion(), 1 + currentIndexMetadata.getAliasesVersion())
+                                        currentIndexMetadata.getAliasesVersion()
                                     );
 
                                     for (int shard = 0; shard < snapshotIndexMetadata.getNumberOfShards(); shard++) {
-                                        indexMdBuilder.primaryTerm(
-                                            shard,
-                                            Math.max(snapshotIndexMetadata.primaryTerm(shard), currentIndexMetadata.primaryTerm(shard))
-                                        );
+                                        if (shard >= latestShardNumber) {
+                                            indexMdBuilder.primaryTerm(
+                                                shard,
+                                                snapshotIndexMetadata.primaryTerm(shard)
+                                            );
+                                        } else {
+                                            indexMdBuilder.primaryTerm(
+                                                shard,
+                                                currentIndexMetadata.primaryTerm(shard)
+                                            );
+                                        }
                                     }
 
                                     if (!request.includeAliases()) {
