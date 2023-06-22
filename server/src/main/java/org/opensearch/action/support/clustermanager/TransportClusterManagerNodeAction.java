@@ -272,6 +272,7 @@ public abstract class TransportClusterManagerNodeAction<Request extends ClusterM
                         threadPool.executor(executor)
                             .execute(ActionRunnable.wrap(delegate, l -> clusterManagerOperation(task, request, clusterState, l)));
 
+                        // penghuo, schedule task every 10s.
                         if (request instanceof RestoreSnapshotRequest) {
                             threadPool.scheduler().scheduleAtFixedRate(ActionRunnable.wrap(delegate,
                                 l -> clusterManagerOperation(task, request, clusterState, l)), 10, 10,

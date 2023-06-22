@@ -578,6 +578,23 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
             return this;
         }
 
+        public Builder addAsFlintRestore(IndexMetadata indexMetadata,
+            SnapshotRecoverySource recoverySource, IntSet ignoreShards) {
+
+          IndexRoutingTable
+              existingRoutingTable =
+              indicesRouting.get(indexMetadata.getIndex().getName());
+
+            IndexRoutingTable.Builder indexRoutingBuilder = new IndexRoutingTable.Builder(indexMetadata.getIndex()).initializeAsFlintRestore(
+                indexMetadata,
+                recoverySource,
+                ignoreShards,
+                existingRoutingTable
+            );
+            add(indexRoutingBuilder);
+            return this;
+        }
+
         public Builder addAsNewRestore(IndexMetadata indexMetadata, SnapshotRecoverySource recoverySource, IntSet ignoreShards) {
             IndexRoutingTable.Builder indexRoutingBuilder = new IndexRoutingTable.Builder(indexMetadata.getIndex()).initializeAsNewRestore(
                 indexMetadata,

@@ -445,6 +445,21 @@ public class IndexRoutingTable extends AbstractDiffable<IndexRoutingTable> imple
             return initializeAsRestore(indexMetadata, recoverySource, null, false, unassignedInfo);
         }
 
+        public Builder initializeAsFlintRestore(IndexMetadata indexMetadata,
+            SnapshotRecoverySource recoverySource, IntSet ignoreShards,
+            IndexRoutingTable existingRoutingTable) {
+            final UnassignedInfo unassignedInfo = new UnassignedInfo(
+                UnassignedInfo.Reason.EXISTING_INDEX_RESTORED,
+                "restore_source["
+                    + recoverySource.snapshot().getRepository()
+                    + "/"
+                    + recoverySource.snapshot().getSnapshotId().getName()
+                    + "]"
+            );
+            return initializeAsFlintRestore(indexMetadata, recoverySource, ignoreShards, false,
+                unassignedInfo, existingRoutingTable);
+        }
+
         /**
          * Initializes an existing index, to be restored from remote store
          */
@@ -462,6 +477,44 @@ public class IndexRoutingTable extends AbstractDiffable<IndexRoutingTable> imple
                 IndexShardRoutingTable.Builder indexShardRoutingBuilder = new IndexShardRoutingTable.Builder(shardId);
                 indexShardRoutingBuilder.addShard(ShardRouting.newUnassigned(shardId, true, recoverySource, unassignedInfo));
                 shards.put(shardNumber, indexShardRoutingBuilder.build());
+            }
+            return this;
+        }
+
+        /**
+         * Initializes an index, to be restored from snapshot
+         */
+        private Builder initializeAsFlintRestore(
+            IndexMetadata indexMetadata,
+            RecoverySource recoverySource,
+            IntSet ignoreShards,
+            boolean asNew,
+            UnassignedInfo unassignedInfo,
+            IndexRoutingTable existingRoutingTable
+        ) {
+            assert indexMetadata.getIndex().equals(index);
+            if (!shards.isEmpty()) {
+                throw new IllegalStateException("trying to initialize an index with fresh shards, but already has shards created");
+            }
+            for (int shardNumber = 0; shardNumber < indexMetadata.getNumberOfShards(); shardNumber++) {
+                if (ignoreShards.contains(shardNumber)) {
+                    shards.put(shardNumber, existingRoutingTable.shard(shardNumber));
+                } else {
+                    ShardId shardId = new ShardId(index, shardNumber);
+                    IndexShardRoutingTable.Builder indexShardRoutingBuilder = new IndexShardRoutingTable.Builder(shardId);
+                    for (int i = 0; i <= indexMetadata.getNumberOfReplicas(); i++) {
+                        boolean primary = i == 0;
+                        indexShardRoutingBuilder.addShard(
+                            ShardRouting.newUnassigned(
+                                shardId,
+                                primary,
+                                primary ? recoverySource : PeerRecoverySource.INSTANCE,
+                                unassignedInfo
+                            )
+                        );
+                    }
+                    shards.put(shardNumber, indexShardRoutingBuilder.build());
+                }
             }
             return this;
         }

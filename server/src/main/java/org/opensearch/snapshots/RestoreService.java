@@ -550,6 +550,7 @@ public class RestoreService implements ClusterStateApplier {
                                                 shard,
                                                 currentIndexMetadata.primaryTerm(shard)
                                             );
+                                            ignoreShards.add(shard);
                                         }
                                     }
 
@@ -574,7 +575,7 @@ public class RestoreService implements ClusterStateApplier {
                                     indexSettingsBuilder.put(SETTING_HISTORY_UUID, UUIDs.randomBase64UUID());
                                     indexMdBuilder.settings(indexSettingsBuilder);
                                     IndexMetadata updatedIndexMetadata = indexMdBuilder.index(renamedIndexName).build();
-                                    rtBuilder.addAsRestore(updatedIndexMetadata, recoverySource);
+                                    rtBuilder.addAsFlintRestore(updatedIndexMetadata, recoverySource, ignoreShards);
                                     blocks.updateBlocks(updatedIndexMetadata);
                                     mdBuilder.put(updatedIndexMetadata, true);
                                     renamedIndex = updatedIndexMetadata.getIndex();
