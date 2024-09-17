@@ -55,7 +55,7 @@ import java.util.Map;
 
 import static java.util.Collections.emptyMap;
 
-class S3AsyncService implements Closeable {
+public class S3AsyncService implements Closeable {
     private static final Logger logger = LogManager.getLogger(S3AsyncService.class);
 
     private static final String STS_ENDPOINT_OVERRIDE_SYSTEM_PROPERTY = "aws.stsEndpointOverride";

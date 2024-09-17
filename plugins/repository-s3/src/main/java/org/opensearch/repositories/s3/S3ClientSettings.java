@@ -63,7 +63,7 @@ import java.util.function.Function;
 /**
  * A container for settings used to create an S3 client.
  */
-final class S3ClientSettings {
+final public class S3ClientSettings {
 
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(S3ClientSettings.class);
 
@@ -449,7 +449,7 @@ final class S3ClientSettings {
      *
      * Note this will always at least return a client named "default".
      */
-    static Map<String, S3ClientSettings> load(final Settings settings, final Path configPath) {
+    public static Map<String, S3ClientSettings> load(final Settings settings, final Path configPath) {
         final Set<String> clientNames = settings.getGroups(PREFIX).keySet();
         final Map<String, S3ClientSettings> clients = new HashMap<>();
         for (final String clientName : clientNames) {

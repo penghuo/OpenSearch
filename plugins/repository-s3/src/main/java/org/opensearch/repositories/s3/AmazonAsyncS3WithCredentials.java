@@ -16,7 +16,7 @@ import org.opensearch.common.Nullable;
 /**
  * The holder of the AmazonS3 and AWSCredentialsProvider
  */
-final class AmazonAsyncS3WithCredentials {
+final public class AmazonAsyncS3WithCredentials {
     private final S3AsyncClient client;
     private final S3AsyncClient priorityClient;
     private final AwsCredentialsProvider credentials;

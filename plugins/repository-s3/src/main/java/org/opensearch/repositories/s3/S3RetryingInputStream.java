@@ -58,7 +58,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * See https://github.com/aws/aws-sdk-java/issues/856 for the related SDK issue
  */
-class S3RetryingInputStream extends InputStream {
+public class S3RetryingInputStream extends InputStream {
 
     private static final Logger logger = LogManager.getLogger(S3RetryingInputStream.class);
 
