@@ -96,7 +96,7 @@ import java.util.function.Function;
  * <dd>Large file can be divided into chunks. This parameter specifies the chunk size. Defaults to not chucked.</dd>
  * </dl>
  */
-class S3Repository extends MeteredBlobStoreRepository {
+public class S3Repository extends MeteredBlobStoreRepository {
     private static final Logger logger = LogManager.getLogger(S3Repository.class);
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(logger.getName());
 

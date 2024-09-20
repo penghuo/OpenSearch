@@ -94,7 +94,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static java.util.Collections.emptyMap;
 
-class S3Service implements Closeable {
+public class S3Service implements Closeable {
     private static final Logger logger = LogManager.getLogger(S3Service.class);
 
     private static final String STS_ENDPOINT_OVERRIDE_SYSTEM_PROPERTY = "aws.stsEndpointOverride";
@@ -114,7 +114,7 @@ class S3Service implements Closeable {
      */
     private volatile Map<Settings, S3ClientSettings> derivedClientSettings = new ConcurrentHashMap<>();
 
-    S3Service(final Path configPath) {
+    public S3Service(final Path configPath) {
         staticClientSettings = MapBuilder.<String, S3ClientSettings>newMapBuilder()
             .put("default", S3ClientSettings.getClientSettings(Settings.EMPTY, "default", configPath))
             .immutableMap();

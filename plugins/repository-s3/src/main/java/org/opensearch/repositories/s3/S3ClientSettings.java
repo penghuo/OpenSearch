@@ -59,11 +59,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 
 /**
  * A container for settings used to create an S3 client.
  */
-final class S3ClientSettings {
+final public class S3ClientSettings {
 
     private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(S3ClientSettings.class);
 
@@ -464,7 +465,7 @@ final class S3ClientSettings {
      * <p>
      * Note this will always at least return a client named "default".
      */
-    static Map<String, S3ClientSettings> load(final Settings settings, final Path configPath) {
+    public static Map<String, S3ClientSettings> load(final Settings settings, final Path configPath) {
         final Set<String> clientNames = settings.getGroups(PREFIX).keySet();
         final Map<String, S3ClientSettings> clients = new HashMap<>();
         for (final String clientName : clientNames) {
@@ -514,31 +515,32 @@ final class S3ClientSettings {
     }
 
     private static AwsCredentials loadCredentials(Settings settings, String clientName) {
-        try (
-            SecureString accessKey = getConfigValue(settings, clientName, ACCESS_KEY_SETTING);
-            SecureString secretKey = getConfigValue(settings, clientName, SECRET_KEY_SETTING);
-            SecureString sessionToken = getConfigValue(settings, clientName, SESSION_TOKEN_SETTING)
-        ) {
-            if (accessKey.length() != 0) {
-                if (secretKey.length() != 0) {
-                    if (sessionToken.length() != 0) {
-                        return AwsSessionCredentials.create(accessKey.toString(), secretKey.toString(), sessionToken.toString());
-                    } else {
-                        return AwsBasicCredentials.create(accessKey.toString(), secretKey.toString());
-                    }
-                } else {
-                    throw new IllegalArgumentException("Missing secret key for s3 client [" + clientName + "]");
-                }
-            } else {
-                if (secretKey.length() != 0) {
-                    throw new IllegalArgumentException("Missing access key for s3 client [" + clientName + "]");
-                }
-                if (sessionToken.length() != 0) {
-                    throw new IllegalArgumentException("Missing access key and secret key for s3 client [" + clientName + "]");
-                }
-                return null;
-            }
-        }
+        return DefaultCredentialsProvider.create().resolveCredentials();
+//        try (
+//            SecureString accessKey = getConfigValue(settings, clientName, ACCESS_KEY_SETTING);
+//            SecureString secretKey = getConfigValue(settings, clientName, SECRET_KEY_SETTING);
+//            SecureString sessionToken = getConfigValue(settings, clientName, SESSION_TOKEN_SETTING)
+//        ) {
+//            if (accessKey.length() != 0) {
+//                if (secretKey.length() != 0) {
+//                    if (sessionToken.length() != 0) {
+//                        return AwsSessionCredentials.create(accessKey.toString(), secretKey.toString(), sessionToken.toString());
+//                    } else {
+//                        return AwsBasicCredentials.create(accessKey.toString(), secretKey.toString());
+//                    }
+//                } else {
+//                    throw new IllegalArgumentException("Missing secret key for s3 client [" + clientName + "]");
+//                }
+//            } else {
+//                if (secretKey.length() != 0) {
+//                    throw new IllegalArgumentException("Missing access key for s3 client [" + clientName + "]");
+//                }
+//                if (sessionToken.length() != 0) {
+//                    throw new IllegalArgumentException("Missing access key and secret key for s3 client [" + clientName + "]");
+//                }
+//                return null;
+//            }
+//        }
     }
 
     @SuppressForbidden(reason = "PathUtils#get")
