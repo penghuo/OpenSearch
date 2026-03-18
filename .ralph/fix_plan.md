@@ -1,7 +1,6 @@
 # Fix Plan
 
 ## TODO
-- [ ] Lucene I/O adapters: Create `LuceneOutputFile` (adapts `IndexOutput` to Parquet `PositionOutputStream`) and `LuceneInputFile` (adapts `IndexInput` to Parquet `SeekableInputStream`) in `server/src/main/java/org/opensearch/index/codec/parquet/`. Write tests in `server/src/test/java/org/opensearch/index/codec/parquet/`. Run with `-Dtests.iters=10`.
 - [ ] ParquetTypeMapping: Create `ParquetTypeMapping.java` mapping Lucene DocValues types to Parquet primitives (NUMERIC→INT64, BINARY→BYTE_ARRAY, SORTED→BINARY with dict). Write `ParquetTypeMappingTests`. Run with `-Dtests.iters=10`.
 - [ ] ParquetDocValuesWriter: Create `ParquetDocValuesWriter` extending `DocValuesConsumer`. Implement `addNumericField`, `addBinaryField`, `addSortedField`, `addSortedNumericField`, `addSortedSetField` using parquet-column encoders. Write to `.pdvd`/`.pdvm` files via `LuceneOutputFile`. Follow `Composite912DocValuesWriter` pattern for file management. Write `ParquetDocValuesWriterTests`. Run with `-Dtests.iters=10`.
 - [ ] ParquetDocValuesReader: Create `ParquetDocValuesReader` extending `DocValuesProducer`. Read `.pdvd`/`.pdvm` via `LuceneInputFile`. Return `NumericDocValues`, `SortedNumericDocValues`, `BinaryDocValues`, `SortedDocValues`, `SortedSetDocValues` iterators. Write `ParquetDocValuesReaderTests` with round-trip tests for all 5 types. Run with `-Dtests.iters=10`.
@@ -16,3 +15,4 @@
 ## Completed
 - [x] Feature flag and index setting: Added `opensearch.experimental.feature.parquet_doc_values.enabled` feature flag in `FeatureFlags.java`, `index.codec.doc_values.format` setting in `IndexSettings.java` with `isParquetDocValuesEnabled()` accessor, registered in `IndexScopedSettings.java`.
 - [x] Parquet library dependency: Added `parquet-column`, `parquet-encoding`, `parquet-common` 1.15.1 to `server/build.gradle` via version catalog. Created LICENSE/NOTICE files under `server/licenses/`. Added thirdPartyAudit exclusions for parquet shaded classes. All precommit checks pass.
+- [x] Lucene I/O adapters: Created `LuceneOutputFile` (adapts `IndexOutput` to Parquet `PositionOutputStream`) and `LuceneInputFile` (adapts `IndexInput` to Parquet `SeekableInputStream`) in `server/src/main/java/org/opensearch/index/codec/parquet/`. Tests in `LuceneIOAdapterTests` with 12 test methods × 10 iterations all passing.
