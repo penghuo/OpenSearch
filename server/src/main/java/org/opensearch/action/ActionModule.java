@@ -177,6 +177,8 @@ import org.opensearch.action.admin.indices.mapping.put.TransportAutoPutMappingAc
 import org.opensearch.action.admin.indices.mapping.put.TransportPutMappingAction;
 import org.opensearch.action.admin.indices.open.OpenIndexAction;
 import org.opensearch.action.admin.indices.open.TransportOpenIndexAction;
+import org.opensearch.action.admin.indices.parquet.ParquetExportAction;
+import org.opensearch.action.admin.indices.parquet.TransportParquetExportAction;
 import org.opensearch.action.admin.indices.readonly.AddIndexBlockAction;
 import org.opensearch.action.admin.indices.readonly.TransportAddIndexBlockAction;
 import org.opensearch.action.admin.indices.recovery.RecoveryAction;
@@ -426,6 +428,7 @@ import org.opensearch.rest.action.admin.indices.RestIndicesSegmentsAction;
 import org.opensearch.rest.action.admin.indices.RestIndicesShardStoresAction;
 import org.opensearch.rest.action.admin.indices.RestIndicesStatsAction;
 import org.opensearch.rest.action.admin.indices.RestOpenIndexAction;
+import org.opensearch.rest.action.admin.indices.RestParquetExportAction;
 import org.opensearch.rest.action.admin.indices.RestPauseIngestionAction;
 import org.opensearch.rest.action.admin.indices.RestPutComponentTemplateAction;
 import org.opensearch.rest.action.admin.indices.RestPutComposableIndexTemplateAction;
@@ -721,6 +724,7 @@ public class ActionModule extends AbstractModule {
         actions.register(RefreshAction.INSTANCE, TransportRefreshAction.class);
         actions.register(FlushAction.INSTANCE, TransportFlushAction.class);
         actions.register(ForceMergeAction.INSTANCE, TransportForceMergeAction.class);
+        actions.register(ParquetExportAction.INSTANCE, TransportParquetExportAction.class);
         actions.register(UpgradeAction.INSTANCE, TransportUpgradeAction.class);
         actions.register(UpgradeStatusAction.INSTANCE, TransportUpgradeStatusAction.class);
         actions.register(UpgradeSettingsAction.INSTANCE, TransportUpgradeSettingsAction.class);
@@ -934,6 +938,7 @@ public class ActionModule extends AbstractModule {
         registerHandler.accept(new RestFlushAction());
         registerHandler.accept(new RestSyncedFlushAction());
         registerHandler.accept(new RestForceMergeAction());
+        registerHandler.accept(new RestParquetExportAction());
         registerHandler.accept(new RestUpgradeAction());
         registerHandler.accept(new RestUpgradeStatusAction());
         registerHandler.accept(new RestClearIndicesCacheAction());

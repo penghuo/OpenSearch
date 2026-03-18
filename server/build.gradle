@@ -126,6 +126,7 @@ dependencies {
   api libs.parquet.column
   api libs.parquet.encoding
   api libs.parquet.common
+  api libs.parquet.format.structures
   testImplementation 'org.awaitility:awaitility:4.3.0'
   testImplementation(project(":test:framework")) {
     // tests use the locally compiled version of server
@@ -404,9 +405,7 @@ tasks.named("thirdPartyAudit").configure {
             'jdk.incubator.vector.VectorMask',
             'jdk.incubator.vector.VectorOperators',
             'jdk.incubator.vector.VectorShape',
-            'jdk.incubator.vector.VectorSpecies',
-            // from parquet-encoding
-            'org.apache.parquet.format.CompressionCodec'
+            'jdk.incubator.vector.VectorSpecies'
     )
     ignoreViolations(
             'com.google.protobuf.MessageSchema',

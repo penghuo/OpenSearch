@@ -173,6 +173,7 @@ roaringbitmap = { group = "org.roaringbitmap", name = "RoaringBitmap", version.r
 parquet-column = { group = "org.apache.parquet", name = "parquet-column", version.ref = "parquet" }
 parquet-encoding = { group = "org.apache.parquet", name = "parquet-encoding", version.ref = "parquet" }
 parquet-common = { group = "org.apache.parquet", name = "parquet-common", version.ref = "parquet" }
+parquet-format-structures = { group = "org.apache.parquet", name = "parquet-format-structures", version.ref = "parquet" }
 
 spatial4j = { group = "org.locationtech.spatial4j", name = "spatial4j", version.ref = "spatial4j" }
 tdigest = { group = "com.tdunning", name = "t-digest", version.ref = "tdigest" }
