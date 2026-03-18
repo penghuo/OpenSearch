@@ -1234,7 +1234,7 @@ public final class IndexSettings {
         defaultSearchPipeline = scopedSettings.get(DEFAULT_SEARCH_PIPELINE);
         derivedSourceEnabled = scopedSettings.get(INDEX_DERIVED_SOURCE_SETTING);
         derivedSourceEnabledForTranslog = scopedSettings.get(INDEX_DERIVED_SOURCE_TRANSLOG_ENABLED_SETTING);
-        parquetDocValuesEnabled = "parquet".equals(scopedSettings.get(INDEX_DOC_VALUES_FORMAT_SETTING));
+        parquetDocValuesEnabled = "parquet".equals(settings.get(INDEX_DOC_VALUES_FORMAT_SETTING.getKey(), ""));
         scopedSettings.addSettingsUpdateConsumer(INDEX_DERIVED_SOURCE_TRANSLOG_ENABLED_SETTING, this::setDerivedSourceEnabledForTranslog);
         /* There was unintentional breaking change got introduced with [OpenSearch-6424](https://github.com/opensearch-project/OpenSearch/pull/6424) (version 2.7).
          * For indices created prior version (prior to 2.7) which has IndexSort type, they used to type cast the SortField.Type

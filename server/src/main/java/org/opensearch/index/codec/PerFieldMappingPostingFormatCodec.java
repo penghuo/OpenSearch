@@ -42,6 +42,7 @@ import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.codec.fuzzy.FuzzyFilterPostingsFormat;
 import org.opensearch.index.codec.fuzzy.FuzzySetFactory;
 import org.opensearch.index.codec.fuzzy.FuzzySetParameters;
+import org.opensearch.index.codec.parquet.ParquetDocValuesFormat;
 import org.opensearch.index.mapper.CompletionFieldMapper;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -63,6 +64,7 @@ public class PerFieldMappingPostingFormatCodec extends Lucene104Codec {
     private final Logger logger;
     private final MapperService mapperService;
     private final DocValuesFormat dvFormat = new Lucene90DocValuesFormat();
+    private final DocValuesFormat parquetDvFormat = new ParquetDocValuesFormat();
     private final FuzzySetFactory fuzzySetFactory;
     private PostingsFormat docIdPostingsFormat;
 
@@ -101,6 +103,9 @@ public class PerFieldMappingPostingFormatCodec extends Lucene104Codec {
 
     @Override
     public DocValuesFormat getDocValuesFormatForField(String field) {
+        if (mapperService != null && mapperService.getIndexSettings().isParquetDocValuesEnabled()) {
+            return parquetDvFormat;
+        }
         return dvFormat;
     }
 }
