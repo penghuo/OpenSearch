@@ -98,15 +98,17 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
+        List<Integer> docIdList = new ArrayList<>();
         NumericDocValues values = valuesProducer.getNumeric(field);
         while (values.nextDoc() != NumericDocValues.NO_MORE_DOCS) {
+            docIdList.add(values.docID());
             cw.write(values.longValue(), 0, 0);
             writeStore.endRecord();
         }
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter());
+        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
     }
 
     @Override
@@ -119,16 +121,18 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
+        List<Integer> docIdList = new ArrayList<>();
         BinaryDocValues values = valuesProducer.getBinary(field);
         while (values.nextDoc() != BinaryDocValues.NO_MORE_DOCS) {
+            docIdList.add(values.docID());
             BytesRef br = values.binaryValue();
-            cw.write(Binary.fromConstantByteArray(br.bytes, br.offset, br.length), 0, 0);
+            cw.write(Binary.fromReusedByteArray(br.bytes, br.offset, br.length), 0, 0);
             writeStore.endRecord();
         }
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter());
+        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
     }
 
     @Override
@@ -144,16 +148,18 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             .newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
+        List<Integer> docIdList = new ArrayList<>();
         SortedDocValues values = valuesProducer.getSorted(field);
         while (values.nextDoc() != SortedDocValues.NO_MORE_DOCS) {
+            docIdList.add(values.docID());
             BytesRef br = values.lookupOrd(values.ordValue());
-            cw.write(Binary.fromConstantByteArray(br.bytes, br.offset, br.length), 0, 0);
+            cw.write(Binary.fromReusedByteArray(br.bytes, br.offset, br.length), 0, 0);
             writeStore.endRecord();
         }
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter());
+        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
     }
 
     @Override
@@ -166,8 +172,10 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
+        List<Integer> docIdList = new ArrayList<>();
         SortedNumericDocValues values = valuesProducer.getSortedNumeric(field);
         while (values.nextDoc() != SortedNumericDocValues.NO_MORE_DOCS) {
+            docIdList.add(values.docID());
             int count = values.docValueCount();
             if (count == 0) {
                 cw.writeNull(0, 0);
@@ -182,7 +190,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter());
+        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
     }
 
     @Override
@@ -198,8 +206,10 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             .newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
+        List<Integer> docIdList = new ArrayList<>();
         SortedSetDocValues values = valuesProducer.getSortedSet(field);
         while (values.nextDoc() != SortedSetDocValues.NO_MORE_DOCS) {
+            docIdList.add(values.docID());
             int count = values.docValueCount();
             if (count == 0) {
                 cw.writeNull(0, 0);
@@ -208,7 +218,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
                     long ord = values.nextOrd();
                     BytesRef br = values.lookupOrd(ord);
                     int rep = (i == 0) ? 0 : 1;
-                    cw.write(Binary.fromConstantByteArray(br.bytes, br.offset, br.length), rep, 1);
+                    cw.write(Binary.fromReusedByteArray(br.bytes, br.offset, br.length), rep, 1);
                 }
             }
             writeStore.endRecord();
@@ -216,11 +226,25 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter());
+        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
     }
+
+    private static int[] toIntArray(List<Integer> list) {
+        int[] arr = new int[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            arr[i] = list.get(i);
+        }
+        return arr;
+    }
+
+    private boolean closed;
 
     @Override
     public void close() throws IOException {
+        if (closed) {
+            return;
+        }
+        closed = true;
         boolean success = false;
         try {
             if (metaOut != null) {
@@ -243,10 +267,23 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     /**
      * Writes captured Parquet pages for one field to the data file and records
      * metadata (field name, type, offset, page count) in the meta file.
+     * Doc IDs are written first so the reader can map sparse doc values back
+     * to the correct document.
      */
-    private void writeFieldData(String fieldName, String dvTypeName, PrimitiveType parquetType, CapturingPageWriter pageWriter)
-        throws IOException {
+    private void writeFieldData(
+        String fieldName,
+        String dvTypeName,
+        PrimitiveType parquetType,
+        CapturingPageWriter pageWriter,
+        int[] docIds
+    ) throws IOException {
         long dataStartOffset = dataOut.getFilePointer();
+
+        // Write doc IDs for sparse doc values support
+        dataOut.writeInt(docIds.length);
+        for (int docId : docIds) {
+            dataOut.writeInt(docId);
+        }
 
         DictionaryPage dictPage = pageWriter.getDictionaryPage();
         boolean hasDictionary = dictPage != null;
