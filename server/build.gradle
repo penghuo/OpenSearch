@@ -121,6 +121,11 @@ dependencies {
 
   // https://mvnrepository.com/artifact/org.roaringbitmap/RoaringBitmap
   api libs.roaringbitmap
+
+  // parquet doc values
+  api libs.parquet.column
+  api libs.parquet.encoding
+  api libs.parquet.common
   testImplementation 'org.awaitility:awaitility:4.3.0'
   testImplementation(project(":test:framework")) {
     // tests use the locally compiled version of server
@@ -399,7 +404,9 @@ tasks.named("thirdPartyAudit").configure {
             'jdk.incubator.vector.VectorMask',
             'jdk.incubator.vector.VectorOperators',
             'jdk.incubator.vector.VectorShape',
-            'jdk.incubator.vector.VectorSpecies'
+            'jdk.incubator.vector.VectorSpecies',
+            // from parquet-encoding
+            'org.apache.parquet.format.CompressionCodec'
     )
     ignoreViolations(
             'com.google.protobuf.MessageSchema',
@@ -412,7 +419,17 @@ tasks.named("thirdPartyAudit").configure {
             'org.apache.logging.log4j.core.util.internal.UnsafeUtil',
             'org.apache.logging.log4j.core.util.internal.UnsafeUtil$1',
             'reactor.core.publisher.CallSiteSupplierFactory$SharedSecretsCallSiteSupplierFactory',
-            'reactor.core.publisher.CallSiteSupplierFactory$SharedSecretsCallSiteSupplierFactory$TracingException'
+            'reactor.core.publisher.CallSiteSupplierFactory$SharedSecretsCallSiteSupplierFactory$TracingException',
+            // from parquet-common shaded hashing
+            'shaded.parquet.net.openhft.hashing.HotSpotPrior7u6StringHash',
+            'shaded.parquet.net.openhft.hashing.LongHashFunction',
+            'shaded.parquet.net.openhft.hashing.LongTupleHashFunction',
+            'shaded.parquet.net.openhft.hashing.ModernCompactStringHash',
+            'shaded.parquet.net.openhft.hashing.ModernHotSpotStringHash',
+            'shaded.parquet.net.openhft.hashing.UnsafeAccess',
+            'shaded.parquet.net.openhft.hashing.UnsafeAccess$OldUnsafeAccessBigEndian',
+            'shaded.parquet.net.openhft.hashing.UnsafeAccess$OldUnsafeAccessLittleEndian',
+            'shaded.parquet.net.openhft.hashing.Util'
     )
 }
 
@@ -420,6 +437,7 @@ tasks.named("dependencyLicenses").configure {
     mapping from: /jackson-.*/, to: 'jackson'
     mapping from: /reactor-.*/, to: 'reactor'
     mapping from: /lucene-.*/, to: 'lucene'
+    mapping from: /parquet-.*/, to: 'parquet'
     dependencies = project.configurations.runtimeClasspath.incoming.artifactView {
         componentFilter {
             it instanceof ModuleComponentIdentifier &&

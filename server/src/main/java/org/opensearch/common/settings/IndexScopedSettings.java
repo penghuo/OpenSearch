@@ -328,7 +328,9 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
     public static final Map<String, List<Setting>> FEATURE_FLAGGED_INDEX_SETTINGS = Map.of(
         FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG,
         // TODO: Create a separate feature flag for hot tiering index state.
-        List.of(IndexModule.INDEX_STORE_LOCALITY_SETTING, IndexModule.INDEX_TIERING_STATE, IndexModule.IS_WARM_INDEX_SETTING)
+        List.of(IndexModule.INDEX_STORE_LOCALITY_SETTING, IndexModule.INDEX_TIERING_STATE, IndexModule.IS_WARM_INDEX_SETTING),
+        FeatureFlags.PARQUET_DOC_VALUES,
+        List.of(IndexSettings.INDEX_DOC_VALUES_FORMAT_SETTING)
     );
 
     public static final IndexScopedSettings DEFAULT_SCOPED_SETTINGS = new IndexScopedSettings(Settings.EMPTY, BUILT_IN_INDEX_SETTINGS);

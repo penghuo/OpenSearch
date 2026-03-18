@@ -117,6 +117,12 @@ public class FeatureFlags {
     public static final Setting<Boolean> STREAM_TRANSPORT_SETTING = Setting.boolSetting(STREAM_TRANSPORT, false, Property.NodeScope);
 
     /**
+     * Gates the functionality of Parquet-backed doc_values format.
+     */
+    public static final String PARQUET_DOC_VALUES = FEATURE_FLAG_PREFIX + "parquet_doc_values.enabled";
+    public static final Setting<Boolean> PARQUET_DOC_VALUES_SETTING = Setting.boolSetting(PARQUET_DOC_VALUES, false, Property.NodeScope);
+
+    /**
      * Underlying implementation for feature flags.
      * All settable feature flags are tracked here in FeatureFlagsImpl.featureFlags.
      * Contains all functionality across test and server use cases.
@@ -140,6 +146,7 @@ public class FeatureFlags {
                 );
                 put(TERM_VERSION_PRECOMMIT_ENABLE_SETTING, TERM_VERSION_PRECOMMIT_ENABLE_SETTING.getDefault(Settings.EMPTY));
                 put(STREAM_TRANSPORT_SETTING, STREAM_TRANSPORT_SETTING.getDefault(Settings.EMPTY));
+                put(PARQUET_DOC_VALUES_SETTING, PARQUET_DOC_VALUES_SETTING.getDefault(Settings.EMPTY));
                 put(CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING, CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING.getDefault(Settings.EMPTY));
             }
         };

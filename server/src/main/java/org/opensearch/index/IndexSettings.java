@@ -917,6 +917,17 @@ public final class IndexSettings {
         Property.Dynamic
     );
 
+    /**
+     * Setting to configure the doc_values format for an index. When set to "parquet",
+     * doc_values are stored using Apache Parquet encoding instead of Lucene's native format.
+     */
+    public static final Setting<String> INDEX_DOC_VALUES_FORMAT_SETTING = Setting.simpleString(
+        "index.codec.doc_values.format",
+        "",
+        Property.IndexScope,
+        Property.Final
+    );
+
     private final Index index;
     private final Version version;
     private final Logger logger;
@@ -974,6 +985,7 @@ public final class IndexSettings {
     private volatile boolean allowDerivedField;
     private final boolean derivedSourceEnabled;
     private volatile boolean derivedSourceEnabledForTranslog;
+    private final boolean parquetDocValuesEnabled;
 
     /**
      * The maximum age of a retention lease before it is considered expired.
@@ -1222,6 +1234,7 @@ public final class IndexSettings {
         defaultSearchPipeline = scopedSettings.get(DEFAULT_SEARCH_PIPELINE);
         derivedSourceEnabled = scopedSettings.get(INDEX_DERIVED_SOURCE_SETTING);
         derivedSourceEnabledForTranslog = scopedSettings.get(INDEX_DERIVED_SOURCE_TRANSLOG_ENABLED_SETTING);
+        parquetDocValuesEnabled = "parquet".equals(scopedSettings.get(INDEX_DOC_VALUES_FORMAT_SETTING));
         scopedSettings.addSettingsUpdateConsumer(INDEX_DERIVED_SOURCE_TRANSLOG_ENABLED_SETTING, this::setDerivedSourceEnabledForTranslog);
         /* There was unintentional breaking change got introduced with [OpenSearch-6424](https://github.com/opensearch-project/OpenSearch/pull/6424) (version 2.7).
          * For indices created prior version (prior to 2.7) which has IndexSort type, they used to type cast the SortField.Type
@@ -2359,5 +2372,12 @@ public final class IndexSettings {
 
     public boolean isDerivedSourceEnabled() {
         return derivedSourceEnabled;
+    }
+
+    /**
+     * Returns true if the parquet doc_values format is enabled for this index.
+     */
+    public boolean isParquetDocValuesEnabled() {
+        return parquetDocValuesEnabled;
     }
 }
