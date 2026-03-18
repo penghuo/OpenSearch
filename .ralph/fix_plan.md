@@ -1,7 +1,7 @@
 # Fix Plan
 
 ## TODO
-- [ ] ParquetTypeMapping: Create `ParquetTypeMapping.java` mapping Lucene DocValues types to Parquet primitives (NUMERIC→INT64, BINARY→BYTE_ARRAY, SORTED→BINARY with dict). Write `ParquetTypeMappingTests`. Run with `-Dtests.iters=10`.
+- [x] ParquetTypeMapping: Created `ParquetTypeMapping.java` with all 5 type mappings (NUMERIC→REQUIRED INT64, SORTED_NUMERIC→REPEATED INT64, BINARY→REQUIRED BINARY, SORTED→REQUIRED BINARY, SORTED_SET→REPEATED BINARY) plus messageType/columnDescriptor/level helpers. `ParquetTypeMappingTests` with 11 test methods × 10 iterations all passing.
 - [ ] ParquetDocValuesWriter: Create `ParquetDocValuesWriter` extending `DocValuesConsumer`. Implement `addNumericField`, `addBinaryField`, `addSortedField`, `addSortedNumericField`, `addSortedSetField` using parquet-column encoders. Write to `.pdvd`/`.pdvm` files via `LuceneOutputFile`. Follow `Composite912DocValuesWriter` pattern for file management. Write `ParquetDocValuesWriterTests`. Run with `-Dtests.iters=10`.
 - [ ] ParquetDocValuesReader: Create `ParquetDocValuesReader` extending `DocValuesProducer`. Read `.pdvd`/`.pdvm` via `LuceneInputFile`. Return `NumericDocValues`, `SortedNumericDocValues`, `BinaryDocValues`, `SortedDocValues`, `SortedSetDocValues` iterators. Write `ParquetDocValuesReaderTests` with round-trip tests for all 5 types. Run with `-Dtests.iters=10`.
 - [ ] ParquetDocValuesFormat and conformance tests: Create `ParquetDocValuesFormat` extending `DocValuesFormat` with extensions `.pdvd`/`.pdvm`. Create `ParquetDocValuesFormatTests` extending Lucene's `BaseDocValuesFormatTestCase`. ALL conformance tests must pass. Run with `-Dtests.iters=3`.
