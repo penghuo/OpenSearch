@@ -127,6 +127,8 @@ dependencies {
   api libs.parquet.encoding
   api libs.parquet.common
   api libs.parquet.format.structures
+  api libs.slf4japi
+  api libs.log4jslf4j2impl
   testImplementation 'org.awaitility:awaitility:4.3.0'
   testImplementation(project(":test:framework")) {
     // tests use the locally compiled version of server
@@ -350,8 +352,6 @@ tasks.named("thirdPartyAudit").configure {
             'org.osgi.framework.wiring.BundleRevision',
             'org.osgi.framework.wiring.BundleWire',
             'org.osgi.framework.wiring.BundleWiring',
-            'org.slf4j.Logger',
-            'org.slf4j.LoggerFactory',
             'org.zeromq.SocketType',
             'org.zeromq.ZContext',
             'org.zeromq.ZMQ',

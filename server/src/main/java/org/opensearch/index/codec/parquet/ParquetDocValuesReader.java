@@ -78,6 +78,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final long dataLength;
         final int pageCount;
         final boolean hasDictionary;
+        final long docIdOffset;
 
         FieldMeta(
             String fieldName,
@@ -87,7 +88,8 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             long dataStartOffset,
             long dataLength,
             int pageCount,
-            boolean hasDictionary
+            boolean hasDictionary,
+            long docIdOffset
         ) {
             this.fieldName = fieldName;
             this.dvTypeName = dvTypeName;
@@ -97,6 +99,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             this.dataLength = dataLength;
             this.pageCount = pageCount;
             this.hasDictionary = hasDictionary;
+            this.docIdOffset = docIdOffset;
         }
     }
 
@@ -156,9 +159,20 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             long dataLength = metaIn.readLong();
             int pageCount = metaIn.readInt();
             boolean hasDictionary = metaIn.readByte() == 1;
+            long docIdOffset = metaIn.readLong();
             fields.put(
                 fieldName,
-                new FieldMeta(fieldName, dvTypeName, repetition, primitiveTypeName, dataStartOffset, dataLength, pageCount, hasDictionary)
+                new FieldMeta(
+                    fieldName,
+                    dvTypeName,
+                    repetition,
+                    primitiveTypeName,
+                    dataStartOffset,
+                    dataLength,
+                    pageCount,
+                    hasDictionary,
+                    docIdOffset
+                )
             );
             fieldName = metaIn.readString();
         }
@@ -166,7 +180,8 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
     /**
      * Reads doc IDs and all values for a field from the data file using Parquet's ColumnReader.
-     * Returns a FieldData containing the doc IDs and the ColumnReader for decoding values.
+     * Version 1 format: [data pages...][dictionary page][docCount][docIds...]
+     * Doc IDs are located at meta.docIdOffset within the field's data slice.
      */
     private FieldData readFieldData(FieldMeta meta, PrimitiveType parquetType) throws IOException {
         MessageType schema = ParquetTypeMapping.messageType(meta.fieldName, parquetType);
@@ -174,27 +189,23 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
         IndexInput slice = dataIn.slice("field:" + meta.fieldName, meta.dataStartOffset, meta.dataLength);
 
-        // Read doc IDs
-        int docCount = slice.readInt();
+        // Read doc IDs from the docIdOffset position
+        IndexInput docIdSlice = dataIn.slice(
+            "field-docids:" + meta.fieldName,
+            meta.dataStartOffset + meta.docIdOffset,
+            meta.dataLength - meta.docIdOffset
+        );
+        int docCount = docIdSlice.readInt();
         int[] docIds = new int[docCount];
         for (int i = 0; i < docCount; i++) {
-            docIds[i] = slice.readInt();
+            docIds[i] = docIdSlice.readInt();
         }
 
         if (docCount == 0) {
             return new FieldData(docIds, null);
         }
 
-        DictionaryPage dictPage = null;
-        if (meta.hasDictionary) {
-            int dictBytesLen = slice.readInt();
-            int dictSize = slice.readInt();
-            String dictEncodingName = slice.readString();
-            byte[] dictBytes = new byte[dictBytesLen];
-            slice.readBytes(dictBytes, 0, dictBytesLen);
-            dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
-        }
-
+        // Read data pages from the beginning of the slice
         List<DataPage> dataPages = new ArrayList<>();
         long totalValueCount = 0;
         long totalRowCount = 0;
@@ -220,6 +231,17 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             );
             totalValueCount += valueCount;
             totalRowCount += rowCount;
+        }
+
+        // Read dictionary page (after data pages, before doc IDs)
+        DictionaryPage dictPage = null;
+        if (meta.hasDictionary) {
+            int dictBytesLen = slice.readInt();
+            int dictSize = slice.readInt();
+            String dictEncodingName = slice.readString();
+            byte[] dictBytes = new byte[dictBytesLen];
+            slice.readBytes(dictBytes, 0, dictBytesLen);
+            dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
         }
 
         final DictionaryPage finalDictPage = dictPage;

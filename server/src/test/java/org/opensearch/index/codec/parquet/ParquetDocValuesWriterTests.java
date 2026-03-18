@@ -273,6 +273,7 @@ public class ParquetDocValuesWriterTests extends OpenSearchTestCase {
                 in.readLong(); // length
                 in.readInt(); // pageCount
                 in.readByte(); // hasDictionary (boolean)
+                in.readLong(); // docIdOffset
 
                 // Next should be the end marker
                 String marker = in.readString();

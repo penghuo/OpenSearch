@@ -38,29 +38,32 @@ import org.apache.parquet.schema.PrimitiveType;
 import org.opensearch.common.util.io.IOUtils;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Arrays;
 
 /**
- * Writes Lucene doc values using Parquet column encoding.
+ * Writes Lucene doc values using Parquet column encoding with streaming page writes.
  *
- * <p>Each field is encoded as a Parquet column chunk using {@code ColumnWriteStoreV1}
- * with a custom in-memory {@link PageWriteStore}. Encoded pages are serialized to
- * a {@code .pdvd} data file, with field metadata (offsets, page counts, types)
- * written to a {@code .pdvm} metadata file.</p>
+ * <p>Pages are written directly to the {@code .pdvd} data file as they are produced
+ * by the Parquet column writer, avoiding buffering all encoded data in memory.
+ * Doc IDs are accumulated in a compact {@code int[]} and written after the pages.
+ * Field metadata is written to the {@code .pdvm} metadata file.</p>
+ *
+ * <p>File format per field in .pdvd (version 1):
+ * <pre>
+ *   [data pages...]
+ *   [dictionary page (if any)]
+ *   [int: docCount][int[]: docIds]
+ * </pre>
+ * Metadata per field in .pdvm includes a {@code docIdOffset} so the reader can
+ * locate the doc ID section without scanning pages.
  *
  * @opensearch.experimental
  */
 public class ParquetDocValuesWriter extends DocValuesConsumer {
 
-    /** Codec name written into file headers for validation on read. */
     static final String DATA_CODEC = "ParquetDocValuesData";
-    /** Codec name for the metadata file. */
     static final String META_CODEC = "ParquetDocValuesMeta";
-    /** Current format version. */
-    static final int VERSION_CURRENT = 0;
-
-    /** Marker written to metadata to signal end of field entries. */
+    static final int VERSION_CURRENT = 1;
     static final String END_MARKER = "__END__";
 
     private final IndexOutput dataOut;
@@ -94,21 +97,37 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         MessageType schema = ParquetTypeMapping.messageType(field.name, parquetType);
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
-        CapturingPageWriteStore pageStore = new CapturingPageWriteStore(descriptor);
+        long dataStartOffset = dataOut.getFilePointer();
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
-        List<Integer> docIdList = new ArrayList<>();
+        IntArrayBuilder docIds = new IntArrayBuilder();
         NumericDocValues values = valuesProducer.getNumeric(field);
         while (values.nextDoc() != NumericDocValues.NO_MORE_DOCS) {
-            docIdList.add(values.docID());
+            docIds.add(values.docID());
             cw.write(values.longValue(), 0, 0);
             writeStore.endRecord();
         }
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
+        pageWriter.writeDictionaryPageToOutput();
+        long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
+        writeDocIds(docIds);
+        long dataLength = dataOut.getFilePointer() - dataStartOffset;
+
+        writeFieldMeta(
+            field.name,
+            field.getDocValuesType().name(),
+            parquetType,
+            dataStartOffset,
+            dataLength,
+            pageWriter.getPageCount(),
+            pageWriter.hasDictionary(),
+            docIdOffset
+        );
     }
 
     @Override
@@ -117,14 +136,16 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         MessageType schema = ParquetTypeMapping.messageType(field.name, parquetType);
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
-        CapturingPageWriteStore pageStore = new CapturingPageWriteStore(descriptor);
+        long dataStartOffset = dataOut.getFilePointer();
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
-        List<Integer> docIdList = new ArrayList<>();
+        IntArrayBuilder docIds = new IntArrayBuilder();
         BinaryDocValues values = valuesProducer.getBinary(field);
         while (values.nextDoc() != BinaryDocValues.NO_MORE_DOCS) {
-            docIdList.add(values.docID());
+            docIds.add(values.docID());
             BytesRef br = values.binaryValue();
             cw.write(Binary.fromReusedByteArray(br.bytes, br.offset, br.length), 0, 0);
             writeStore.endRecord();
@@ -132,7 +153,21 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
+        pageWriter.writeDictionaryPageToOutput();
+        long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
+        writeDocIds(docIds);
+        long dataLength = dataOut.getFilePointer() - dataStartOffset;
+
+        writeFieldMeta(
+            field.name,
+            field.getDocValuesType().name(),
+            parquetType,
+            dataStartOffset,
+            dataLength,
+            pageWriter.getPageCount(),
+            pageWriter.hasDictionary(),
+            docIdOffset
+        );
     }
 
     @Override
@@ -141,17 +176,19 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         MessageType schema = ParquetTypeMapping.messageType(field.name, parquetType);
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
-        CapturingPageWriteStore pageStore = new CapturingPageWriteStore(descriptor);
+        long dataStartOffset = dataOut.getFilePointer();
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder()
             .withDictionaryEncoding(true)
             .build()
             .newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
-        List<Integer> docIdList = new ArrayList<>();
+        IntArrayBuilder docIds = new IntArrayBuilder();
         SortedDocValues values = valuesProducer.getSorted(field);
         while (values.nextDoc() != SortedDocValues.NO_MORE_DOCS) {
-            docIdList.add(values.docID());
+            docIds.add(values.docID());
             BytesRef br = values.lookupOrd(values.ordValue());
             cw.write(Binary.fromReusedByteArray(br.bytes, br.offset, br.length), 0, 0);
             writeStore.endRecord();
@@ -159,7 +196,21 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
+        pageWriter.writeDictionaryPageToOutput();
+        long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
+        writeDocIds(docIds);
+        long dataLength = dataOut.getFilePointer() - dataStartOffset;
+
+        writeFieldMeta(
+            field.name,
+            field.getDocValuesType().name(),
+            parquetType,
+            dataStartOffset,
+            dataLength,
+            pageWriter.getPageCount(),
+            pageWriter.hasDictionary(),
+            docIdOffset
+        );
     }
 
     @Override
@@ -168,14 +219,16 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         MessageType schema = ParquetTypeMapping.messageType(field.name, parquetType);
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
-        CapturingPageWriteStore pageStore = new CapturingPageWriteStore(descriptor);
+        long dataStartOffset = dataOut.getFilePointer();
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
-        List<Integer> docIdList = new ArrayList<>();
+        IntArrayBuilder docIds = new IntArrayBuilder();
         SortedNumericDocValues values = valuesProducer.getSortedNumeric(field);
         while (values.nextDoc() != SortedNumericDocValues.NO_MORE_DOCS) {
-            docIdList.add(values.docID());
+            docIds.add(values.docID());
             int count = values.docValueCount();
             if (count == 0) {
                 cw.writeNull(0, 0);
@@ -190,7 +243,21 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
+        pageWriter.writeDictionaryPageToOutput();
+        long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
+        writeDocIds(docIds);
+        long dataLength = dataOut.getFilePointer() - dataStartOffset;
+
+        writeFieldMeta(
+            field.name,
+            field.getDocValuesType().name(),
+            parquetType,
+            dataStartOffset,
+            dataLength,
+            pageWriter.getPageCount(),
+            pageWriter.hasDictionary(),
+            docIdOffset
+        );
     }
 
     @Override
@@ -199,17 +266,19 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         MessageType schema = ParquetTypeMapping.messageType(field.name, parquetType);
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
-        CapturingPageWriteStore pageStore = new CapturingPageWriteStore(descriptor);
+        long dataStartOffset = dataOut.getFilePointer();
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder()
             .withDictionaryEncoding(true)
             .build()
             .newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
-        List<Integer> docIdList = new ArrayList<>();
+        IntArrayBuilder docIds = new IntArrayBuilder();
         SortedSetDocValues values = valuesProducer.getSortedSet(field);
         while (values.nextDoc() != SortedSetDocValues.NO_MORE_DOCS) {
-            docIdList.add(values.docID());
+            docIds.add(values.docID());
             int count = values.docValueCount();
             if (count == 0) {
                 cw.writeNull(0, 0);
@@ -226,15 +295,49 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeStore.flush();
         writeStore.close();
 
-        writeFieldData(field.name, field.getDocValuesType().name(), parquetType, pageStore.capturingWriter(), toIntArray(docIdList));
+        pageWriter.writeDictionaryPageToOutput();
+        long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
+        writeDocIds(docIds);
+        long dataLength = dataOut.getFilePointer() - dataStartOffset;
+
+        writeFieldMeta(
+            field.name,
+            field.getDocValuesType().name(),
+            parquetType,
+            dataStartOffset,
+            dataLength,
+            pageWriter.getPageCount(),
+            pageWriter.hasDictionary(),
+            docIdOffset
+        );
     }
 
-    private static int[] toIntArray(List<Integer> list) {
-        int[] arr = new int[list.size()];
-        for (int i = 0; i < list.size(); i++) {
-            arr[i] = list.get(i);
+    private void writeDocIds(IntArrayBuilder docIds) throws IOException {
+        dataOut.writeInt(docIds.size());
+        for (int i = 0; i < docIds.size(); i++) {
+            dataOut.writeInt(docIds.get(i));
         }
-        return arr;
+    }
+
+    private void writeFieldMeta(
+        String fieldName,
+        String dvTypeName,
+        PrimitiveType parquetType,
+        long dataStartOffset,
+        long dataLength,
+        int pageCount,
+        boolean hasDictionary,
+        long docIdOffset
+    ) throws IOException {
+        metaOut.writeString(fieldName);
+        metaOut.writeString(dvTypeName);
+        metaOut.writeString(parquetType.getRepetition().name());
+        metaOut.writeString(parquetType.getPrimitiveTypeName().name());
+        metaOut.writeLong(dataStartOffset);
+        metaOut.writeLong(dataLength);
+        metaOut.writeInt(pageCount);
+        metaOut.writeByte(hasDictionary ? (byte) 1 : (byte) 0);
+        metaOut.writeLong(docIdOffset);
     }
 
     private boolean closed;
@@ -265,91 +368,18 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     }
 
     /**
-     * Writes captured Parquet pages for one field to the data file and records
-     * metadata (field name, type, offset, page count) in the meta file.
-     * Doc IDs are written first so the reader can map sparse doc values back
-     * to the correct document.
+     * A {@link PageWriter} that streams data pages directly to an {@link IndexOutput},
+     * avoiding in-memory buffering. Dictionary pages are deferred until after all data
+     * pages are written (they arrive during flush, after data pages).
      */
-    private void writeFieldData(
-        String fieldName,
-        String dvTypeName,
-        PrimitiveType parquetType,
-        CapturingPageWriter pageWriter,
-        int[] docIds
-    ) throws IOException {
-        long dataStartOffset = dataOut.getFilePointer();
-
-        // Write doc IDs for sparse doc values support
-        dataOut.writeInt(docIds.length);
-        for (int docId : docIds) {
-            dataOut.writeInt(docId);
-        }
-
-        DictionaryPage dictPage = pageWriter.getDictionaryPage();
-        boolean hasDictionary = dictPage != null;
-        if (hasDictionary) {
-            byte[] dictBytes = dictPage.getBytes().toByteArray();
-            dataOut.writeInt(dictBytes.length);
-            dataOut.writeInt(dictPage.getDictionarySize());
-            dataOut.writeString(dictPage.getEncoding().name());
-            dataOut.writeBytes(dictBytes, dictBytes.length);
-        }
-
-        List<CapturedPage> pages = pageWriter.getPages();
-        for (CapturedPage page : pages) {
-            byte[] pageBytes = page.bytes.toByteArray();
-            dataOut.writeInt(pageBytes.length);
-            dataOut.writeInt(page.valueCount);
-            dataOut.writeInt(page.rowCount);
-            dataOut.writeString(page.valuesEncoding.name());
-            dataOut.writeString(page.rlEncoding.name());
-            dataOut.writeString(page.dlEncoding.name());
-            dataOut.writeBytes(pageBytes, pageBytes.length);
-        }
-
-        long dataEndOffset = dataOut.getFilePointer();
-
-        metaOut.writeString(fieldName);
-        metaOut.writeString(dvTypeName);
-        metaOut.writeString(parquetType.getRepetition().name());
-        metaOut.writeString(parquetType.getPrimitiveTypeName().name());
-        metaOut.writeLong(dataStartOffset);
-        metaOut.writeLong(dataEndOffset - dataStartOffset);
-        metaOut.writeInt(pages.size());
-        metaOut.writeByte(hasDictionary ? (byte) 1 : (byte) 0);
-    }
-
-    /** Holds the raw bytes and metadata of a single captured data page. */
-    static class CapturedPage {
-        final BytesInput bytes;
-        final int valueCount;
-        final int rowCount;
-        final Encoding valuesEncoding;
-        final Encoding rlEncoding;
-        final Encoding dlEncoding;
-
-        CapturedPage(BytesInput bytes, int valueCount, int rowCount, Encoding valuesEncoding, Encoding rlEncoding, Encoding dlEncoding) {
-            try {
-                this.bytes = BytesInput.from(bytes.toByteArray());
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to copy page bytes", e);
-            }
-            this.valueCount = valueCount;
-            this.rowCount = rowCount;
-            this.valuesEncoding = valuesEncoding;
-            this.rlEncoding = rlEncoding;
-            this.dlEncoding = dlEncoding;
-        }
-    }
-
-    /**
-     * A {@link PageWriter} that captures pages in memory rather than writing to disk.
-     * Used as the sink for {@code ColumnWriteStoreV1} during encoding.
-     */
-    static class CapturingPageWriter implements PageWriter {
-        private final List<CapturedPage> pages = new ArrayList<>();
+    static class StreamingPageWriter implements PageWriter {
+        private final IndexOutput out;
+        private int pageCount;
         private DictionaryPage dictionaryPage;
-        private long memSize;
+
+        StreamingPageWriter(IndexOutput out) {
+            this.out = out;
+        }
 
         @Override
         public void writePage(
@@ -373,8 +403,15 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             Encoding dlEncoding,
             Encoding valuesEncoding
         ) throws IOException {
-            pages.add(new CapturedPage(bytes, valueCount, rowCount, valuesEncoding, rlEncoding, dlEncoding));
-            memSize += bytes.size();
+            byte[] pageBytes = bytes.toByteArray();
+            out.writeInt(pageBytes.length);
+            out.writeInt(valueCount);
+            out.writeInt(rowCount);
+            out.writeString(valuesEncoding.name());
+            out.writeString(rlEncoding.name());
+            out.writeString(dlEncoding.name());
+            out.writeBytes(pageBytes, pageBytes.length);
+            pageCount++;
         }
 
         @Override
@@ -403,57 +440,67 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             Statistics<?> statistics
         ) throws IOException {
             BytesInput combined = BytesInput.concat(repetitionLevels, definitionLevels, data);
-            pages.add(new CapturedPage(combined, valueCount, rowCount, dataEncoding, Encoding.RLE, Encoding.RLE));
-            memSize += combined.size();
+            writePage(combined, valueCount, rowCount, statistics, Encoding.RLE, Encoding.RLE, dataEncoding);
         }
 
         @Override
         public long getMemSize() {
-            return memSize;
+            return 0;
         }
 
         @Override
         public long allocatedSize() {
-            return memSize;
+            return 0;
         }
 
         @Override
         public void writeDictionaryPage(DictionaryPage dictionaryPage) throws IOException {
+            // Buffer the dictionary page — it arrives during flush and must be written
+            // after all data pages but before doc IDs
             byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
             this.dictionaryPage = new DictionaryPage(
                 BytesInput.from(dictBytes),
                 dictionaryPage.getDictionarySize(),
                 dictionaryPage.getEncoding()
             );
-            memSize += dictBytes.length;
+        }
+
+        /** Writes the buffered dictionary page to the output, if any. */
+        void writeDictionaryPageToOutput() throws IOException {
+            if (dictionaryPage != null) {
+                byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
+                out.writeInt(dictBytes.length);
+                out.writeInt(dictionaryPage.getDictionarySize());
+                out.writeString(dictionaryPage.getEncoding().name());
+                out.writeBytes(dictBytes, dictBytes.length);
+            }
         }
 
         @Override
         public String memUsageString(String prefix) {
-            return prefix + " CapturingPageWriter: " + memSize + " bytes";
+            return prefix + " StreamingPageWriter: 0 bytes (streaming)";
         }
 
         @Override
         public void close() {}
 
-        List<CapturedPage> getPages() {
-            return pages;
+        int getPageCount() {
+            return pageCount;
         }
 
-        DictionaryPage getDictionaryPage() {
-            return dictionaryPage;
+        boolean hasDictionary() {
+            return dictionaryPage != null;
         }
     }
 
     /**
-     * A {@link PageWriteStore} backed by a single {@link CapturingPageWriter}.
-     * Each field uses one column, so one page writer suffices.
+     * A {@link PageWriteStore} backed by a single {@link StreamingPageWriter}.
      */
-    static class CapturingPageWriteStore implements PageWriteStore {
-        private final CapturingPageWriter writer;
+    static class StreamingPageWriteStore implements PageWriteStore {
+        private final StreamingPageWriter writer;
 
-        CapturingPageWriteStore(ColumnDescriptor descriptor) {
-            this.writer = new CapturingPageWriter();
+        StreamingPageWriteStore(StreamingPageWriter writer) {
+            this.writer = writer;
         }
 
         @Override
@@ -463,9 +510,33 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
 
         @Override
         public void close() {}
+    }
 
-        CapturingPageWriter capturingWriter() {
-            return writer;
+    /**
+     * Growable primitive int array to avoid boxing overhead of {@code ArrayList<Integer>}.
+     * For 181M docs, this uses ~724MB vs ~2.9GB with boxed Integers.
+     */
+    static class IntArrayBuilder {
+        private int[] data;
+        private int size;
+
+        IntArrayBuilder() {
+            this.data = new int[1024];
+        }
+
+        void add(int value) {
+            if (size == data.length) {
+                data = Arrays.copyOf(data, data.length + (data.length >> 1));
+            }
+            data[size++] = value;
+        }
+
+        int get(int index) {
+            return data[index];
+        }
+
+        int size() {
+            return size;
         }
     }
 }
