@@ -296,6 +296,9 @@ public class SourceFieldMapper extends MetadataFieldMapper {
         if (context.indexSettings().isDerivedSourceEnabled()) {
             return;
         }
+        if (context.indexSettings().isParquetDocValuesEnabled()) {
+            return;
+        }
         BytesReference originalSource = context.sourceToParse().source();
         MediaType contentType = context.sourceToParse().getMediaType();
         final BytesReference adaptedSource = applyFilters(originalSource, contentType);
