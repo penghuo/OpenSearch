@@ -44,6 +44,7 @@ import org.apache.parquet.schema.PrimitiveType;
 import org.opensearch.common.util.io.IOUtils;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -82,10 +83,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     private static class CachedNumeric {
         final int[] docIds;
         final long[] values;
+        final boolean isDense;
 
-        CachedNumeric(int[] docIds, long[] values) {
+        CachedNumeric(int[] docIds, long[] values, boolean isDense) {
             this.docIds = docIds;
             this.values = values;
+            this.isDense = isDense;
         }
     }
 
@@ -93,10 +96,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     private static class CachedBinary {
         final int[] docIds;
         final BytesRef[] values;
+        final boolean isDense;
 
-        CachedBinary(int[] docIds, BytesRef[] values) {
+        CachedBinary(int[] docIds, BytesRef[] values, boolean isDense) {
             this.docIds = docIds;
             this.values = values;
+            this.isDense = isDense;
         }
     }
 
@@ -105,11 +110,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final int[] docIds;
         final int[] ords;
         final BytesRef[] dict;
+        final boolean isDense;
 
-        CachedSorted(int[] docIds, int[] ords, BytesRef[] dict) {
+        CachedSorted(int[] docIds, int[] ords, BytesRef[] dict, boolean isDense) {
             this.docIds = docIds;
             this.ords = ords;
             this.dict = dict;
+            this.isDense = isDense;
         }
     }
 
@@ -117,10 +124,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     private static class CachedSortedNumeric {
         final int[] docIds;
         final long[][] allValues;
+        final boolean isDense;
 
-        CachedSortedNumeric(int[] docIds, long[][] allValues) {
+        CachedSortedNumeric(int[] docIds, long[][] allValues, boolean isDense) {
             this.docIds = docIds;
             this.allValues = allValues;
+            this.isDense = isDense;
         }
     }
 
@@ -129,11 +138,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final int[] docIds;
         final long[][] docOrds;
         final BytesRef[] dict;
+        final boolean isDense;
 
-        CachedSortedSet(int[] docIds, long[][] docOrds, BytesRef[] dict) {
+        CachedSortedSet(int[] docIds, long[][] docOrds, BytesRef[] dict, boolean isDense) {
             this.docIds = docIds;
             this.docOrds = docOrds;
             this.dict = dict;
+            this.isDense = isDense;
         }
     }
 
@@ -266,14 +277,26 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             meta.dataStartOffset + meta.docIdOffset,
             meta.dataLength - meta.docIdOffset
         );
+        byte denseFlag = docIdSlice.readByte();
         int docCount = docIdSlice.readInt();
-        int[] docIds = new int[docCount];
-        for (int i = 0; i < docCount; i++) {
-            docIds[i] = docIdSlice.readInt();
+        boolean isDense = (denseFlag == ParquetDocValuesWriter.DENSE_FLAG);
+        int[] docIds;
+        if (isDense) {
+            // Dense field: sequential doc IDs [0, 1, 2, ..., docCount-1]
+            docIds = new int[docCount];
+            for (int i = 0; i < docCount; i++) {
+                docIds[i] = i;
+            }
+        } else {
+            // Sparse field: doc IDs stored explicitly
+            docIds = new int[docCount];
+            for (int i = 0; i < docCount; i++) {
+                docIds[i] = docIdSlice.readInt();
+            }
         }
 
         if (docCount == 0) {
-            return new FieldData(docIds, null);
+            return new FieldData(docIds, null, isDense);
         }
 
         // Read data pages from the beginning of the slice
@@ -352,17 +375,19 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         };
 
         ColumnReadStoreImpl readStore = new ColumnReadStoreImpl(pageReadStore, new NoOpGroupConverter(), schema, "parquet-docvalues");
-        return new FieldData(docIds, readStore.getColumnReader(descriptor));
+        return new FieldData(docIds, readStore.getColumnReader(descriptor), isDense);
     }
 
-    /** Holds doc IDs and the column reader for a field. */
+    /** Holds doc IDs, the column reader, and whether the field is dense. */
     private static class FieldData {
         final int[] docIds;
         final ColumnReader reader;
+        final boolean isDense;
 
-        FieldData(int[] docIds, ColumnReader reader) {
+        FieldData(int[] docIds, ColumnReader reader, boolean isDense) {
             this.docIds = docIds;
             this.reader = reader;
+            this.isDense = isDense;
         }
     }
 
@@ -371,7 +396,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
         if (docIds.length == 0) {
-            return new CachedNumeric(docIds, new long[0]);
+            return new CachedNumeric(docIds, new long[0], fieldData.isDense);
         }
         ColumnReader reader = fieldData.reader;
         long[] values = new long[docIds.length];
@@ -379,8 +404,25 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             values[i] = reader.getLong();
             reader.consume();
         }
-        return new CachedNumeric(docIds, values);
+        return new CachedNumeric(docIds, values, fieldData.isDense);
     }
+
+    /**
+     * Linear scan forward from start looking for target in docIds.
+     * Returns the index if found within LINEAR_SCAN_THRESHOLD steps, or -1 if not found within that window.
+     */
+    private static int linearScanForward(int[] docIds, int start, int target) {
+        int end = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+        for (int i = start; i < end; i++) {
+            if (docIds[i] >= target) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Threshold for switching from linear scan to binary search in advance(). */
+    private static final int LINEAR_SCAN_THRESHOLD = 64;
 
     @Override
     public NumericDocValues getNumeric(FieldInfo field) throws IOException {
@@ -388,16 +430,58 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        CachedNumeric cached = numericCache.get(field.name);
-        if (cached == null) {
-            cached = loadNumeric(meta);
-            numericCache.put(field.name, cached);
-        }
+        CachedNumeric cached = computeNumericCache(field.name, meta);
         int[] docIds = cached.docIds;
         long[] values = cached.values;
 
         if (docIds.length == 0) {
             return DocValues.emptyNumeric();
+        }
+
+        if (cached.isDense) {
+            final int maxDoc = docIds.length;
+            return new NumericDocValues() {
+                private int doc = -1;
+
+                @Override
+                public long longValue() {
+                    return values[doc];
+                }
+
+                @Override
+                public boolean advanceExact(int target) {
+                    doc = target;
+                    return target < maxDoc;
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    doc++;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public int advance(int target) {
+                    doc = target;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public long cost() {
+                    return maxDoc;
+                }
+            };
         }
 
         return new NumericDocValues() {
@@ -412,7 +496,22 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int found = java.util.Arrays.binarySearch(docIds, target);
+                int start = 0;
+                // Linear probe for sequential (forward) access pattern
+                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
+                    start = idx;
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        if (docIds[i] == target) {
+                            idx = i;
+                            return true;
+                        }
+                        idx = i - 1;
+                        return false;
+                    }
+                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     return true;
@@ -439,7 +538,18 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
             @Override
             public int advance(int target) {
-                int found = java.util.Arrays.binarySearch(docIds, Math.max(idx + 1, 0), docIds.length, target);
+                int start = Math.max(idx + 1, 0);
+                // Linear probe for sequential access pattern
+                if (start < docIds.length && docIds[start] <= target) {
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        idx = i;
+                        doc = docIds[idx];
+                        return doc;
+                    }
+                    start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     doc = docIds[idx];
@@ -461,12 +571,22 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         };
     }
 
+    private CachedNumeric computeNumericCache(String fieldName, FieldMeta meta) {
+        return numericCache.computeIfAbsent(fieldName, k -> {
+            try {
+                return loadNumeric(meta);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+    }
+
     private CachedBinary loadBinary(FieldMeta meta) throws IOException {
         PrimitiveType parquetType = ParquetTypeMapping.binaryType(meta.fieldName);
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
         if (docIds.length == 0) {
-            return new CachedBinary(docIds, new BytesRef[0]);
+            return new CachedBinary(docIds, new BytesRef[0], fieldData.isDense);
         }
         ColumnReader reader = fieldData.reader;
         BytesRef[] values = new BytesRef[docIds.length];
@@ -475,7 +595,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             values[i] = new BytesRef(bin.getBytes().clone());
             reader.consume();
         }
-        return new CachedBinary(docIds, values);
+        return new CachedBinary(docIds, values, fieldData.isDense);
     }
 
     @Override
@@ -484,16 +604,64 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        CachedBinary cached = binaryCache.get(field.name);
-        if (cached == null) {
-            cached = loadBinary(meta);
-            binaryCache.put(field.name, cached);
-        }
+        CachedBinary cached = binaryCache.computeIfAbsent(field.name, k -> {
+            try {
+                return loadBinary(meta);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
         int[] docIds = cached.docIds;
         BytesRef[] values = cached.values;
 
         if (docIds.length == 0) {
             return DocValues.emptyBinary();
+        }
+
+        if (cached.isDense) {
+            final int maxDoc = docIds.length;
+            return new BinaryDocValues() {
+                private int doc = -1;
+
+                @Override
+                public BytesRef binaryValue() {
+                    return values[doc];
+                }
+
+                @Override
+                public boolean advanceExact(int target) {
+                    doc = target;
+                    return target < maxDoc;
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    doc++;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public int advance(int target) {
+                    doc = target;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public long cost() {
+                    return maxDoc;
+                }
+            };
         }
 
         return new BinaryDocValues() {
@@ -508,7 +676,21 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int found = java.util.Arrays.binarySearch(docIds, target);
+                int start = 0;
+                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
+                    start = idx;
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        if (docIds[i] == target) {
+                            idx = i;
+                            return true;
+                        }
+                        idx = i - 1;
+                        return false;
+                    }
+                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     return true;
@@ -535,7 +717,17 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
             @Override
             public int advance(int target) {
-                int found = java.util.Arrays.binarySearch(docIds, Math.max(idx + 1, 0), docIds.length, target);
+                int start = Math.max(idx + 1, 0);
+                if (start < docIds.length && docIds[start] <= target) {
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        idx = i;
+                        doc = docIds[idx];
+                        return doc;
+                    }
+                    start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     doc = docIds[idx];
@@ -562,23 +754,23 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
         if (docIds.length == 0) {
-            return new CachedSorted(docIds, new int[0], new BytesRef[0]);
+            return new CachedSorted(docIds, new int[0], new BytesRef[0], fieldData.isDense);
         }
         ColumnReader reader = fieldData.reader;
-        Binary[] rawValues = new Binary[docIds.length];
+        BytesRef[] rawValues = new BytesRef[docIds.length];
         for (int i = 0; i < docIds.length; i++) {
-            rawValues[i] = reader.getBinary().copy();
+            rawValues[i] = new BytesRef(reader.getBinary().getBytes().clone());
             reader.consume();
         }
-        Map<Binary, Integer> valueToOrd = new HashMap<>();
-        List<Binary> sortedDict = new ArrayList<>();
-        for (Binary val : rawValues) {
+        Map<BytesRef, Integer> valueToOrd = new HashMap<>();
+        List<BytesRef> sortedDict = new ArrayList<>();
+        for (BytesRef val : rawValues) {
             if (valueToOrd.containsKey(val) == false) {
                 valueToOrd.put(val, sortedDict.size());
                 sortedDict.add(val);
             }
         }
-        sortedDict.sort((a, b) -> new BytesRef(a.getBytes()).compareTo(new BytesRef(b.getBytes())));
+        sortedDict.sort(BytesRef::compareTo);
         for (int i = 0; i < sortedDict.size(); i++) {
             valueToOrd.put(sortedDict.get(i), i);
         }
@@ -586,11 +778,8 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         for (int i = 0; i < docIds.length; i++) {
             ords[i] = valueToOrd.get(rawValues[i]);
         }
-        BytesRef[] dict = new BytesRef[sortedDict.size()];
-        for (int i = 0; i < sortedDict.size(); i++) {
-            dict[i] = new BytesRef(sortedDict.get(i).getBytes());
-        }
-        return new CachedSorted(docIds, ords, dict);
+        BytesRef[] dict = sortedDict.toArray(new BytesRef[0]);
+        return new CachedSorted(docIds, ords, dict, fieldData.isDense);
     }
 
     @Override
@@ -599,17 +788,75 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        CachedSorted cached = sortedCache.get(field.name);
-        if (cached == null) {
-            cached = loadSorted(meta);
-            sortedCache.put(field.name, cached);
-        }
+        CachedSorted cached = sortedCache.computeIfAbsent(field.name, k -> {
+            try {
+                return loadSorted(meta);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
         int[] docIds = cached.docIds;
         int[] ords = cached.ords;
         BytesRef[] dict = cached.dict;
 
         if (docIds.length == 0) {
             return DocValues.emptySorted();
+        }
+
+        if (cached.isDense) {
+            final int maxDoc = docIds.length;
+            return new SortedDocValues() {
+                private int doc = -1;
+
+                @Override
+                public int ordValue() {
+                    return ords[doc];
+                }
+
+                @Override
+                public BytesRef lookupOrd(int ord) {
+                    return dict[ord];
+                }
+
+                @Override
+                public int getValueCount() {
+                    return dict.length;
+                }
+
+                @Override
+                public boolean advanceExact(int target) {
+                    doc = target;
+                    return target < maxDoc;
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    doc++;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public int advance(int target) {
+                    doc = target;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public long cost() {
+                    return maxDoc;
+                }
+            };
         }
 
         return new SortedDocValues() {
@@ -634,7 +881,21 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int found = java.util.Arrays.binarySearch(docIds, target);
+                int start = 0;
+                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
+                    start = idx;
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        if (docIds[i] == target) {
+                            idx = i;
+                            return true;
+                        }
+                        idx = i - 1;
+                        return false;
+                    }
+                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     return true;
@@ -661,7 +922,17 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
             @Override
             public int advance(int target) {
-                int found = java.util.Arrays.binarySearch(docIds, Math.max(idx + 1, 0), docIds.length, target);
+                int start = Math.max(idx + 1, 0);
+                if (start < docIds.length && docIds[start] <= target) {
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        idx = i;
+                        doc = docIds[idx];
+                        return doc;
+                    }
+                    start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     doc = docIds[idx];
@@ -688,28 +959,33 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
         if (docIds.length == 0) {
-            return new CachedSortedNumeric(docIds, new long[0][]);
+            return new CachedSortedNumeric(docIds, new long[0][], fieldData.isDense);
         }
         ColumnReader reader = fieldData.reader;
         int totalValues = (int) reader.getTotalValueCount();
         List<long[]> docValues = new ArrayList<>();
-        List<Long> currentDoc = new ArrayList<>();
+        // Use primitive array to avoid boxing overhead
+        long[] currentDoc = new long[8];
+        int currentSize = 0;
         for (int i = 0; i < totalValues; i++) {
             int rep = reader.getCurrentRepetitionLevel();
             int def = reader.getCurrentDefinitionLevel();
             if (rep == 0 && i > 0) {
-                docValues.add(currentDoc.stream().mapToLong(Long::longValue).toArray());
-                currentDoc.clear();
+                docValues.add(java.util.Arrays.copyOf(currentDoc, currentSize));
+                currentSize = 0;
             }
             if (def == 1) {
-                currentDoc.add(reader.getLong());
+                if (currentSize == currentDoc.length) {
+                    currentDoc = java.util.Arrays.copyOf(currentDoc, currentDoc.length * 2);
+                }
+                currentDoc[currentSize++] = reader.getLong();
             }
             reader.consume();
         }
         if (totalValues > 0) {
-            docValues.add(currentDoc.stream().mapToLong(Long::longValue).toArray());
+            docValues.add(java.util.Arrays.copyOf(currentDoc, currentSize));
         }
-        return new CachedSortedNumeric(docIds, docValues.toArray(new long[0][]));
+        return new CachedSortedNumeric(docIds, docValues.toArray(new long[0][]), fieldData.isDense);
     }
 
     @Override
@@ -718,16 +994,73 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        CachedSortedNumeric cached = sortedNumericCache.get(field.name);
-        if (cached == null) {
-            cached = loadSortedNumeric(meta);
-            sortedNumericCache.put(field.name, cached);
-        }
+        CachedSortedNumeric cached = sortedNumericCache.computeIfAbsent(field.name, k -> {
+            try {
+                return loadSortedNumeric(meta);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
         int[] docIds = cached.docIds;
         long[][] allValues = cached.allValues;
 
         if (docIds.length == 0) {
             return DocValues.emptySortedNumeric();
+        }
+
+        if (cached.isDense) {
+            final int maxDoc = docIds.length;
+            return new SortedNumericDocValues() {
+                private int doc = -1;
+                private int valueIdx;
+
+                @Override
+                public long nextValue() {
+                    return allValues[doc][valueIdx++];
+                }
+
+                @Override
+                public int docValueCount() {
+                    return allValues[doc].length;
+                }
+
+                @Override
+                public boolean advanceExact(int target) {
+                    doc = target;
+                    valueIdx = 0;
+                    return target < maxDoc;
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    doc++;
+                    valueIdx = 0;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public int advance(int target) {
+                    doc = target;
+                    valueIdx = 0;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public long cost() {
+                    return maxDoc;
+                }
+            };
         }
 
         return new SortedNumericDocValues() {
@@ -748,7 +1081,22 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int found = java.util.Arrays.binarySearch(docIds, target);
+                int start = 0;
+                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
+                    start = idx;
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        if (docIds[i] == target) {
+                            idx = i;
+                            valueIdx = 0;
+                            return true;
+                        }
+                        idx = i - 1;
+                        return false;
+                    }
+                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     valueIdx = 0;
@@ -777,7 +1125,18 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
             @Override
             public int advance(int target) {
-                int found = java.util.Arrays.binarySearch(docIds, Math.max(idx + 1, 0), docIds.length, target);
+                int start = Math.max(idx + 1, 0);
+                if (start < docIds.length && docIds[start] <= target) {
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        idx = i;
+                        doc = docIds[idx];
+                        valueIdx = 0;
+                        return doc;
+                    }
+                    start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                 } else {
@@ -804,48 +1163,45 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
         if (docIds.length == 0) {
-            return new CachedSortedSet(docIds, new long[0][], new BytesRef[0]);
+            return new CachedSortedSet(docIds, new long[0][], new BytesRef[0], fieldData.isDense);
         }
         ColumnReader reader = fieldData.reader;
         int totalValues = (int) reader.getTotalValueCount();
-        List<List<Binary>> docBinaries = new ArrayList<>();
-        List<Binary> currentDoc = new ArrayList<>();
+        List<List<BytesRef>> docBytesRefs = new ArrayList<>();
+        List<BytesRef> currentDoc = new ArrayList<>();
         for (int i = 0; i < totalValues; i++) {
             int rep = reader.getCurrentRepetitionLevel();
             int def = reader.getCurrentDefinitionLevel();
             if (rep == 0 && i > 0) {
-                docBinaries.add(new ArrayList<>(currentDoc));
+                docBytesRefs.add(new ArrayList<>(currentDoc));
                 currentDoc.clear();
             }
             if (def == 1) {
-                currentDoc.add(reader.getBinary().copy());
+                currentDoc.add(new BytesRef(reader.getBinary().getBytes().clone()));
             }
             reader.consume();
         }
         if (totalValues > 0) {
-            docBinaries.add(new ArrayList<>(currentDoc));
+            docBytesRefs.add(new ArrayList<>(currentDoc));
         }
-        Map<Binary, Integer> valueToOrd = new HashMap<>();
-        List<Binary> sortedDict = new ArrayList<>();
-        for (List<Binary> docVals : docBinaries) {
-            for (Binary val : docVals) {
+        Map<BytesRef, Integer> valueToOrd = new HashMap<>();
+        List<BytesRef> sortedDict = new ArrayList<>();
+        for (List<BytesRef> docVals : docBytesRefs) {
+            for (BytesRef val : docVals) {
                 if (valueToOrd.containsKey(val) == false) {
                     valueToOrd.put(val, sortedDict.size());
                     sortedDict.add(val);
                 }
             }
         }
-        sortedDict.sort((a, b) -> new BytesRef(a.getBytes()).compareTo(new BytesRef(b.getBytes())));
+        sortedDict.sort(BytesRef::compareTo);
         for (int i = 0; i < sortedDict.size(); i++) {
             valueToOrd.put(sortedDict.get(i), i);
         }
-        BytesRef[] dict = new BytesRef[sortedDict.size()];
-        for (int i = 0; i < sortedDict.size(); i++) {
-            dict[i] = new BytesRef(sortedDict.get(i).getBytes());
-        }
-        long[][] docOrds = new long[docBinaries.size()][];
-        for (int d = 0; d < docBinaries.size(); d++) {
-            List<Binary> vals = docBinaries.get(d);
+        BytesRef[] dict = sortedDict.toArray(new BytesRef[0]);
+        long[][] docOrds = new long[docBytesRefs.size()][];
+        for (int d = 0; d < docBytesRefs.size(); d++) {
+            List<BytesRef> vals = docBytesRefs.get(d);
             long[] ordArr = new long[vals.size()];
             for (int v = 0; v < vals.size(); v++) {
                 ordArr[v] = valueToOrd.get(vals.get(v));
@@ -853,7 +1209,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             java.util.Arrays.sort(ordArr);
             docOrds[d] = ordArr;
         }
-        return new CachedSortedSet(docIds, docOrds, dict);
+        return new CachedSortedSet(docIds, docOrds, dict, fieldData.isDense);
     }
 
     @Override
@@ -862,17 +1218,84 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        CachedSortedSet cached = sortedSetCache.get(field.name);
-        if (cached == null) {
-            cached = loadSortedSet(meta);
-            sortedSetCache.put(field.name, cached);
-        }
+        CachedSortedSet cached = sortedSetCache.computeIfAbsent(field.name, k -> {
+            try {
+                return loadSortedSet(meta);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
         int[] docIds = cached.docIds;
         long[][] docOrds = cached.docOrds;
         BytesRef[] dict = cached.dict;
 
         if (docIds.length == 0) {
             return DocValues.emptySortedSet();
+        }
+
+        if (cached.isDense) {
+            final int maxDoc = docIds.length;
+            return new SortedSetDocValues() {
+                private int doc = -1;
+                private int ordIdx;
+
+                @Override
+                public long nextOrd() {
+                    return docOrds[doc][ordIdx++];
+                }
+
+                @Override
+                public int docValueCount() {
+                    return docOrds[doc].length;
+                }
+
+                @Override
+                public BytesRef lookupOrd(long ord) {
+                    return dict[(int) ord];
+                }
+
+                @Override
+                public long getValueCount() {
+                    return dict.length;
+                }
+
+                @Override
+                public boolean advanceExact(int target) {
+                    doc = target;
+                    ordIdx = 0;
+                    return target < maxDoc;
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    doc++;
+                    ordIdx = 0;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public int advance(int target) {
+                    doc = target;
+                    ordIdx = 0;
+                    if (doc >= maxDoc) {
+                        doc = NO_MORE_DOCS;
+                    }
+                    return doc;
+                }
+
+                @Override
+                public long cost() {
+                    return maxDoc;
+                }
+            };
         }
 
         return new SortedSetDocValues() {
@@ -903,7 +1326,22 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int found = java.util.Arrays.binarySearch(docIds, target);
+                int start = 0;
+                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
+                    start = idx;
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        if (docIds[i] == target) {
+                            idx = i;
+                            ordIdx = 0;
+                            return true;
+                        }
+                        idx = i - 1;
+                        return false;
+                    }
+                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     ordIdx = 0;
@@ -932,7 +1370,18 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
             @Override
             public int advance(int target) {
-                int found = java.util.Arrays.binarySearch(docIds, Math.max(idx + 1, 0), docIds.length, target);
+                int start = Math.max(idx + 1, 0);
+                if (start < docIds.length && docIds[start] <= target) {
+                    int i = linearScanForward(docIds, start, target);
+                    if (i >= 0) {
+                        idx = i;
+                        doc = docIds[idx];
+                        ordIdx = 0;
+                        return doc;
+                    }
+                    start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                }
+                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                 } else {
@@ -968,11 +1417,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         int lastDocId = DocIdSetIterator.NO_MORE_DOCS;
 
         if (dvType.equals("NUMERIC")) {
-            CachedNumeric cached = numericCache.get(field.name);
-            if (cached == null) {
-                cached = loadNumeric(meta);
-                numericCache.put(field.name, cached);
-            }
+            CachedNumeric cached = computeNumericCache(field.name, meta);
             if (cached.docIds.length > 0) {
                 firstDocId = cached.docIds[0];
                 lastDocId = cached.docIds[cached.docIds.length - 1];
@@ -986,11 +1431,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 globalMax = max;
             }
         } else if (dvType.equals("SORTED_NUMERIC")) {
-            CachedSortedNumeric cached = sortedNumericCache.get(field.name);
-            if (cached == null) {
-                cached = loadSortedNumeric(meta);
-                sortedNumericCache.put(field.name, cached);
-            }
+            CachedSortedNumeric cached = sortedNumericCache.computeIfAbsent(field.name, k -> {
+                try {
+                    return loadSortedNumeric(meta);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
             if (cached.docIds.length > 0) {
                 firstDocId = cached.docIds[0];
                 lastDocId = cached.docIds[cached.docIds.length - 1];
@@ -1006,11 +1453,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 globalMax = max;
             }
         } else if (dvType.equals("SORTED")) {
-            CachedSorted cached = sortedCache.get(field.name);
-            if (cached == null) {
-                cached = loadSorted(meta);
-                sortedCache.put(field.name, cached);
-            }
+            CachedSorted cached = sortedCache.computeIfAbsent(field.name, k -> {
+                try {
+                    return loadSorted(meta);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
             if (cached.docIds.length > 0) {
                 firstDocId = cached.docIds[0];
                 lastDocId = cached.docIds[cached.docIds.length - 1];
@@ -1019,11 +1468,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 globalMax = cached.dict.length - 1;
             }
         } else if (dvType.equals("SORTED_SET")) {
-            CachedSortedSet cached = sortedSetCache.get(field.name);
-            if (cached == null) {
-                cached = loadSortedSet(meta);
-                sortedSetCache.put(field.name, cached);
-            }
+            CachedSortedSet cached = sortedSetCache.computeIfAbsent(field.name, k -> {
+                try {
+                    return loadSortedSet(meta);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
             if (cached.docIds.length > 0) {
                 firstDocId = cached.docIds[0];
                 lastDocId = cached.docIds[cached.docIds.length - 1];
@@ -1033,11 +1484,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             }
         } else {
             // BINARY type
-            CachedBinary cached = binaryCache.get(field.name);
-            if (cached == null) {
-                cached = loadBinary(meta);
-                binaryCache.put(field.name, cached);
-            }
+            CachedBinary cached = binaryCache.computeIfAbsent(field.name, k -> {
+                try {
+                    return loadBinary(meta);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
             if (cached.docIds.length > 0) {
                 firstDocId = cached.docIds[0];
                 lastDocId = cached.docIds[cached.docIds.length - 1];

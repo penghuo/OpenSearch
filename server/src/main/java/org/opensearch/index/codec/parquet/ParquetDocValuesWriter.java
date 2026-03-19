@@ -66,8 +66,14 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     static final int VERSION_CURRENT = 1;
     static final String END_MARKER = "__END__";
 
+    /** Flag byte: field has a value for every doc in the segment (no doc IDs stored). */
+    static final byte DENSE_FLAG = 1;
+    /** Flag byte: field is sparse — doc IDs stored explicitly. */
+    static final byte SPARSE_FLAG = 0;
+
     private final IndexOutput dataOut;
     private final IndexOutput metaOut;
+    private final int maxDoc;
 
     public ParquetDocValuesWriter(SegmentWriteState state, String dataExtension, String metaExtension, String dataCodec, String metaCodec)
         throws IOException {
@@ -79,6 +85,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             CodecUtil.writeIndexHeader(dataOut, dataCodec, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
             metaOut = state.directory.createOutput(metaFileName, state.context);
             CodecUtil.writeIndexHeader(metaOut, metaCodec, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
+            maxDoc = state.segmentInfo.maxDoc();
             success = true;
         } finally {
             if (success == false) {
@@ -313,9 +320,17 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     }
 
     private void writeDocIds(IntArrayBuilder docIds) throws IOException {
-        dataOut.writeInt(docIds.size());
-        for (int i = 0; i < docIds.size(); i++) {
-            dataOut.writeInt(docIds.get(i));
+        if (docIds.size() == maxDoc) {
+            // Dense field: every doc has a value, no need to store doc IDs
+            dataOut.writeByte(DENSE_FLAG);
+            dataOut.writeInt(docIds.size());
+        } else {
+            // Sparse field: store doc IDs explicitly
+            dataOut.writeByte(SPARSE_FLAG);
+            dataOut.writeInt(docIds.size());
+            for (int i = 0; i < docIds.size(); i++) {
+                dataOut.writeInt(docIds.get(i));
+            }
         }
     }
 

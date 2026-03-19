@@ -14,42 +14,75 @@ import org.apache.lucene.util.BytesRef;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
  * FieldValueFetcher for sorted set doc values, for a doc, values will be deduplicated and sorted while stored in
- * lucene
+ * lucene.
+ *
+ * <p>Caches the doc values iterator per thread per LeafReader to avoid creating a new
+ * iterator for every document during _source reconstruction. This eliminates the dominant
+ * cost in parquet-backed _source reconstruction: per-document iterator allocation and
+ * cache lookups in ParquetDocValuesReader. The cache is thread-safe via ThreadLocal
+ * since DerivedFieldGenerator instances are shared across search threads.</p>
  *
  * @opensearch.internal
  */
 public class SortedSetDocValuesFetcher extends FieldValueFetcher {
+
+    private final ThreadLocal<CachedIterator> cached = new ThreadLocal<>();
 
     public SortedSetDocValuesFetcher(MappedFieldType mappedFieldType, String simpleName) {
         super(simpleName);
         this.mappedFieldType = mappedFieldType;
     }
 
+    private SortedSetDocValues getDv(LeafReader reader) throws IOException {
+        CachedIterator c = cached.get();
+        if (c != null && c.reader == reader) {
+            return c.dv;
+        }
+        SortedSetDocValues dv = reader.getSortedSetDocValues(mappedFieldType.name());
+        cached.set(new CachedIterator(reader, dv));
+        return dv;
+    }
+
     @Override
     public List<Object> fetch(LeafReader reader, int docId) throws IOException {
-        List<Object> values = new ArrayList<>();
         try {
-            final SortedSetDocValues sortedSetDocValues = reader.getSortedSetDocValues(mappedFieldType.name());
-            if (sortedSetDocValues == null || !sortedSetDocValues.advanceExact(docId)) {
-                return values;
+            final SortedSetDocValues dv = getDv(reader);
+            if (dv == null || !dv.advanceExact(docId)) {
+                return Collections.emptyList();
             }
-            int valueCount = sortedSetDocValues.docValueCount();
-            for (int ord = 0; ord < valueCount; ord++) {
-                BytesRef value = sortedSetDocValues.lookupOrd(sortedSetDocValues.nextOrd());
+            int count = dv.docValueCount();
+            if (count == 1) {
+                BytesRef value = dv.lookupOrd(dv.nextOrd());
+                return Collections.singletonList(BytesRef.deepCopyOf(value));
+            }
+            List<Object> values = new ArrayList<>(count);
+            for (int ord = 0; ord < count; ord++) {
+                BytesRef value = dv.lookupOrd(dv.nextOrd());
                 values.add(BytesRef.deepCopyOf(value));
             }
+            return values;
         } catch (IOException e) {
             throw new IOException("Failed to read doc values for document " + docId + " in field " + mappedFieldType.name(), e);
         }
-        return values;
     }
 
     @Override
     public Object convert(Object value) {
         return mappedFieldType.valueForDisplay(value);
+    }
+
+    private static class CachedIterator {
+        final LeafReader reader;
+        final SortedSetDocValues dv;
+
+        CachedIterator(LeafReader reader, SortedSetDocValues dv) {
+            this.reader = reader;
+            this.dv = dv;
+        }
     }
 }

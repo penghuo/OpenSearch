@@ -47,6 +47,8 @@ import org.opensearch.index.mapper.CompletionFieldMapper;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.index.mapper.SeqNoFieldMapper;
+import org.opensearch.index.mapper.VersionFieldMapper;
 
 import java.util.Map;
 
@@ -104,6 +106,13 @@ public class PerFieldMappingPostingFormatCodec extends Lucene104Codec {
     @Override
     public DocValuesFormat getDocValuesFormatForField(String field) {
         if (mapperService != null && mapperService.getIndexSettings().isParquetDocValuesEnabled()) {
+            // Internal metadata fields use Lucene's native format — they don't contribute
+            // to _source reconstruction and Lucene handles monotonic longs more efficiently.
+            if (field.equals(SeqNoFieldMapper.NAME)
+                || field.equals(SeqNoFieldMapper.PRIMARY_TERM_NAME)
+                || field.equals(VersionFieldMapper.NAME)) {
+                return dvFormat;
+            }
             return parquetDvFormat;
         }
         return dvFormat;
