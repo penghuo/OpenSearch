@@ -48,6 +48,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Reads Lucene doc values from Parquet-encoded {@code .pdvd}/{@code .pdvm} files
@@ -59,12 +60,82 @@ import java.util.Map;
  * {@link NumericDocValues}, {@link BinaryDocValues}, {@link SortedDocValues},
  * {@link SortedNumericDocValues}, or {@link SortedSetDocValues} iterators.</p>
  *
+ * <p>Decoded field data is cached at the segment level so that repeated calls
+ * (e.g. during _source reconstruction or aggregations) do not re-read from disk.</p>
+ *
  * @opensearch.experimental
  */
 public class ParquetDocValuesReader extends DocValuesProducer {
 
     private final IndexInput dataIn;
     private final Map<String, FieldMeta> fields = new HashMap<>();
+
+    // Segment-level caches for decoded field data, keyed by field name.
+    // Each cache stores the fully decoded arrays so repeated calls avoid disk I/O.
+    private final ConcurrentHashMap<String, CachedNumeric> numericCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CachedBinary> binaryCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CachedSorted> sortedCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CachedSortedNumeric> sortedNumericCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CachedSortedSet> sortedSetCache = new ConcurrentHashMap<>();
+
+    /** Cached decoded data for NUMERIC fields. */
+    private static class CachedNumeric {
+        final int[] docIds;
+        final long[] values;
+
+        CachedNumeric(int[] docIds, long[] values) {
+            this.docIds = docIds;
+            this.values = values;
+        }
+    }
+
+    /** Cached decoded data for BINARY fields. */
+    private static class CachedBinary {
+        final int[] docIds;
+        final BytesRef[] values;
+
+        CachedBinary(int[] docIds, BytesRef[] values) {
+            this.docIds = docIds;
+            this.values = values;
+        }
+    }
+
+    /** Cached decoded data for SORTED fields. */
+    private static class CachedSorted {
+        final int[] docIds;
+        final int[] ords;
+        final BytesRef[] dict;
+
+        CachedSorted(int[] docIds, int[] ords, BytesRef[] dict) {
+            this.docIds = docIds;
+            this.ords = ords;
+            this.dict = dict;
+        }
+    }
+
+    /** Cached decoded data for SORTED_NUMERIC fields. */
+    private static class CachedSortedNumeric {
+        final int[] docIds;
+        final long[][] allValues;
+
+        CachedSortedNumeric(int[] docIds, long[][] allValues) {
+            this.docIds = docIds;
+            this.allValues = allValues;
+        }
+    }
+
+    /** Cached decoded data for SORTED_SET fields. */
+    private static class CachedSortedSet {
+        final int[] docIds;
+        final long[][] docOrds;
+        final BytesRef[] dict;
+
+        CachedSortedSet(int[] docIds, long[][] docOrds, BytesRef[] dict) {
+            this.docIds = docIds;
+            this.docOrds = docOrds;
+            this.dict = dict;
+        }
+    }
 
     /**
      * Metadata for a single field, read from the {@code .pdvm} file.
@@ -295,25 +366,38 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         }
     }
 
+    private CachedNumeric loadNumeric(FieldMeta meta) throws IOException {
+        PrimitiveType parquetType = ParquetTypeMapping.numericType(meta.fieldName);
+        FieldData fieldData = readFieldData(meta, parquetType);
+        int[] docIds = fieldData.docIds;
+        if (docIds.length == 0) {
+            return new CachedNumeric(docIds, new long[0]);
+        }
+        ColumnReader reader = fieldData.reader;
+        long[] values = new long[docIds.length];
+        for (int i = 0; i < docIds.length; i++) {
+            values[i] = reader.getLong();
+            reader.consume();
+        }
+        return new CachedNumeric(docIds, values);
+    }
+
     @Override
     public NumericDocValues getNumeric(FieldInfo field) throws IOException {
         FieldMeta meta = fields.get(field.name);
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        PrimitiveType parquetType = ParquetTypeMapping.numericType(field.name);
-        FieldData fieldData = readFieldData(meta, parquetType);
-        int[] docIds = fieldData.docIds;
+        CachedNumeric cached = numericCache.get(field.name);
+        if (cached == null) {
+            cached = loadNumeric(meta);
+            numericCache.put(field.name, cached);
+        }
+        int[] docIds = cached.docIds;
+        long[] values = cached.values;
 
         if (docIds.length == 0) {
             return DocValues.emptyNumeric();
-        }
-
-        ColumnReader reader = fieldData.reader;
-        long[] values = new long[docIds.length];
-        for (int i = 0; i < docIds.length; i++) {
-            values[i] = reader.getLong();
-            reader.consume();
         }
 
         return new NumericDocValues() {
@@ -377,27 +461,39 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         };
     }
 
+    private CachedBinary loadBinary(FieldMeta meta) throws IOException {
+        PrimitiveType parquetType = ParquetTypeMapping.binaryType(meta.fieldName);
+        FieldData fieldData = readFieldData(meta, parquetType);
+        int[] docIds = fieldData.docIds;
+        if (docIds.length == 0) {
+            return new CachedBinary(docIds, new BytesRef[0]);
+        }
+        ColumnReader reader = fieldData.reader;
+        BytesRef[] values = new BytesRef[docIds.length];
+        for (int i = 0; i < docIds.length; i++) {
+            Binary bin = reader.getBinary();
+            values[i] = new BytesRef(bin.getBytes().clone());
+            reader.consume();
+        }
+        return new CachedBinary(docIds, values);
+    }
+
     @Override
     public BinaryDocValues getBinary(FieldInfo field) throws IOException {
         FieldMeta meta = fields.get(field.name);
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        PrimitiveType parquetType = ParquetTypeMapping.binaryType(field.name);
-        FieldData fieldData = readFieldData(meta, parquetType);
-        int[] docIds = fieldData.docIds;
+        CachedBinary cached = binaryCache.get(field.name);
+        if (cached == null) {
+            cached = loadBinary(meta);
+            binaryCache.put(field.name, cached);
+        }
+        int[] docIds = cached.docIds;
+        BytesRef[] values = cached.values;
 
         if (docIds.length == 0) {
             return DocValues.emptyBinary();
-        }
-
-        ColumnReader reader = fieldData.reader;
-        BytesRef[] values = new BytesRef[docIds.length];
-        for (int i = 0; i < docIds.length; i++) {
-            Binary bin = reader.getBinary();
-            byte[] bytes = bin.getBytes();
-            values[i] = new BytesRef(bytes.clone());
-            reader.consume();
         }
 
         return new BinaryDocValues() {
@@ -461,28 +557,19 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         };
     }
 
-    @Override
-    public SortedDocValues getSorted(FieldInfo field) throws IOException {
-        FieldMeta meta = fields.get(field.name);
-        if (meta == null) {
-            throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
-        }
-        PrimitiveType parquetType = ParquetTypeMapping.sortedType(field.name);
+    private CachedSorted loadSorted(FieldMeta meta) throws IOException {
+        PrimitiveType parquetType = ParquetTypeMapping.sortedType(meta.fieldName);
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
-
         if (docIds.length == 0) {
-            return DocValues.emptySorted();
+            return new CachedSorted(docIds, new int[0], new BytesRef[0]);
         }
-
         ColumnReader reader = fieldData.reader;
         Binary[] rawValues = new Binary[docIds.length];
         for (int i = 0; i < docIds.length; i++) {
             rawValues[i] = reader.getBinary().copy();
             reader.consume();
         }
-
-        // Build sorted dictionary: collect unique values, sort them, assign ords
         Map<Binary, Integer> valueToOrd = new HashMap<>();
         List<Binary> sortedDict = new ArrayList<>();
         for (Binary val : rawValues) {
@@ -491,24 +578,38 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 sortedDict.add(val);
             }
         }
-        sortedDict.sort((a, b) -> {
-            byte[] ab = a.getBytes();
-            byte[] bb = b.getBytes();
-            return new BytesRef(ab).compareTo(new BytesRef(bb));
-        });
-        // Reassign ords after sorting
+        sortedDict.sort((a, b) -> new BytesRef(a.getBytes()).compareTo(new BytesRef(b.getBytes())));
         for (int i = 0; i < sortedDict.size(); i++) {
             valueToOrd.put(sortedDict.get(i), i);
         }
-
         int[] ords = new int[docIds.length];
         for (int i = 0; i < docIds.length; i++) {
             ords[i] = valueToOrd.get(rawValues[i]);
         }
-
         BytesRef[] dict = new BytesRef[sortedDict.size()];
         for (int i = 0; i < sortedDict.size(); i++) {
             dict[i] = new BytesRef(sortedDict.get(i).getBytes());
+        }
+        return new CachedSorted(docIds, ords, dict);
+    }
+
+    @Override
+    public SortedDocValues getSorted(FieldInfo field) throws IOException {
+        FieldMeta meta = fields.get(field.name);
+        if (meta == null) {
+            throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
+        }
+        CachedSorted cached = sortedCache.get(field.name);
+        if (cached == null) {
+            cached = loadSorted(meta);
+            sortedCache.put(field.name, cached);
+        }
+        int[] docIds = cached.docIds;
+        int[] ords = cached.ords;
+        BytesRef[] dict = cached.dict;
+
+        if (docIds.length == 0) {
+            return DocValues.emptySorted();
         }
 
         return new SortedDocValues() {
@@ -582,46 +683,52 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         };
     }
 
+    private CachedSortedNumeric loadSortedNumeric(FieldMeta meta) throws IOException {
+        PrimitiveType parquetType = ParquetTypeMapping.sortedNumericType(meta.fieldName);
+        FieldData fieldData = readFieldData(meta, parquetType);
+        int[] docIds = fieldData.docIds;
+        if (docIds.length == 0) {
+            return new CachedSortedNumeric(docIds, new long[0][]);
+        }
+        ColumnReader reader = fieldData.reader;
+        int totalValues = (int) reader.getTotalValueCount();
+        List<long[]> docValues = new ArrayList<>();
+        List<Long> currentDoc = new ArrayList<>();
+        for (int i = 0; i < totalValues; i++) {
+            int rep = reader.getCurrentRepetitionLevel();
+            int def = reader.getCurrentDefinitionLevel();
+            if (rep == 0 && i > 0) {
+                docValues.add(currentDoc.stream().mapToLong(Long::longValue).toArray());
+                currentDoc.clear();
+            }
+            if (def == 1) {
+                currentDoc.add(reader.getLong());
+            }
+            reader.consume();
+        }
+        if (totalValues > 0) {
+            docValues.add(currentDoc.stream().mapToLong(Long::longValue).toArray());
+        }
+        return new CachedSortedNumeric(docIds, docValues.toArray(new long[0][]));
+    }
+
     @Override
     public SortedNumericDocValues getSortedNumeric(FieldInfo field) throws IOException {
         FieldMeta meta = fields.get(field.name);
         if (meta == null) {
             throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
         }
-        PrimitiveType parquetType = ParquetTypeMapping.sortedNumericType(field.name);
-        FieldData fieldData = readFieldData(meta, parquetType);
-        int[] docIds = fieldData.docIds;
+        CachedSortedNumeric cached = sortedNumericCache.get(field.name);
+        if (cached == null) {
+            cached = loadSortedNumeric(meta);
+            sortedNumericCache.put(field.name, cached);
+        }
+        int[] docIds = cached.docIds;
+        long[][] allValues = cached.allValues;
 
         if (docIds.length == 0) {
             return DocValues.emptySortedNumeric();
         }
-
-        ColumnReader reader = fieldData.reader;
-        // Decode repeated INT64 using repetition/definition levels
-        int totalValues = (int) reader.getTotalValueCount();
-        List<long[]> docValues = new ArrayList<>();
-        List<Long> currentDoc = new ArrayList<>();
-
-        for (int i = 0; i < totalValues; i++) {
-            int rep = reader.getCurrentRepetitionLevel();
-            int def = reader.getCurrentDefinitionLevel();
-
-            if (rep == 0 && i > 0) {
-                docValues.add(currentDoc.stream().mapToLong(Long::longValue).toArray());
-                currentDoc.clear();
-            }
-
-            if (def == 1) {
-                currentDoc.add(reader.getLong());
-            }
-
-            reader.consume();
-        }
-        if (totalValues > 0) {
-            docValues.add(currentDoc.stream().mapToLong(Long::longValue).toArray());
-        }
-
-        long[][] allValues = docValues.toArray(new long[0][]);
 
         return new SortedNumericDocValues() {
             private int idx = -1;
@@ -692,46 +799,32 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         };
     }
 
-    @Override
-    public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
-        FieldMeta meta = fields.get(field.name);
-        if (meta == null) {
-            throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
-        }
-        PrimitiveType parquetType = ParquetTypeMapping.sortedSetType(field.name);
+    private CachedSortedSet loadSortedSet(FieldMeta meta) throws IOException {
+        PrimitiveType parquetType = ParquetTypeMapping.sortedSetType(meta.fieldName);
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
-
         if (docIds.length == 0) {
-            return DocValues.emptySortedSet();
+            return new CachedSortedSet(docIds, new long[0][], new BytesRef[0]);
         }
-
         ColumnReader reader = fieldData.reader;
-        // Decode repeated BINARY using repetition/definition levels
         int totalValues = (int) reader.getTotalValueCount();
         List<List<Binary>> docBinaries = new ArrayList<>();
         List<Binary> currentDoc = new ArrayList<>();
-
         for (int i = 0; i < totalValues; i++) {
             int rep = reader.getCurrentRepetitionLevel();
             int def = reader.getCurrentDefinitionLevel();
-
             if (rep == 0 && i > 0) {
                 docBinaries.add(new ArrayList<>(currentDoc));
                 currentDoc.clear();
             }
-
             if (def == 1) {
                 currentDoc.add(reader.getBinary().copy());
             }
-
             reader.consume();
         }
         if (totalValues > 0) {
             docBinaries.add(new ArrayList<>(currentDoc));
         }
-
-        // Build sorted global dictionary from all unique values
         Map<Binary, Integer> valueToOrd = new HashMap<>();
         List<Binary> sortedDict = new ArrayList<>();
         for (List<Binary> docVals : docBinaries) {
@@ -742,21 +835,14 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 }
             }
         }
-        sortedDict.sort((a, b) -> {
-            byte[] ab = a.getBytes();
-            byte[] bb = b.getBytes();
-            return new BytesRef(ab).compareTo(new BytesRef(bb));
-        });
+        sortedDict.sort((a, b) -> new BytesRef(a.getBytes()).compareTo(new BytesRef(b.getBytes())));
         for (int i = 0; i < sortedDict.size(); i++) {
             valueToOrd.put(sortedDict.get(i), i);
         }
-
         BytesRef[] dict = new BytesRef[sortedDict.size()];
         for (int i = 0; i < sortedDict.size(); i++) {
             dict[i] = new BytesRef(sortedDict.get(i).getBytes());
         }
-
-        // Convert each doc's values to sorted ord arrays
         long[][] docOrds = new long[docBinaries.size()][];
         for (int d = 0; d < docBinaries.size(); d++) {
             List<Binary> vals = docBinaries.get(d);
@@ -766,6 +852,27 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             }
             java.util.Arrays.sort(ordArr);
             docOrds[d] = ordArr;
+        }
+        return new CachedSortedSet(docIds, docOrds, dict);
+    }
+
+    @Override
+    public SortedSetDocValues getSortedSet(FieldInfo field) throws IOException {
+        FieldMeta meta = fields.get(field.name);
+        if (meta == null) {
+            throw new IllegalArgumentException("No parquet doc values for field: " + field.name);
+        }
+        CachedSortedSet cached = sortedSetCache.get(field.name);
+        if (cached == null) {
+            cached = loadSortedSet(meta);
+            sortedSetCache.put(field.name, cached);
+        }
+        int[] docIds = cached.docIds;
+        long[][] docOrds = cached.docOrds;
+        BytesRef[] dict = cached.dict;
+
+        if (docIds.length == 0) {
+            return DocValues.emptySortedSet();
         }
 
         return new SortedSetDocValues() {
@@ -853,7 +960,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         if (meta == null) {
             return null;
         }
-        // Read the field data to compute min/max for the skipper
         String dvType = meta.dvTypeName;
         long globalMin = 0;
         long globalMax = 0;
@@ -861,81 +967,81 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         int firstDocId = DocIdSetIterator.NO_MORE_DOCS;
         int lastDocId = DocIdSetIterator.NO_MORE_DOCS;
 
-        if (dvType.equals("NUMERIC") || dvType.equals("SORTED_NUMERIC")) {
-            PrimitiveType parquetType = dvType.equals("NUMERIC")
-                ? ParquetTypeMapping.numericType(field.name)
-                : ParquetTypeMapping.sortedNumericType(field.name);
-            FieldData fieldData = readFieldData(meta, parquetType);
-            int[] docIds = fieldData.docIds;
-            if (docIds.length > 0) {
-                firstDocId = docIds[0];
-                lastDocId = docIds[docIds.length - 1];
-                globalDocCount = docIds.length;
-
-                ColumnReader reader = fieldData.reader;
-                int totalValues = (int) reader.getTotalValueCount();
-                long min = Long.MAX_VALUE;
-                long max = Long.MIN_VALUE;
-                for (int i = 0; i < totalValues; i++) {
-                    int def = reader.getCurrentDefinitionLevel();
-                    if (def >= reader.getDescriptor().getMaxDefinitionLevel() || reader.getDescriptor().getMaxDefinitionLevel() == 0) {
-                        long val = reader.getLong();
-                        min = Math.min(min, val);
-                        max = Math.max(max, val);
+        if (dvType.equals("NUMERIC")) {
+            CachedNumeric cached = numericCache.get(field.name);
+            if (cached == null) {
+                cached = loadNumeric(meta);
+                numericCache.put(field.name, cached);
+            }
+            if (cached.docIds.length > 0) {
+                firstDocId = cached.docIds[0];
+                lastDocId = cached.docIds[cached.docIds.length - 1];
+                globalDocCount = cached.docIds.length;
+                long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
+                for (long v : cached.values) {
+                    min = Math.min(min, v);
+                    max = Math.max(max, v);
+                }
+                globalMin = min;
+                globalMax = max;
+            }
+        } else if (dvType.equals("SORTED_NUMERIC")) {
+            CachedSortedNumeric cached = sortedNumericCache.get(field.name);
+            if (cached == null) {
+                cached = loadSortedNumeric(meta);
+                sortedNumericCache.put(field.name, cached);
+            }
+            if (cached.docIds.length > 0) {
+                firstDocId = cached.docIds[0];
+                lastDocId = cached.docIds[cached.docIds.length - 1];
+                globalDocCount = cached.docIds.length;
+                long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
+                for (long[] vals : cached.allValues) {
+                    for (long v : vals) {
+                        min = Math.min(min, v);
+                        max = Math.max(max, v);
                     }
-                    reader.consume();
                 }
                 globalMin = min;
                 globalMax = max;
             }
         } else if (dvType.equals("SORTED")) {
-            PrimitiveType parquetType = ParquetTypeMapping.sortedType(field.name);
-            FieldData fieldData = readFieldData(meta, parquetType);
-            int[] docIds = fieldData.docIds;
-            if (docIds.length > 0) {
-                firstDocId = docIds[0];
-                lastDocId = docIds[docIds.length - 1];
-                globalDocCount = docIds.length;
-                ColumnReader reader = fieldData.reader;
-                int totalValues = (int) reader.getTotalValueCount();
-                java.util.Set<Binary> unique = new java.util.HashSet<>();
-                for (int i = 0; i < totalValues; i++) {
-                    unique.add(reader.getBinary().copy());
-                    reader.consume();
-                }
+            CachedSorted cached = sortedCache.get(field.name);
+            if (cached == null) {
+                cached = loadSorted(meta);
+                sortedCache.put(field.name, cached);
+            }
+            if (cached.docIds.length > 0) {
+                firstDocId = cached.docIds[0];
+                lastDocId = cached.docIds[cached.docIds.length - 1];
+                globalDocCount = cached.docIds.length;
                 globalMin = 0;
-                globalMax = unique.size() - 1;
+                globalMax = cached.dict.length - 1;
             }
         } else if (dvType.equals("SORTED_SET")) {
-            PrimitiveType parquetType = ParquetTypeMapping.sortedSetType(field.name);
-            FieldData fieldData = readFieldData(meta, parquetType);
-            int[] docIds = fieldData.docIds;
-            if (docIds.length > 0) {
-                firstDocId = docIds[0];
-                lastDocId = docIds[docIds.length - 1];
-                globalDocCount = docIds.length;
-                ColumnReader reader = fieldData.reader;
-                int totalValues = (int) reader.getTotalValueCount();
-                java.util.Set<Binary> unique = new java.util.HashSet<>();
-                for (int i = 0; i < totalValues; i++) {
-                    int def = reader.getCurrentDefinitionLevel();
-                    if (def == 1) {
-                        unique.add(reader.getBinary().copy());
-                    }
-                    reader.consume();
-                }
+            CachedSortedSet cached = sortedSetCache.get(field.name);
+            if (cached == null) {
+                cached = loadSortedSet(meta);
+                sortedSetCache.put(field.name, cached);
+            }
+            if (cached.docIds.length > 0) {
+                firstDocId = cached.docIds[0];
+                lastDocId = cached.docIds[cached.docIds.length - 1];
+                globalDocCount = cached.docIds.length;
                 globalMin = 0;
-                globalMax = Math.max(0, unique.size() - 1);
+                globalMax = Math.max(0, cached.dict.length - 1);
             }
         } else {
             // BINARY type
-            PrimitiveType parquetType = ParquetTypeMapping.binaryType(field.name);
-            FieldData fieldData = readFieldData(meta, parquetType);
-            int[] docIds = fieldData.docIds;
-            if (docIds.length > 0) {
-                firstDocId = docIds[0];
-                lastDocId = docIds[docIds.length - 1];
-                globalDocCount = docIds.length;
+            CachedBinary cached = binaryCache.get(field.name);
+            if (cached == null) {
+                cached = loadBinary(meta);
+                binaryCache.put(field.name, cached);
+            }
+            if (cached.docIds.length > 0) {
+                firstDocId = cached.docIds[0];
+                lastDocId = cached.docIds[cached.docIds.length - 1];
+                globalDocCount = cached.docIds.length;
             }
         }
 

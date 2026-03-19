@@ -38,7 +38,7 @@ public class DerivedSourceDirectoryReader extends FilterDirectoryReader {
 
     @Override
     protected DirectoryReader doWrapDirectoryReader(DirectoryReader directoryReader) throws IOException {
-        return new DerivedSourceDirectoryReader(in, wrapper, sourceProvider);
+        return new DerivedSourceDirectoryReader(directoryReader, wrapper, sourceProvider);
     }
 
     @Override
