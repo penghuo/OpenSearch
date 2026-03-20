@@ -43,27 +43,21 @@ yamlRestTest {
     systemProperty 'tests.rest.denylist', ['nodes.reload_secure_settings/11_no_password/*']
         .join(",")
   }
-}
-
-// Parquet doc_values correctness tests
-sourceSets {
-  yamlRestTestParquet {
-    resources {
-      srcDir 'src/yamlRestTestParquet/resources'
-    }
+  filter {
+    excludeTestsMatching "*parquet.search.aggregation*"
   }
 }
 
-tasks.named('processYamlRestTestParquetResources').configure {
-  duplicatesStrategy = DuplicatesStrategy.INCLUDE
-}
-
+// Parquet doc_values correctness tests
 task yamlRestTestParquet(type: RestIntegTestTask) {
   description = 'Runs YAML REST tests with parquet doc_values format enabled.'
   SourceSetContainer sourceSets = project.getExtensions().getByType(SourceSetContainer.class)
   SourceSet yamlRestTestSourceSet = sourceSets.getByName(YamlRestTestPlugin.SOURCE_SET_NAME)
   setTestClassesDirs(yamlRestTestSourceSet.getOutput().getClassesDirs())
-  setClasspath(yamlRestTestSourceSet.getRuntimeClasspath() + sourceSets.yamlRestTestParquet.output)
+  setClasspath(yamlRestTestSourceSet.getRuntimeClasspath())
+  filter {
+    includeTestsMatching "*parquet.search.aggregation*"
+  }
 }
 check.dependsOn(yamlRestTestParquet)
 
