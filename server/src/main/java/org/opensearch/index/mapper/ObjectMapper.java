@@ -33,7 +33,13 @@
 package org.opensearch.index.mapper;
 
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.BitSet;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -42,6 +48,7 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.collect.CopyOnWriteHashMap;
 import org.opensearch.common.logging.DeprecationLogger;
+import org.opensearch.common.lucene.search.Queries;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.ToXContent;
@@ -1074,8 +1081,8 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void canDeriveSource() {
-        if (!this.enabled.value() || this.nested.isNested()) {
-            throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled/nested");
+        if (!this.enabled.value()) {
+            throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled");
         }
         for (final Mapper mapper : this.mappers.values()) {
             mapper.canDeriveSource();
@@ -1084,10 +1091,51 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void deriveSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        if (nested.isNested()) {
+            deriveNestedSource(builder, leafReader, docId);
+            return;
+        }
         builder.startObject(simpleName());
         for (final Mapper mapper : this.mappers.values()) {
             mapper.deriveSource(builder, leafReader, docId);
         }
         builder.endObject();
+    }
+
+    private void deriveNestedSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        IndexSearcher searcher = new IndexSearcher(leafReader);
+        searcher.setQueryCache(null);
+        LeafReaderContext leafCtx = searcher.getIndexReader().leaves().get(0);
+
+        // Get parent doc BitSet
+        Weight parentWeight = searcher.createWeight(searcher.rewrite(Queries.newNonNestedFilter()), ScoreMode.COMPLETE_NO_SCORES, 1f);
+        Scorer parentScorer = parentWeight.scorer(leafCtx);
+        if (parentScorer == null) return;
+        BitSet parentBits = BitSet.of(parentScorer.iterator(), leafReader.maxDoc());
+
+        // Get child doc BitSet for this nested path
+        Weight childWeight = searcher.createWeight(searcher.rewrite(nestedTypeFilter), ScoreMode.COMPLETE_NO_SCORES, 1f);
+        Scorer childScorer = childWeight.scorer(leafCtx);
+        if (childScorer == null) return;
+        BitSet childBits = BitSet.of(childScorer.iterator(), leafReader.maxDoc());
+
+        // Find child doc IDs between previous parent and current parent
+        int prevParent = docId > 0 ? parentBits.prevSetBit(docId - 1) : -1;
+        List<Integer> childDocIds = new ArrayList<>();
+        for (int childId = childBits.nextSetBit(prevParent + 1); childId >= 0 && childId < docId; childId = childBits.nextSetBit(childId + 1)) {
+            childDocIds.add(childId);
+        }
+
+        if (childDocIds.isEmpty()) return;
+
+        builder.startArray(simpleName());
+        for (int childDocId : childDocIds) {
+            builder.startObject();
+            for (final Mapper mapper : this.mappers.values()) {
+                mapper.deriveSource(builder, leafReader, childDocId);
+            }
+            builder.endObject();
+        }
+        builder.endArray();
     }
 }
