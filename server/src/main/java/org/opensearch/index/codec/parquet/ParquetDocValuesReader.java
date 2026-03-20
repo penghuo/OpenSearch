@@ -8,6 +8,8 @@
 
 package org.opensearch.index.codec.parquet;
 
+import com.github.luben.zstd.Zstd;
+
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
@@ -304,19 +306,21 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         long totalValueCount = 0;
         long totalRowCount = 0;
         for (int i = 0; i < meta.pageCount; i++) {
-            int pageBytesLen = slice.readInt();
+            int compressedSize = slice.readInt();
+            int uncompressedSize = slice.readInt();
             int valueCount = slice.readInt();
             int rowCount = slice.readInt();
             String valuesEncodingName = slice.readString();
             String rlEncodingName = slice.readString();
             String dlEncodingName = slice.readString();
-            byte[] pageBytes = new byte[pageBytesLen];
-            slice.readBytes(pageBytes, 0, pageBytesLen);
+            byte[] compressedBytes = new byte[compressedSize];
+            slice.readBytes(compressedBytes, 0, compressedSize);
+            byte[] pageBytes = Zstd.decompress(compressedBytes, uncompressedSize);
             dataPages.add(
                 new DataPageV1(
                     BytesInput.from(pageBytes),
                     valueCount,
-                    pageBytesLen,
+                    uncompressedSize,
                     Statistics.getBuilderForReading(parquetType).build(),
                     Encoding.valueOf(rlEncodingName),
                     Encoding.valueOf(dlEncodingName),
@@ -330,11 +334,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         // Read dictionary page (after data pages, before doc IDs)
         DictionaryPage dictPage = null;
         if (meta.hasDictionary) {
-            int dictBytesLen = slice.readInt();
+            int compressedSize = slice.readInt();
+            int uncompressedSize = slice.readInt();
             int dictSize = slice.readInt();
             String dictEncodingName = slice.readString();
-            byte[] dictBytes = new byte[dictBytesLen];
-            slice.readBytes(dictBytes, 0, dictBytesLen);
+            byte[] compressedBytes = new byte[compressedSize];
+            slice.readBytes(compressedBytes, 0, compressedSize);
+            byte[] dictBytes = Zstd.decompress(compressedBytes, uncompressedSize);
             dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
         }
 

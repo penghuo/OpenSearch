@@ -8,6 +8,8 @@
 
 package org.opensearch.index.codec.parquet;
 
+import com.github.luben.zstd.Zstd;
+
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesConsumer;
 import org.apache.lucene.codecs.DocValuesProducer;
@@ -48,12 +50,17 @@ import java.util.Arrays;
  * Doc IDs are accumulated in a compact {@code int[]} and written after the pages.
  * Field metadata is written to the {@code .pdvm} metadata file.</p>
  *
- * <p>File format per field in .pdvd (version 1):
+ * <p>File format per field in .pdvd (version 2):
  * <pre>
- *   [data pages...]
- *   [dictionary page (if any)]
- *   [int: docCount][int[]: docIds]
+ *   [ZSTD-compressed data pages...]
+ *   [ZSTD-compressed dictionary page (if any)]
+ *   [byte: denseFlag][int: docCount][int[]: docIds (if sparse)]
  * </pre>
+ * Each data page: [int: compressedSize][int: uncompressedSize][int: valueCount]
+ *                  [int: rowCount][String: valuesEncoding][String: rlEncoding]
+ *                  [String: dlEncoding][byte[]: ZSTD-compressed page data]
+ * Dictionary page: [int: compressedSize][int: uncompressedSize][int: dictSize]
+ *                  [String: encoding][byte[]: ZSTD-compressed dict data]
  * Metadata per field in .pdvm includes a {@code docIdOffset} so the reader can
  * locate the doc ID section without scanning pages.
  *
@@ -63,7 +70,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
 
     static final String DATA_CODEC = "ParquetDocValuesData";
     static final String META_CODEC = "ParquetDocValuesMeta";
-    static final int VERSION_CURRENT = 1;
+    static final int VERSION_CURRENT = 2;
     static final String END_MARKER = "__END__";
 
     /** Flag byte: field has a value for every doc in the segment (no doc IDs stored). */
@@ -419,13 +426,15 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             Encoding valuesEncoding
         ) throws IOException {
             byte[] pageBytes = bytes.toByteArray();
+            byte[] compressedBytes = Zstd.compress(pageBytes);
+            out.writeInt(compressedBytes.length);
             out.writeInt(pageBytes.length);
             out.writeInt(valueCount);
             out.writeInt(rowCount);
             out.writeString(valuesEncoding.name());
             out.writeString(rlEncoding.name());
             out.writeString(dlEncoding.name());
-            out.writeBytes(pageBytes, pageBytes.length);
+            out.writeBytes(compressedBytes, compressedBytes.length);
             pageCount++;
         }
 
@@ -484,10 +493,12 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         void writeDictionaryPageToOutput() throws IOException {
             if (dictionaryPage != null) {
                 byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
+                byte[] compressedBytes = Zstd.compress(dictBytes);
+                out.writeInt(compressedBytes.length);
                 out.writeInt(dictBytes.length);
                 out.writeInt(dictionaryPage.getDictionarySize());
                 out.writeString(dictionaryPage.getEncoding().name());
-                out.writeBytes(dictBytes, dictBytes.length);
+                out.writeBytes(compressedBytes, compressedBytes.length);
             }
         }
 
