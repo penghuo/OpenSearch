@@ -29,8 +29,8 @@ osb_run() {
 
 capture_storage() {
     local label="$1" outfile="$2"
-    echo "=== Storage: $label ==="
-    curl -s "localhost:9200/_cat/indices?v&h=index,docs.count,store.size&s=index" | tee "$outfile"
+    echo "=== Storage: $label ===" >&2
+    curl -s "localhost:9200/_cat/indices?v&h=index,docs.count,store.size&s=index" | tee "$outfile" >&2
     local bytes
     bytes=$(curl -s "localhost:9200/_cat/indices?h=store.size&bytes=b" | awk '{sum+=$1} END {print sum}')
     echo "" >> "$outfile"
