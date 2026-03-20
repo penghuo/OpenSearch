@@ -23,6 +23,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
 import org.opensearch.Version;
 import org.opensearch.common.lucene.search.MultiPhrasePrefixQuery;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.query.QueryShardContext;
@@ -71,10 +72,11 @@ public class MatchOnlyTextFieldMapper extends TextFieldMapper {
         TextFieldMapper.PhraseFieldMapper phraseFieldMapper,
         MultiFields multiFields,
         CopyTo copyTo,
-        Builder builder
+        Builder builder,
+        boolean parquetEnabled
     ) {
 
-        super(simpleName, fieldType, mappedFieldType, prefixFieldMapper, phraseFieldMapper, multiFields, copyTo, builder);
+        super(simpleName, fieldType, mappedFieldType, prefixFieldMapper, phraseFieldMapper, multiFields, copyTo, builder, parquetEnabled);
     }
 
     @Override
@@ -140,6 +142,9 @@ public class MatchOnlyTextFieldMapper extends TextFieldMapper {
         public MatchOnlyTextFieldMapper build(BuilderContext context) {
             FieldType fieldType = TextParams.buildFieldType(index, store, indexOptions, norms, termVectors);
             MatchOnlyTextFieldType tft = buildFieldType(fieldType, context);
+            boolean parquetEnabled = "parquet".equals(
+                context.indexSettings().get(IndexSettings.INDEX_DOC_VALUES_FORMAT_SETTING.getKey(), "")
+            );
             return new MatchOnlyTextFieldMapper(
                 name,
                 fieldType,
@@ -148,7 +153,8 @@ public class MatchOnlyTextFieldMapper extends TextFieldMapper {
                 buildPhraseMapper(fieldType, tft),
                 multiFieldsBuilder.build(this, context),
                 copyTo.build(),
-                this
+                this,
+                parquetEnabled
             );
         }
 

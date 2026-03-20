@@ -476,6 +476,9 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false)) {
                 fieldType.setStored(true);
             }
+            boolean parquetEnabled = "parquet".equals(
+                context.indexSettings().get(IndexSettings.INDEX_DOC_VALUES_FORMAT_SETTING.getKey(), "")
+            );
             return new TextFieldMapper(
                 name,
                 fieldType,
@@ -484,7 +487,8 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
                 buildPhraseMapper(fieldType, tft),
                 multiFieldsBuilder.build(this, context),
                 copyTo.build(),
-                this
+                this,
+                parquetEnabled
             );
         }
     }
@@ -995,6 +999,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
     protected final Version indexCreatedVersion;
     protected final IndexAnalyzers indexAnalyzers;
     private final FielddataFrequencyFilter freqFilter;
+    private final boolean parquetEnabled;
 
     protected TextFieldMapper(
         String simpleName,
@@ -1004,7 +1009,8 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         PhraseFieldMapper phraseFieldMapper,
         MultiFields multiFields,
         CopyTo copyTo,
-        Builder builder
+        Builder builder,
+        boolean parquetEnabled
     ) {
         super(simpleName, mappedFieldType, multiFields, copyTo);
         assert mappedFieldType.getTextSearchInfo().isTokenized();
@@ -1022,6 +1028,10 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         this.indexCreatedVersion = builder.indexCreatedVersion;
         this.indexAnalyzers = builder.analyzers.indexAnalyzers;
         this.freqFilter = builder.freqFilter.getValue();
+        this.parquetEnabled = parquetEnabled;
+        if (parquetEnabled) {
+            setDerivedFieldGenerator(derivedFieldGenerator());
+        }
     }
 
     @Override
@@ -1246,14 +1256,22 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
      */
     @Override
     protected DerivedFieldGenerator derivedFieldGenerator() {
-        return new DerivedFieldGenerator(
-            mappedFieldType,
-            new BinaryDocValuesFetcher(mappedFieldType, simpleName()),
-            new StoredFieldFetcher(mappedFieldType, simpleName())
-        ) {
+        if (parquetEnabled) {
+            return new DerivedFieldGenerator(
+                mappedFieldType,
+                new BinaryDocValuesFetcher(mappedFieldType, simpleName()),
+                new StoredFieldFetcher(mappedFieldType, simpleName())
+            ) {
+                @Override
+                public FieldValueType getDerivedFieldPreference() {
+                    return FieldValueType.DOC_VALUES;
+                }
+            };
+        }
+        return new DerivedFieldGenerator(mappedFieldType, null, new StoredFieldFetcher(mappedFieldType, simpleName())) {
             @Override
             public FieldValueType getDerivedFieldPreference() {
-                return FieldValueType.DOC_VALUES;
+                return FieldValueType.STORED;
             }
         };
     }
