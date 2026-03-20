@@ -76,20 +76,20 @@ run_phase1() {
     local dir="$RESULTS_DIR/phase1"
     mkdir -p "$dir"
 
-    start_opensearch
-
     # Baseline 1%
+    start_opensearch
     echo "=== Phase 1: Baseline run ==="
     osb_run "baseline-params-1pct.json" "baseline-1pct" "$dir/baseline-output.txt"
     local baseline_bytes
     baseline_bytes=$(capture_storage "baseline-1pct" "$dir/baseline-store.txt")
+    stop_opensearch
 
-    # Parquet 1%
+    # Parquet 1% (fresh instance to prevent data contamination)
+    start_opensearch
     echo "=== Phase 1: Parquet run ==="
     osb_run "parquet-params-1pct.json" "parquet-1pct" "$dir/parquet-output.txt"
     local parquet_bytes
     parquet_bytes=$(capture_storage "parquet-1pct" "$dir/parquet-store.txt")
-
     stop_opensearch
 
     # Compare
@@ -153,20 +153,20 @@ run_phase2() {
     local dir="$RESULTS_DIR/phase2"
     mkdir -p "$dir"
 
-    start_opensearch
-
     # Baseline full
+    start_opensearch
     echo "=== Phase 2: Baseline run ==="
     osb_run "baseline-params.json" "baseline-full" "$dir/baseline-output.txt"
     local baseline_bytes
     baseline_bytes=$(capture_storage "baseline-full" "$dir/baseline-store.txt")
+    stop_opensearch
 
-    # Parquet full
+    # Parquet full (fresh instance to prevent data contamination)
+    start_opensearch
     echo "=== Phase 2: Parquet run ==="
     osb_run "parquet-params.json" "parquet-full" "$dir/parquet-output.txt"
     local parquet_bytes
     parquet_bytes=$(capture_storage "parquet-full" "$dir/parquet-store.txt")
-
     stop_opensearch
 
     # Compare
