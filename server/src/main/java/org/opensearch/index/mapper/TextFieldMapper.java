@@ -42,6 +42,7 @@ import org.apache.lucene.analysis.shingle.FixedShingleFilter;
 import org.apache.lucene.analysis.tokenattributes.BytesTermAttribute;
 import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
 import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
+import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.IndexOptions;
@@ -1053,6 +1054,9 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
                 context.doc().add(new Field(phraseFieldMapper.fieldType().name(), value, phraseFieldMapper.fieldType));
             }
         }
+        if (context.indexSettings().isParquetDocValuesEnabled()) {
+            context.doc().add(new BinaryDocValuesField(fieldType().name(), new BytesRef(value)));
+        }
     }
 
     @Override
@@ -1242,10 +1246,14 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
      */
     @Override
     protected DerivedFieldGenerator derivedFieldGenerator() {
-        return new DerivedFieldGenerator(mappedFieldType, null, new StoredFieldFetcher(mappedFieldType, simpleName())) {
+        return new DerivedFieldGenerator(
+            mappedFieldType,
+            new BinaryDocValuesFetcher(mappedFieldType, simpleName()),
+            new StoredFieldFetcher(mappedFieldType, simpleName())
+        ) {
             @Override
             public FieldValueType getDerivedFieldPreference() {
-                return FieldValueType.STORED;
+                return FieldValueType.DOC_VALUES;
             }
         };
     }
