@@ -1,3 +1,5 @@
+import org.opensearch.gradle.test.RestIntegTestTask
+import org.opensearch.gradle.test.rest.YamlRestTestPlugin
 import org.opensearch.gradle.info.BuildParams
 
 /*
@@ -41,4 +43,31 @@ yamlRestTest {
     systemProperty 'tests.rest.denylist', ['nodes.reload_secure_settings/11_no_password/*']
         .join(",")
   }
+}
+
+// Parquet doc_values correctness tests
+sourceSets {
+  yamlRestTestParquet {
+    resources {
+      srcDir 'src/yamlRestTestParquet/resources'
+    }
+  }
+}
+
+tasks.named('processYamlRestTestParquetResources').configure {
+  duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+task yamlRestTestParquet(type: RestIntegTestTask) {
+  description = 'Runs YAML REST tests with parquet doc_values format enabled.'
+  SourceSetContainer sourceSets = project.getExtensions().getByType(SourceSetContainer.class)
+  SourceSet yamlRestTestSourceSet = sourceSets.getByName(YamlRestTestPlugin.SOURCE_SET_NAME)
+  setTestClassesDirs(yamlRestTestSourceSet.getOutput().getClassesDirs())
+  setClasspath(yamlRestTestSourceSet.getRuntimeClasspath() + sourceSets.yamlRestTestParquet.output)
+}
+check.dependsOn(yamlRestTestParquet)
+
+testClusters.yamlRestTestParquet {
+  systemProperty 'opensearch.experimental.feature.parquet_doc_values.enabled', 'true'
+  module ':modules:mapper-extras'
 }
