@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Rules
+
+- NEVER delete, remove, or modify tests without explicit user approval. If tests fail, propose the fix and wait for confirmation before changing any test file.
+
 ## Repository Structure
 
 Key components:
