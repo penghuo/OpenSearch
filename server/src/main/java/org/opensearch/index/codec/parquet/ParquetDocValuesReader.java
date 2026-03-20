@@ -1239,6 +1239,146 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             return DocValues.emptySortedSet();
         }
 
+        // Singleton detection: if every document has exactly one ordinal,
+        // wrap as DocValues.singleton() so DocValues.unwrapSingleton() succeeds
+        // (required by GlobalOrdinalsStringTermsAggregator).
+        boolean isSingleton = true;
+        for (long[] ords : docOrds) {
+            if (ords.length != 1) {
+                isSingleton = false;
+                break;
+            }
+        }
+        if (isSingleton) {
+            SortedDocValues sortedDv;
+            if (cached.isDense) {
+                final int maxDoc = docIds.length;
+                sortedDv = new SortedDocValues() {
+                    private int doc = -1;
+
+                    @Override
+                    public int ordValue() {
+                        return (int) docOrds[doc][0];
+                    }
+
+                    @Override
+                    public BytesRef lookupOrd(int ord) {
+                        return dict[ord];
+                    }
+
+                    @Override
+                    public int getValueCount() {
+                        return dict.length;
+                    }
+
+                    @Override
+                    public boolean advanceExact(int target) {
+                        doc = target;
+                        return target < maxDoc;
+                    }
+
+                    @Override
+                    public int docID() {
+                        return doc;
+                    }
+
+                    @Override
+                    public int nextDoc() {
+                        doc++;
+                        if (doc >= maxDoc) {
+                            doc = NO_MORE_DOCS;
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public int advance(int target) {
+                        doc = target;
+                        if (doc >= maxDoc) {
+                            doc = NO_MORE_DOCS;
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public long cost() {
+                        return maxDoc;
+                    }
+                };
+            } else {
+                sortedDv = new SortedDocValues() {
+                    private int idx = -1;
+                    private int doc = -1;
+
+                    @Override
+                    public int ordValue() {
+                        return (int) docOrds[idx][0];
+                    }
+
+                    @Override
+                    public BytesRef lookupOrd(int ord) {
+                        return dict[ord];
+                    }
+
+                    @Override
+                    public int getValueCount() {
+                        return dict.length;
+                    }
+
+                    @Override
+                    public boolean advanceExact(int target) {
+                        doc = target;
+                        int found = java.util.Arrays.binarySearch(docIds, Math.max(idx, 0), docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
+                            return true;
+                        }
+                        idx = -found - 2;
+                        return false;
+                    }
+
+                    @Override
+                    public int docID() {
+                        return doc;
+                    }
+
+                    @Override
+                    public int nextDoc() {
+                        idx++;
+                        if (idx >= docIds.length) {
+                            doc = NO_MORE_DOCS;
+                        } else {
+                            doc = docIds[idx];
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public int advance(int target) {
+                        int start = Math.max(idx + 1, 0);
+                        int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
+                        } else {
+                            idx = -found - 1;
+                        }
+                        if (idx >= docIds.length) {
+                            doc = NO_MORE_DOCS;
+                        } else {
+                            doc = docIds[idx];
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public long cost() {
+                        return docIds.length;
+                    }
+                };
+            }
+            return DocValues.singleton(sortedDv);
+        }
+
         if (cached.isDense) {
             final int maxDoc = docIds.length;
             return new SortedSetDocValues() {
