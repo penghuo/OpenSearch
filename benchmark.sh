@@ -20,6 +20,11 @@ osb_run() {
         --user-tag="config:$tag" \
         --kill-running-processes \
         2>&1 | tee "$output_file"
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        echo "WARNING: OSB run '$tag' exited with code $exit_code" >&2
+    fi
+    return $exit_code
 }
 
 capture_storage() {
@@ -34,7 +39,7 @@ capture_storage() {
 }
 
 extract_run_id() {
-    grep -oP 'Test run ID: \K[a-f0-9-]+' "$1" | tail -1
+    grep -oP '\[Test Run ID\]: \K[a-f0-9-]+' "$1" | tail -1
 }
 
 start_opensearch() {
@@ -79,7 +84,7 @@ run_phase1() {
     # Baseline 1%
     start_opensearch
     echo "=== Phase 1: Baseline run ==="
-    osb_run "baseline-params-1pct.json" "baseline-1pct" "$dir/baseline-output.txt"
+    osb_run "baseline-params-1pct.json" "baseline-1pct" "$dir/baseline-output.txt" || echo "WARNING: OSB run failed, continuing..."
     local baseline_bytes
     baseline_bytes=$(capture_storage "baseline-1pct" "$dir/baseline-store.txt")
     stop_opensearch
@@ -87,7 +92,7 @@ run_phase1() {
     # Parquet 1% (fresh instance to prevent data contamination)
     start_opensearch
     echo "=== Phase 1: Parquet run ==="
-    osb_run "parquet-params-1pct.json" "parquet-1pct" "$dir/parquet-output.txt"
+    osb_run "parquet-params-1pct.json" "parquet-1pct" "$dir/parquet-output.txt" || echo "WARNING: OSB run failed, continuing..."
     local parquet_bytes
     parquet_bytes=$(capture_storage "parquet-1pct" "$dir/parquet-store.txt")
     stop_opensearch
@@ -146,6 +151,82 @@ EOF
     cat "$dir/summary.md"
 }
 
+run_smoke() {
+    echo "============================================"
+    echo "  SMOKE: 0.1% corpus"
+    echo "============================================"
+    local dir="$RESULTS_DIR/smoke"
+    mkdir -p "$dir"
+
+    # Baseline smoke
+    start_opensearch
+    echo "=== Smoke: Baseline run ==="
+    osb_run "baseline-params-smoke.json" "baseline-smoke" "$dir/baseline-output.txt" || echo "WARNING: OSB run failed, continuing..."
+    local baseline_bytes
+    baseline_bytes=$(capture_storage "baseline-smoke" "$dir/baseline-store.txt")
+    stop_opensearch
+
+    # Parquet smoke (fresh instance to prevent data contamination)
+    start_opensearch
+    echo "=== Smoke: Parquet run ==="
+    osb_run "parquet-params-smoke.json" "parquet-smoke" "$dir/parquet-output.txt" || echo "WARNING: OSB run failed, continuing..."
+    local parquet_bytes
+    parquet_bytes=$(capture_storage "parquet-smoke" "$dir/parquet-store.txt")
+    stop_opensearch
+
+    # Compare
+    local baseline_id parquet_id
+    baseline_id=$(extract_run_id "$dir/baseline-output.txt")
+    parquet_id=$(extract_run_id "$dir/parquet-output.txt")
+    echo "Baseline ID: $baseline_id"
+    echo "Parquet ID:  $parquet_id"
+
+    docker run --rm --network host \
+      -v osb-data:/opensearch-benchmark/.benchmark \
+      opensearchproject/opensearch-benchmark:latest \
+      compare --baseline "$baseline_id" --contender "$parquet_id" \
+      --results-format markdown \
+      2>&1 | tee "$dir/comparison.md"
+
+    # Evaluate smoke
+    local baseline_ok parquet_ok
+    baseline_ok=$(grep -c "SUCCESS" "$dir/baseline-output.txt" || true)
+    parquet_ok=$(grep -c "SUCCESS" "$dir/parquet-output.txt" || true)
+
+    local storage_pct="N/A"
+    if [ "$baseline_bytes" -gt 0 ] 2>/dev/null; then
+        storage_pct=$(awk "BEGIN {printf \"%.1f\", ($parquet_bytes / $baseline_bytes) * 100}")
+    fi
+
+    cat > "$dir/summary.md" <<EOF
+# Smoke Summary (0.1% corpus)
+
+## Correctness
+- Baseline: $([ "$baseline_ok" -ge 1 ] && echo "✅ SUCCESS" || echo "❌ FAIL")
+- Parquet:  $([ "$parquet_ok" -ge 1 ] && echo "✅ SUCCESS" || echo "❌ FAIL")
+
+## Storage
+- Baseline: $baseline_bytes bytes
+- Parquet:  $parquet_bytes bytes
+- Ratio:    ${storage_pct}% of baseline
+
+## Pass/Fail (Smoke: no downgrade)
+| Criterion | Target | Result | Status |
+|-----------|--------|--------|--------|
+| Correctness | 0 errors | parquet_ok=$parquet_ok | $([ "$parquet_ok" -ge 1 ] && echo "✅" || echo "❌") |
+| Storage | ≤ baseline | ${storage_pct}% | $(awk "BEGIN {exit ($parquet_bytes <= $baseline_bytes) ? 0 : 1}" 2>/dev/null && echo "✅" || echo "❌") |
+| Ingestion | ≥ baseline | See comparison.md | ⏳ CHECK |
+| Query perf | ≤ baseline | See comparison.md | ⏳ CHECK |
+
+## Run IDs
+- Baseline: $baseline_id
+- Parquet:  $parquet_id
+EOF
+
+    echo "=== Smoke complete. See $dir/summary.md ==="
+    cat "$dir/summary.md"
+}
+
 run_phase2() {
     echo "============================================"
     echo "  PHASE 2: Full corpus (247M docs)"
@@ -156,7 +237,7 @@ run_phase2() {
     # Baseline full
     start_opensearch
     echo "=== Phase 2: Baseline run ==="
-    osb_run "baseline-params.json" "baseline-full" "$dir/baseline-output.txt"
+    osb_run "baseline-params.json" "baseline-full" "$dir/baseline-output.txt" || echo "WARNING: OSB run failed, continuing..."
     local baseline_bytes
     baseline_bytes=$(capture_storage "baseline-full" "$dir/baseline-store.txt")
     stop_opensearch
@@ -164,7 +245,7 @@ run_phase2() {
     # Parquet full (fresh instance to prevent data contamination)
     start_opensearch
     echo "=== Phase 2: Parquet run ==="
-    osb_run "parquet-params.json" "parquet-full" "$dir/parquet-output.txt"
+    osb_run "parquet-params.json" "parquet-full" "$dir/parquet-output.txt" || echo "WARNING: OSB run failed, continuing..."
     local parquet_bytes
     parquet_bytes=$(capture_storage "parquet-full" "$dir/parquet-store.txt")
     stop_opensearch
@@ -216,8 +297,9 @@ EOF
 }
 
 case "$PHASE" in
+    smoke)  run_smoke ;;
     phase1) run_phase1 ;;
     phase2) run_phase2 ;;
     all)    run_phase1 && run_phase2 ;;
-    *)      echo "Usage: $0 {phase1|phase2|all}"; exit 1 ;;
+    *)      echo "Usage: $0 {smoke|phase1|phase2|all}"; exit 1 ;;
 esac
