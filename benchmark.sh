@@ -6,6 +6,7 @@ RESULTS_DIR="benchmark-results"
 INGEST_PCT="${1:-1}"
 
 mkdir -p "$RESULTS_DIR"
+chmod 777 "$RESULTS_DIR"
 
 start_opensearch() {
     echo "=== Cleaning data ==="
