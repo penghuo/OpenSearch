@@ -44,7 +44,7 @@ yamlRestTest {
         .join(",")
   }
   filter {
-    excludeTestsMatching "*parquet.search.aggregation*"
+    excludeTestsMatching "*parquet.search*"
   }
 }
 
@@ -56,8 +56,26 @@ task yamlRestTestParquet(type: RestIntegTestTask) {
   setTestClassesDirs(yamlRestTestSourceSet.getOutput().getClassesDirs())
   setClasspath(yamlRestTestSourceSet.getRuntimeClasspath())
   filter {
-    includeTestsMatching "*parquet.search.aggregation*"
+    includeTestsMatching "*parquet.search*"
   }
+  // Exclude tests that are incompatible with _source reconstruction from doc_values:
+  // - Multi-valued numeric arrays: doc_values return sorted order, not insertion order
+  // - Half-float precision: IEEE 754 half-precision loses precision (194.4 -> 194.375)
+  // - Date timezone: epoch millis storage loses original timezone offset
+  // - Range fields: complex binary encoding not supported by parquet format
+  // - doc_values:false fields: cannot reconstruct _source without doc_values
+  // - _source:enabled:false: parquet always reconstructs _source from doc_values
+  systemProperty 'tests.rest.denylist', [
+    'parquet.search/260_sort_long/test sorting against long only fields',
+    'parquet.search/260_sort_double/test sorting against double only fields',
+    'parquet.search/260_sort_unsigned_long/test sorting against unsigned_long only fields',
+    'parquet.search/260_sort_mixed/search across indices with mixed long and double and float numeric types',
+    'parquet.search/90_search_after/half float',
+    'parquet.search/240_date_nanos/date with nested sort now',
+    'parquet.search/330_fetch_fields/Test basic field retrieval',
+    'parquet.search/340_doc_values_field/search on fields with only index enabled',
+    'parquet.search.inner_hits/20_highlighting_field_match_only_text/Unified highlighter with stored fields and disabled source',
+  ].join(',')
 }
 check.dependsOn(yamlRestTestParquet)
 
