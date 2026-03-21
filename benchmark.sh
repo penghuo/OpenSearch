@@ -45,7 +45,7 @@ capture_storage() {
 }
 
 osb_run() {
-    local tag="$1" params="$2" csv_file="$3"
+    local tag="$1" params_file="$2" csv_file="$3"
     docker run --rm --network host \
       -v osb-data:/opensearch-benchmark/.benchmark \
       -v "$(pwd)/$RESULTS_DIR:/results" \
@@ -55,7 +55,7 @@ osb_run() {
         --target-hosts localhost:9200 \
         --pipeline benchmark-only \
         --test-procedure append-no-conflicts-index-only \
-        --workload-params="$params" \
+        --workload-params="/results/$(basename "$params_file")" \
         --user-tag="config:$tag" \
         --results-format csv \
         --results-file "/results/$(basename "$csv_file")" \
@@ -63,42 +63,49 @@ osb_run() {
         2>&1 | tee "$RESULTS_DIR/${tag}-output.txt"
 }
 
+# ── Clean old results ────────────────────────────────────────────────────────
+rm -f "$RESULTS_DIR/baseline.csv" "$RESULTS_DIR/parquet.csv" "$RESULTS_DIR/summary.md"
+
+# ── Write param files ────────────────────────────────────────────────────────
+cat > "$RESULTS_DIR/baseline-params.json" <<PARAMS
+{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}}
+PARAMS
+
+cat > "$RESULTS_DIR/parquet-params.json" <<PARAMS
+{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "index_settings": {"index.codec.doc_values.format": "parquet"}}
+PARAMS
+
 # ── Baseline ─────────────────────────────────────────────────────────────────
 start_opensearch
 echo "=== Baseline run (${INGEST_PCT}% corpus) ==="
-osb_run "baseline" \
-    "number_of_replicas:0,ingest_percentage:${INGEST_PCT}" \
-    "baseline.csv"
-BASELINE_BYTES=$(capture_storage "baseline")
+osb_run "baseline" "$RESULTS_DIR/baseline-params.json" "baseline.csv"
+capture_storage "baseline"
 stop_opensearch
 
 # ── Parquet ──────────────────────────────────────────────────────────────────
 start_opensearch
 echo "=== Parquet run (${INGEST_PCT}% corpus) ==="
-osb_run "parquet" \
-    "number_of_replicas:0,ingest_percentage:${INGEST_PCT},index_settings:{\"index.codec.doc_values.format\":\"parquet\"}" \
-    "parquet.csv"
-PARQUET_BYTES=$(capture_storage "parquet")
+osb_run "parquet" "$RESULTS_DIR/parquet-params.json" "parquet.csv"
+capture_storage "parquet"
 stop_opensearch
 
 # ── Extract metrics from CSVs ────────────────────────────────────────────────
 extract_metric() {
     local file="$1" metric="$2"
-    grep "^$metric" "$file" | head -1 | awk -F',' '{print $2}'
+    grep "^${metric}," "$file" | head -1 | awk -F',' '{print $3}'
 }
 
-B_MEDIAN_TP=$(extract_metric "$RESULTS_DIR/baseline.csv" "Median Throughput")
-P_MEDIAN_TP=$(extract_metric "$RESULTS_DIR/parquet.csv" "Median Throughput")
+B_STORE_GB=$(extract_metric "$RESULTS_DIR/baseline.csv" "Store size")
+P_STORE_GB=$(extract_metric "$RESULTS_DIR/parquet.csv" "Store size")
 B_INDEX_TIME=$(extract_metric "$RESULTS_DIR/baseline.csv" "Cumulative indexing time of primary shards")
 P_INDEX_TIME=$(extract_metric "$RESULTS_DIR/parquet.csv" "Cumulative indexing time of primary shards")
 
 pct_diff() {
-    awk "BEGIN { if ($1 != 0) printf \"%.1f%%\", (($2 - $1) / $1) * 100; else print \"N/A\" }"
+    awk "BEGIN { if ($1+0 != 0) printf \"%.1f%%\", (($2 - $1) / $1) * 100; else print \"N/A\" }"
 }
 
-STORAGE_DIFF=$(pct_diff "$BASELINE_BYTES" "$PARQUET_BYTES")
-TP_DIFF=$(pct_diff "$B_MEDIAN_TP" "$P_MEDIAN_TP")
-TIME_DIFF=$(pct_diff "$B_INDEX_TIME" "$P_INDEX_TIME")
+STORAGE_DIFF=$(pct_diff "${B_STORE_GB:-0}" "${P_STORE_GB:-0}")
+TIME_DIFF=$(pct_diff "${B_INDEX_TIME:-0}" "${P_INDEX_TIME:-0}")
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 cat <<EOF | tee "$RESULTS_DIR/summary.md"
@@ -106,11 +113,12 @@ cat <<EOF | tee "$RESULTS_DIR/summary.md"
 
 | Metric                    | Baseline       | Parquet        | Diff       |
 |---------------------------|----------------|----------------|------------|
-| Median Throughput (docs/s)| $B_MEDIAN_TP   | $P_MEDIAN_TP   | $TP_DIFF   |
-| Store Size (bytes)        | $BASELINE_BYTES| $PARQUET_BYTES | $STORAGE_DIFF |
+| Store Size (GB)           | $B_STORE_GB    | $P_STORE_GB    | $STORAGE_DIFF |
 | Indexing Time (min)       | $B_INDEX_TIME  | $P_INDEX_TIME  | $TIME_DIFF |
+
+Note: Median Throughput not available (1% corpus completes during OSB warmup phase).
 
 ## Pass/Fail
 - Storage reduction: $STORAGE_DIFF (target: significant reduction)
-- Ingestion throughput: $TP_DIFF (target: no major regression)
+- Indexing time: $TIME_DIFF (target: no major regression)
 EOF
