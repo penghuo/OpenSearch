@@ -25,3 +25,32 @@
 
 ## Pass/Fail
 - Target: no operation regresses >20% on p90 latency
+- **VERDICT: FAIL** — 9 out of 20 operations regress >20% on p90
+
+### Failing Operations (p90 regression >20%)
+| Operation | p90 Diff |
+|-----------|----------|
+| asc_sort_timestamp | +23.2% |
+| asc-sort-timestamp-after-force-merge-1-seg | +66.3% |
+| desc_sort_size | +24.0% |
+| desc_sort_timestamp | +28.1% |
+| desc-sort-timestamp-after-force-merge-1-seg | +34.4% |
+| desc-sort-with-after-timestamp-after-force-merge-1-seg | +50.0% |
+| scroll | +89.5% |
+| status-200s-in-range | +1411.3% |
+| status-400s-in-range | +10167.6% |
+
+### Passing Operations (p90 regression ≤20%)
+| Operation | p90 Diff |
+|-----------|----------|
+| asc_sort_size | +10.0% |
+| asc_sort_with_after_timestamp | +2.7% |
+| asc-sort-with-after-timestamp-after-force-merge-1-seg | +2.4% |
+| desc_sort_with_after_timestamp | +19.5% |
+| hourly_agg | -5.9% |
+| hourly_agg_with_filter | +17.8% |
+| hourly_agg_with_filter_and_metrics | +11.0% |
+| match-all | +19.8% |
+| multi_term_agg | -6.4% |
+| range | -2.1% |
+| term | +4.5% |
