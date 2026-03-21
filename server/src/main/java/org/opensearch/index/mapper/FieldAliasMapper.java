@@ -35,6 +35,8 @@ package org.opensearch.index.mapper;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.XContentBuilder;
 
+import org.apache.lucene.index.LeafReader;
+
 import java.io.IOException;
 import java.util.Collections;
 import java.util.Iterator;
@@ -97,6 +99,16 @@ public final class FieldAliasMapper extends Mapper {
     @Override
     public Iterator<Mapper> iterator() {
         return Collections.emptyIterator();
+    }
+
+    @Override
+    public void canDeriveSource() {
+        // Aliases have no concrete data — nothing to derive
+    }
+
+    @Override
+    public void deriveSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        // Aliases have no concrete data — nothing to derive
     }
 
     @Override
