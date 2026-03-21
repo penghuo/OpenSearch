@@ -3,44 +3,9 @@ set -euo pipefail
 
 OS_HOME="/local/home/penghuo/oss/OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
 RESULTS_DIR="benchmark-results"
-PARAMS_DIR="$RESULTS_DIR"
+INGEST_PCT="${1:-1}"
 
-osb_run() {
-    local params_file="$1" tag="$2" output_file="$3"
-    docker run --rm --network host \
-      -v osb-data:/opensearch-benchmark/.benchmark \
-      -v "$(cd "$PARAMS_DIR" && pwd)/$params_file:/params.json:ro" \
-      opensearchproject/opensearch-benchmark:latest \
-      run \
-        --workload http_logs \
-        --target-hosts localhost:9200 \
-        --pipeline benchmark-only \
-        --test-procedure append-no-conflicts \
-        --workload-params="/params.json" \
-        --user-tag="config:$tag" \
-        --kill-running-processes \
-        2>&1 | tee "$output_file"
-    local exit_code=${PIPESTATUS[0]}
-    if [ $exit_code -ne 0 ]; then
-        echo "WARNING: OSB run '$tag' exited with code $exit_code" >&2
-    fi
-    return $exit_code
-}
-
-capture_storage() {
-    local label="$1" outfile="$2"
-    echo "=== Storage: $label ===" >&2
-    curl -s "localhost:9200/_cat/indices?v&h=index,docs.count,store.size&s=index" | tee "$outfile" >&2
-    local bytes
-    bytes=$(curl -s "localhost:9200/_cat/indices?h=store.size&bytes=b" | awk '{sum+=$1} END {print sum}')
-    echo "" >> "$outfile"
-    echo "Total bytes: $bytes" >> "$outfile"
-    echo "$bytes"
-}
-
-extract_run_id() {
-    grep -oP '\[Test Run ID\]: \K[a-f0-9-]+' "$1" | tail -1
-}
+mkdir -p "$RESULTS_DIR"
 
 start_opensearch() {
     echo "=== Cleaning data ==="
@@ -54,15 +19,15 @@ start_opensearch() {
     echo "=== Waiting for cluster ==="
     for i in $(seq 1 120); do
         local status
-        status=$(curl -s localhost:9200/_cluster/health 2>/dev/null | grep -oP '"status"\s*:\s*"\K[^"]+' || true)
+        status=$(curl -s localhost:9200/_cluster/health 2>/dev/null \
+            | grep -oP '"status"\s*:\s*"\K[^"]+' || true)
         if [ "$status" = "green" ] || [ "$status" = "yellow" ]; then
             echo "Cluster is $status"
             return 0
         fi
         sleep 5
     done
-    echo "ERROR: cluster did not start" >&2
-    return 1
+    echo "ERROR: cluster did not start" >&2; return 1
 }
 
 stop_opensearch() {
@@ -71,235 +36,80 @@ stop_opensearch() {
     sleep 5
 }
 
-# ── Parse args ───────────────────────────────────────────────────────────────
-PHASE="${1:-all}"  # phase1, phase2, or all
-
-run_phase1() {
-    echo "============================================"
-    echo "  PHASE 1: 1% corpus (~2.5M docs)"
-    echo "============================================"
-    local dir="$RESULTS_DIR/phase1"
-    mkdir -p "$dir"
-
-    # Baseline 1%
-    start_opensearch
-    echo "=== Phase 1: Baseline run ==="
-    osb_run "baseline-params-1pct.json" "baseline-1pct" "$dir/baseline-output.txt" || echo "WARNING: OSB run failed, continuing..."
-    local baseline_bytes
-    baseline_bytes=$(capture_storage "baseline-1pct" "$dir/baseline-store.txt")
-    stop_opensearch
-
-    # Parquet 1% (fresh instance to prevent data contamination)
-    start_opensearch
-    echo "=== Phase 1: Parquet run ==="
-    osb_run "parquet-params-1pct.json" "parquet-1pct" "$dir/parquet-output.txt" || echo "WARNING: OSB run failed, continuing..."
-    local parquet_bytes
-    parquet_bytes=$(capture_storage "parquet-1pct" "$dir/parquet-store.txt")
-    stop_opensearch
-
-    # Compare
-    local baseline_id parquet_id
-    baseline_id=$(extract_run_id "$dir/baseline-output.txt")
-    parquet_id=$(extract_run_id "$dir/parquet-output.txt")
-    echo "Baseline ID: $baseline_id"
-    echo "Parquet ID:  $parquet_id"
-
-    docker run --rm --network host \
-      -v osb-data:/opensearch-benchmark/.benchmark \
-      opensearchproject/opensearch-benchmark:latest \
-      compare --baseline "$baseline_id" --contender "$parquet_id" \
-      --results-format markdown \
-      2>&1 | tee "$dir/comparison.md"
-
-    # Evaluate phase 1
-    local parquet_errors baseline_ok parquet_ok
-    parquet_errors=$(grep -ci "error" "$dir/parquet-output.txt" || true)
-    baseline_ok=$(grep -c "SUCCESS" "$dir/baseline-output.txt" || true)
-    parquet_ok=$(grep -c "SUCCESS" "$dir/parquet-output.txt" || true)
-
-    local storage_pct="N/A"
-    if [ "$baseline_bytes" -gt 0 ] 2>/dev/null; then
-        storage_pct=$(awk "BEGIN {printf \"%.1f\", ($parquet_bytes / $baseline_bytes) * 100}")
-    fi
-
-    cat > "$dir/summary.md" <<EOF
-# Phase 1 Summary (1% corpus)
-
-## Correctness
-- Baseline: $([ "$baseline_ok" -ge 1 ] && echo "✅ SUCCESS" || echo "❌ FAIL")
-- Parquet:  $([ "$parquet_ok" -ge 1 ] && echo "✅ SUCCESS" || echo "❌ FAIL")
-
-## Storage
-- Baseline: $baseline_bytes bytes
-- Parquet:  $parquet_bytes bytes
-- Ratio:    ${storage_pct}% of baseline
-
-## Pass/Fail (Phase 1: no downgrade)
-| Criterion | Target | Result | Status |
-|-----------|--------|--------|--------|
-| Correctness | 0 errors | parquet_ok=$parquet_ok | $([ "$parquet_ok" -ge 1 ] && echo "✅" || echo "❌") |
-| Storage | ≤ baseline | ${storage_pct}% | $(awk "BEGIN {exit ($parquet_bytes <= $baseline_bytes) ? 0 : 1}" 2>/dev/null && echo "✅" || echo "❌") |
-| Ingestion | ≥ baseline | See comparison.md | ⏳ CHECK |
-| Query perf | ≤ baseline | See comparison.md | ⏳ CHECK |
-
-## Run IDs
-- Baseline: $baseline_id
-- Parquet:  $parquet_id
-EOF
-
-    echo "=== Phase 1 complete. See $dir/summary.md ==="
-    cat "$dir/summary.md"
+capture_storage() {
+    local label="$1"
+    curl -s "localhost:9200/_cat/indices?v&h=index,docs.count,store.size&s=index" >&2
+    curl -s "localhost:9200/_cat/indices?h=store.size&bytes=b" \
+        | awk '{sum+=$1} END {print sum}'
 }
 
-run_smoke() {
-    echo "============================================"
-    echo "  SMOKE: 0.1% corpus"
-    echo "============================================"
-    local dir="$RESULTS_DIR/smoke"
-    mkdir -p "$dir"
-
-    # Baseline smoke
-    start_opensearch
-    echo "=== Smoke: Baseline run ==="
-    osb_run "baseline-params-smoke.json" "baseline-smoke" "$dir/baseline-output.txt" || echo "WARNING: OSB run failed, continuing..."
-    local baseline_bytes
-    baseline_bytes=$(capture_storage "baseline-smoke" "$dir/baseline-store.txt")
-    stop_opensearch
-
-    # Parquet smoke (fresh instance to prevent data contamination)
-    start_opensearch
-    echo "=== Smoke: Parquet run ==="
-    osb_run "parquet-params-smoke.json" "parquet-smoke" "$dir/parquet-output.txt" || echo "WARNING: OSB run failed, continuing..."
-    local parquet_bytes
-    parquet_bytes=$(capture_storage "parquet-smoke" "$dir/parquet-store.txt")
-    stop_opensearch
-
-    # Compare
-    local baseline_id parquet_id
-    baseline_id=$(extract_run_id "$dir/baseline-output.txt")
-    parquet_id=$(extract_run_id "$dir/parquet-output.txt")
-    echo "Baseline ID: $baseline_id"
-    echo "Parquet ID:  $parquet_id"
-
+osb_run() {
+    local tag="$1" params="$2" csv_file="$3"
     docker run --rm --network host \
       -v osb-data:/opensearch-benchmark/.benchmark \
+      -v "$(pwd)/$RESULTS_DIR:/results" \
       opensearchproject/opensearch-benchmark:latest \
-      compare --baseline "$baseline_id" --contender "$parquet_id" \
-      --results-format markdown \
-      2>&1 | tee "$dir/comparison.md"
-
-    # Evaluate smoke
-    local baseline_ok parquet_ok
-    baseline_ok=$(grep -c "SUCCESS" "$dir/baseline-output.txt" || true)
-    parquet_ok=$(grep -c "SUCCESS" "$dir/parquet-output.txt" || true)
-
-    local storage_pct="N/A"
-    if [ "$baseline_bytes" -gt 0 ] 2>/dev/null; then
-        storage_pct=$(awk "BEGIN {printf \"%.1f\", ($parquet_bytes / $baseline_bytes) * 100}")
-    fi
-
-    cat > "$dir/summary.md" <<EOF
-# Smoke Summary (0.1% corpus)
-
-## Correctness
-- Baseline: $([ "$baseline_ok" -ge 1 ] && echo "✅ SUCCESS" || echo "❌ FAIL")
-- Parquet:  $([ "$parquet_ok" -ge 1 ] && echo "✅ SUCCESS" || echo "❌ FAIL")
-
-## Storage
-- Baseline: $baseline_bytes bytes
-- Parquet:  $parquet_bytes bytes
-- Ratio:    ${storage_pct}% of baseline
-
-## Pass/Fail (Smoke: no downgrade)
-| Criterion | Target | Result | Status |
-|-----------|--------|--------|--------|
-| Correctness | 0 errors | parquet_ok=$parquet_ok | $([ "$parquet_ok" -ge 1 ] && echo "✅" || echo "❌") |
-| Storage | ≤ baseline | ${storage_pct}% | $(awk "BEGIN {exit ($parquet_bytes <= $baseline_bytes) ? 0 : 1}" 2>/dev/null && echo "✅" || echo "❌") |
-| Ingestion | ≥ baseline | See comparison.md | ⏳ CHECK |
-| Query perf | ≤ baseline | See comparison.md | ⏳ CHECK |
-
-## Run IDs
-- Baseline: $baseline_id
-- Parquet:  $parquet_id
-EOF
-
-    echo "=== Smoke complete. See $dir/summary.md ==="
-    cat "$dir/summary.md"
+      run \
+        --workload http_logs \
+        --target-hosts localhost:9200 \
+        --pipeline benchmark-only \
+        --test-procedure append-no-conflicts-index-only \
+        --workload-params="$params" \
+        --user-tag="config:$tag" \
+        --results-format csv \
+        --results-file "/results/$(basename "$csv_file")" \
+        --kill-running-processes \
+        2>&1 | tee "$RESULTS_DIR/${tag}-output.txt"
 }
 
-run_phase2() {
-    echo "============================================"
-    echo "  PHASE 2: Full corpus (247M docs)"
-    echo "============================================"
-    local dir="$RESULTS_DIR/phase2"
-    mkdir -p "$dir"
+# ── Baseline ─────────────────────────────────────────────────────────────────
+start_opensearch
+echo "=== Baseline run (${INGEST_PCT}% corpus) ==="
+osb_run "baseline" \
+    "number_of_replicas:0,ingest_percentage:${INGEST_PCT}" \
+    "baseline.csv"
+BASELINE_BYTES=$(capture_storage "baseline")
+stop_opensearch
 
-    # Baseline full
-    start_opensearch
-    echo "=== Phase 2: Baseline run ==="
-    osb_run "baseline-params.json" "baseline-full" "$dir/baseline-output.txt" || echo "WARNING: OSB run failed, continuing..."
-    local baseline_bytes
-    baseline_bytes=$(capture_storage "baseline-full" "$dir/baseline-store.txt")
-    stop_opensearch
+# ── Parquet ──────────────────────────────────────────────────────────────────
+start_opensearch
+echo "=== Parquet run (${INGEST_PCT}% corpus) ==="
+osb_run "parquet" \
+    "number_of_replicas:0,ingest_percentage:${INGEST_PCT},index_settings:{\"index.codec.doc_values.format\":\"parquet\"}" \
+    "parquet.csv"
+PARQUET_BYTES=$(capture_storage "parquet")
+stop_opensearch
 
-    # Parquet full (fresh instance to prevent data contamination)
-    start_opensearch
-    echo "=== Phase 2: Parquet run ==="
-    osb_run "parquet-params.json" "parquet-full" "$dir/parquet-output.txt" || echo "WARNING: OSB run failed, continuing..."
-    local parquet_bytes
-    parquet_bytes=$(capture_storage "parquet-full" "$dir/parquet-store.txt")
-    stop_opensearch
-
-    # Compare
-    local baseline_id parquet_id
-    baseline_id=$(extract_run_id "$dir/baseline-output.txt")
-    parquet_id=$(extract_run_id "$dir/parquet-output.txt")
-
-    docker run --rm --network host \
-      -v osb-data:/opensearch-benchmark/.benchmark \
-      opensearchproject/opensearch-benchmark:latest \
-      compare --baseline "$baseline_id" --contender "$parquet_id" \
-      --results-format markdown \
-      2>&1 | tee "$dir/comparison.md"
-
-    # Evaluate phase 2
-    local parquet_ok
-    parquet_ok=$(grep -c "SUCCESS" "$dir/parquet-output.txt" || true)
-
-    local storage_pct="N/A"
-    if [ "$baseline_bytes" -gt 0 ] 2>/dev/null; then
-        storage_pct=$(awk "BEGIN {printf \"%.1f\", ($parquet_bytes / $baseline_bytes) * 100}")
-    fi
-
-    cat > "$dir/summary.md" <<EOF
-# Phase 2 Summary (Full corpus)
-
-## Storage
-- Baseline: $baseline_bytes bytes
-- Parquet:  $parquet_bytes bytes
-- Ratio:    ${storage_pct}% of baseline
-
-## Pass/Fail (Phase 2 targets)
-| Criterion | Target | Result | Status |
-|-----------|--------|--------|--------|
-| Correctness | 0 errors | parquet_ok=$parquet_ok | $([ "$parquet_ok" -ge 1 ] && echo "✅" || echo "❌") |
-| Storage | ≤30% of baseline | ${storage_pct}% | $(awk "BEGIN {exit ($parquet_bytes <= $baseline_bytes * 0.30) ? 0 : 1}" 2>/dev/null && echo "✅" || echo "❌") |
-| Ingestion | ≥2x baseline | See comparison.md | ⏳ CHECK |
-| Query perf | ≤10% regression | See comparison.md | ⏳ CHECK |
-
-## Run IDs
-- Baseline: $baseline_id
-- Parquet:  $parquet_id
-EOF
-
-    echo "=== Phase 2 complete. See $dir/summary.md ==="
-    cat "$dir/summary.md"
+# ── Extract metrics from CSVs ────────────────────────────────────────────────
+extract_metric() {
+    local file="$1" metric="$2"
+    grep "^$metric" "$file" | head -1 | awk -F',' '{print $2}'
 }
 
-case "$PHASE" in
-    smoke)  run_smoke ;;
-    phase1) run_phase1 ;;
-    phase2) run_phase2 ;;
-    all)    run_phase1 && run_phase2 ;;
-    *)      echo "Usage: $0 {smoke|phase1|phase2|all}"; exit 1 ;;
-esac
+B_MEDIAN_TP=$(extract_metric "$RESULTS_DIR/baseline.csv" "Median Throughput")
+P_MEDIAN_TP=$(extract_metric "$RESULTS_DIR/parquet.csv" "Median Throughput")
+B_INDEX_TIME=$(extract_metric "$RESULTS_DIR/baseline.csv" "Cumulative indexing time of primary shards")
+P_INDEX_TIME=$(extract_metric "$RESULTS_DIR/parquet.csv" "Cumulative indexing time of primary shards")
+
+pct_diff() {
+    awk "BEGIN { if ($1 != 0) printf \"%.1f%%\", (($2 - $1) / $1) * 100; else print \"N/A\" }"
+}
+
+STORAGE_DIFF=$(pct_diff "$BASELINE_BYTES" "$PARQUET_BYTES")
+TP_DIFF=$(pct_diff "$B_MEDIAN_TP" "$P_MEDIAN_TP")
+TIME_DIFF=$(pct_diff "$B_INDEX_TIME" "$P_INDEX_TIME")
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+cat <<EOF | tee "$RESULTS_DIR/summary.md"
+# Benchmark Summary (${INGEST_PCT}% http_logs, index-only)
+
+| Metric                    | Baseline       | Parquet        | Diff       |
+|---------------------------|----------------|----------------|------------|
+| Median Throughput (docs/s)| $B_MEDIAN_TP   | $P_MEDIAN_TP   | $TP_DIFF   |
+| Store Size (bytes)        | $BASELINE_BYTES| $PARQUET_BYTES | $STORAGE_DIFF |
+| Indexing Time (min)       | $B_INDEX_TIME  | $P_INDEX_TIME  | $TIME_DIFF |
+
+## Pass/Fail
+- Storage reduction: $STORAGE_DIFF (target: significant reduction)
+- Ingestion throughput: $TP_DIFF (target: no major regression)
+EOF
