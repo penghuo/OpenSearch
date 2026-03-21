@@ -42,7 +42,7 @@ import org.apache.lucene.analysis.shingle.FixedShingleFilter;
 import org.apache.lucene.analysis.tokenattributes.BytesTermAttribute;
 import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
 import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
-import org.apache.lucene.document.BinaryDocValuesField;
+import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.IndexOptions;
@@ -1065,7 +1065,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             }
         }
         if (context.indexSettings().isParquetDocValuesEnabled()) {
-            context.doc().add(new BinaryDocValuesField(fieldType().name(), new BytesRef(value)));
+            context.doc().add(new SortedSetDocValuesField(fieldType().name(), new BytesRef(value)));
         }
     }
 
@@ -1259,7 +1259,15 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         if (parquetEnabled) {
             return new DerivedFieldGenerator(
                 mappedFieldType,
-                new BinaryDocValuesFetcher(mappedFieldType, simpleName()),
+                new SortedSetDocValuesFetcher(mappedFieldType, simpleName()) {
+                    @Override
+                    public Object convert(Object value) {
+                        if (value instanceof BytesRef) {
+                            return ((BytesRef) value).utf8ToString();
+                        }
+                        return value;
+                    }
+                },
                 new StoredFieldFetcher(mappedFieldType, simpleName())
             ) {
                 @Override
