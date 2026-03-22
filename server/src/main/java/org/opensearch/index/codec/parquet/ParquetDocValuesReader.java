@@ -1551,12 +1551,153 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
     @Override
     public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
-        // Return null because the parquet format does not write skip index data.
-        // A single-level skipper with global min/max misleads Lucene's cost estimation,
-        // causing IndexOrDocValuesQuery to choose the doc_values full-scan path
-        // instead of the fast point index path — resulting in catastrophic regressions
-        // for range queries (1400-10000% slower).
-        return null;
+        // Range query regressions are prevented upstream: DateFieldMapper and NumberFieldMapper
+        // disable the doc_values query path when parquet is enabled, so this skipper is only
+        // used by Lucene's competitive iterator optimization for sort/scroll queries.
+        FieldMeta meta = fields.get(field.name);
+        if (meta == null) return null;
+
+        String dvType = meta.dvTypeName;
+        int blockSize = 128;
+        int[] docIds;
+        long[] blockMin, blockMax;
+        int[] blockMinDocId, blockMaxDocId, blockDocCount;
+        long globalMin = Long.MAX_VALUE, globalMax = Long.MIN_VALUE;
+        int globalDocCount;
+
+        if (dvType.equals("NUMERIC")) {
+            CachedNumeric cached = computeNumericCache(field.name, meta);
+            if (cached.docIds.length == 0) return null;
+            docIds = cached.docIds;
+            globalDocCount = docIds.length;
+            int numBlocks = (docIds.length + blockSize - 1) / blockSize;
+            blockMin = new long[numBlocks];
+            blockMax = new long[numBlocks];
+            blockMinDocId = new int[numBlocks];
+            blockMaxDocId = new int[numBlocks];
+            blockDocCount = new int[numBlocks];
+            for (int b = 0; b < numBlocks; b++) {
+                int start = b * blockSize;
+                int end = Math.min(start + blockSize, docIds.length);
+                long bMin = Long.MAX_VALUE, bMax = Long.MIN_VALUE;
+                for (int i = start; i < end; i++) {
+                    bMin = Math.min(bMin, cached.values[i]);
+                    bMax = Math.max(bMax, cached.values[i]);
+                }
+                blockMin[b] = bMin;
+                blockMax[b] = bMax;
+                blockMinDocId[b] = cached.isDense ? start : docIds[start];
+                blockMaxDocId[b] = cached.isDense ? (end - 1) : docIds[end - 1];
+                blockDocCount[b] = end - start;
+                globalMin = Math.min(globalMin, bMin);
+                globalMax = Math.max(globalMax, bMax);
+            }
+        } else if (dvType.equals("SORTED_NUMERIC")) {
+            CachedSortedNumeric cached = sortedNumericCache.computeIfAbsent(field.name, k -> {
+                try {
+                    return loadSortedNumeric(meta);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+            if (cached.docIds.length == 0) return null;
+            docIds = cached.docIds;
+            globalDocCount = docIds.length;
+            int numBlocks = (docIds.length + blockSize - 1) / blockSize;
+            blockMin = new long[numBlocks];
+            blockMax = new long[numBlocks];
+            blockMinDocId = new int[numBlocks];
+            blockMaxDocId = new int[numBlocks];
+            blockDocCount = new int[numBlocks];
+            for (int b = 0; b < numBlocks; b++) {
+                int start = b * blockSize;
+                int end = Math.min(start + blockSize, docIds.length);
+                long bMin = Long.MAX_VALUE, bMax = Long.MIN_VALUE;
+                for (int i = start; i < end; i++) {
+                    for (long v : cached.allValues[i]) {
+                        bMin = Math.min(bMin, v);
+                        bMax = Math.max(bMax, v);
+                    }
+                }
+                blockMin[b] = bMin;
+                blockMax[b] = bMax;
+                blockMinDocId[b] = cached.isDense ? start : docIds[start];
+                blockMaxDocId[b] = cached.isDense ? (end - 1) : docIds[end - 1];
+                blockDocCount[b] = end - start;
+                globalMin = Math.min(globalMin, bMin);
+                globalMax = Math.max(globalMax, bMax);
+            }
+        } else {
+            return null;
+        }
+
+        final long gMin = globalMin, gMax = globalMax;
+        final int gDocCount = globalDocCount;
+        final int firstDocId = docIds[0];
+        final int lastDocId = docIds[docIds.length - 1];
+
+        return new DocValuesSkipper() {
+            private int currentBlock = -1;
+            private final int numBlocks = blockMin.length;
+
+            @Override
+            public void advance(int target) {
+                currentBlock++;
+                while (currentBlock < numBlocks && blockMaxDocId[currentBlock] < target) {
+                    currentBlock++;
+                }
+            }
+
+            @Override
+            public int numLevels() {
+                return 2;
+            }
+
+            @Override
+            public int minDocID(int level) {
+                if (level > 0) return firstDocId;
+                return currentBlock < numBlocks ? blockMinDocId[currentBlock] : Integer.MAX_VALUE;
+            }
+
+            @Override
+            public int maxDocID(int level) {
+                if (level > 0) return lastDocId;
+                return currentBlock < numBlocks ? blockMaxDocId[currentBlock] : Integer.MAX_VALUE;
+            }
+
+            @Override
+            public long minValue(int level) {
+                if (level > 0) return gMin;
+                return currentBlock < numBlocks ? blockMin[currentBlock] : 0;
+            }
+
+            @Override
+            public long maxValue(int level) {
+                if (level > 0) return gMax;
+                return currentBlock < numBlocks ? blockMax[currentBlock] : 0;
+            }
+
+            @Override
+            public int docCount(int level) {
+                if (level > 0) return gDocCount;
+                return currentBlock < numBlocks ? blockDocCount[currentBlock] : 0;
+            }
+
+            @Override
+            public long minValue() {
+                return gMin;
+            }
+
+            @Override
+            public long maxValue() {
+                return gMax;
+            }
+
+            @Override
+            public int docCount() {
+                return gDocCount;
+            }
+        };
     }
 
     @Override

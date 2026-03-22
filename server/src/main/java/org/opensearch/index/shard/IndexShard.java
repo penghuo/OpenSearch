@@ -527,7 +527,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             cachingPolicy = new IndicesQueryCache.OpenseachUsageTrackingQueryCachingPolicy(clusterApplierService.clusterSettings());
         }
         indexShardOperationPermits = new IndexShardOperationPermits(shardId, threadPool);
-        if (indexSettings.isDerivedSourceEnabled() || indexSettings.isParquetDocValuesEnabled()) {
+        if (indexSettings.isDerivedSourceEnabled()) {
             readerWrapper = reader -> {
                 final DirectoryReader wrappedReader = indexReaderWrapper == null ? reader : indexReaderWrapper.apply(reader);
                 return DerivedSourceDirectoryReader.wrap(
