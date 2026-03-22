@@ -127,11 +127,30 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final int[] docIds;
         final long[][] allValues;
         final boolean isDense;
+        /** Non-null when every document has exactly one value (singleton optimization). */
+        final long[] singletonValues;
 
         CachedSortedNumeric(int[] docIds, long[][] allValues, boolean isDense) {
             this.docIds = docIds;
             this.allValues = allValues;
             this.isDense = isDense;
+            // Detect singleton: all docs have exactly 1 value
+            boolean singleton = true;
+            for (long[] vals : allValues) {
+                if (vals.length != 1) {
+                    singleton = false;
+                    break;
+                }
+            }
+            if (singleton && allValues.length > 0) {
+                long[] flat = new long[allValues.length];
+                for (int i = 0; i < allValues.length; i++) {
+                    flat[i] = allValues[i][0];
+                }
+                this.singletonValues = flat;
+            } else {
+                this.singletonValues = null;
+            }
         }
     }
 
@@ -1012,6 +1031,153 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
         if (docIds.length == 0) {
             return DocValues.emptySortedNumeric();
+        }
+
+        // Singleton optimization: if every document has exactly one value,
+        // use a flat array for faster value access. The SortedNumericDocValues
+        // still reports docValueCount()=1 and nextValue() uses 1D array access
+        // instead of 2D array access (allValues[doc][0] → singleValues[doc]).
+        if (cached.singletonValues != null) {
+            final long[] singleValues = cached.singletonValues;
+
+            if (cached.isDense) {
+                final int maxDoc = docIds.length;
+                return new SortedNumericDocValues() {
+                    private int doc = -1;
+
+                    @Override
+                    public long nextValue() {
+                        return singleValues[doc];
+                    }
+
+                    @Override
+                    public int docValueCount() {
+                        return 1;
+                    }
+
+                    @Override
+                    public boolean advanceExact(int target) {
+                        doc = target;
+                        return target < maxDoc;
+                    }
+
+                    @Override
+                    public int docID() {
+                        return doc;
+                    }
+
+                    @Override
+                    public int nextDoc() {
+                        doc++;
+                        if (doc >= maxDoc) {
+                            doc = NO_MORE_DOCS;
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public int advance(int target) {
+                        doc = target;
+                        if (doc >= maxDoc) {
+                            doc = NO_MORE_DOCS;
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public long cost() {
+                        return maxDoc;
+                    }
+                };
+            }
+
+            return new SortedNumericDocValues() {
+                private int idx = -1;
+                private int doc = -1;
+
+                @Override
+                public long nextValue() {
+                    return singleValues[idx];
+                }
+
+                @Override
+                public int docValueCount() {
+                    return 1;
+                }
+
+                @Override
+                public boolean advanceExact(int target) {
+                    doc = target;
+                    int start = 0;
+                    if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
+                        start = idx;
+                        int i = linearScanForward(docIds, start, target);
+                        if (i >= 0) {
+                            if (docIds[i] == target) {
+                                idx = i;
+                                return true;
+                            }
+                            idx = i - 1;
+                            return false;
+                        }
+                        start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                    }
+                    int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                    if (found >= 0) {
+                        idx = found;
+                        return true;
+                    }
+                    idx = -found - 2;
+                    return false;
+                }
+
+                @Override
+                public int docID() {
+                    return doc;
+                }
+
+                @Override
+                public int nextDoc() {
+                    idx++;
+                    if (idx >= docIds.length) {
+                        doc = NO_MORE_DOCS;
+                    } else {
+                        doc = docIds[idx];
+                    }
+                    return doc;
+                }
+
+                @Override
+                public int advance(int target) {
+                    int start = Math.max(idx + 1, 0);
+                    if (start < docIds.length && docIds[start] <= target) {
+                        int i = linearScanForward(docIds, start, target);
+                        if (i >= 0) {
+                            idx = i;
+                            doc = docIds[idx];
+                            return doc;
+                        }
+                        start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                    }
+                    int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                    if (found >= 0) {
+                        idx = found;
+                    } else {
+                        idx = -found - 1;
+                    }
+                    if (idx >= docIds.length) {
+                        doc = NO_MORE_DOCS;
+                    } else {
+                        doc = docIds[idx];
+                    }
+                    return doc;
+                }
+
+                @Override
+                public long cost() {
+                    return docIds.length;
+                }
+            };
         }
 
         if (cached.isDense) {
