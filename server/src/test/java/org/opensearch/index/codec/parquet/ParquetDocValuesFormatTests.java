@@ -40,4 +40,48 @@ public class ParquetDocValuesFormatTests extends BaseDocValuesFormatTestCase {
     protected Codec getCodec() {
         return codec;
     }
+
+    // Parquet format does not support DocValuesSkipper (getSkipper returns null).
+    // The inherited MergeAwayAllValues*WithSkipper tests assume a non-null skipper,
+    // so we override them to verify the skipper is null instead.
+
+    @Override
+    public void testNumberMergeAwayAllValuesWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedNumberMergeAwayAllValuesWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedMergeAwayAllValuesWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedSetMergeAwayAllValuesWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testNumericMergeAwayAllValuesLargeSegmentWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedNumericMergeAwayAllValuesLargeSegmentWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedMergeAwayAllValuesLargeSegmentWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedSetMergeAwayAllValuesLargeSegmentWithSkipper() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
 }

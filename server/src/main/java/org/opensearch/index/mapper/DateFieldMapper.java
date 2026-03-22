@@ -530,7 +530,12 @@ public final class DateFieldMapper extends ParametrizedFieldMapper {
                 context,
                 resolution,
                 (l, u, nowUsed) -> {
-                    Query dvQuery = hasDocValues() ? SortedNumericDocValuesField.newSlowRangeQuery(name(), l, u) : null;
+                    // When parquet doc_values are enabled and the field is indexed, skip the
+                    // doc_values query path. Parquet doc_values lack skip data, making the
+                    // doc_values path in IndexOrDocValuesQuery much slower than the point index path.
+                    boolean effectiveHasDocValues = hasDocValues()
+                        && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
+                    Query dvQuery = effectiveHasDocValues ? SortedNumericDocValuesField.newSlowRangeQuery(name(), l, u) : null;
 
                     // Not searchable. Must have doc values.
                     if (!isSearchable()) {
