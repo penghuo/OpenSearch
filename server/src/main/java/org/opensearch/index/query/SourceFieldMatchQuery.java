@@ -56,7 +56,7 @@ public class SourceFieldMatchQuery extends Query {
         this.fieldType = fieldType;
         this.context = context;
         this.lookup = context.lookup();
-        if (!context.documentMapper("").sourceMapper().enabled()) {
+        if (!context.documentMapper("").sourceMapper().enabled() && !context.getIndexSettings().isParquetDocValuesEnabled()) {
             throw new IllegalArgumentException(
                 "SourceFieldMatchQuery error: unable to fetch fields from _source field: _source is disabled in the mappings "
                     + "for index ["

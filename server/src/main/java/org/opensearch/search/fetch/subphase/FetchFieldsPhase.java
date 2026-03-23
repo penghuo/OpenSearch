@@ -63,7 +63,8 @@ public final class FetchFieldsPhase implements FetchSubPhase {
         }
 
         SearchLookup searchLookup = fetchContext.searchLookup();
-        if (fetchContext.mapperService().documentMapper().sourceMapper().enabled() == false) {
+        if (fetchContext.mapperService().documentMapper().sourceMapper().enabled() == false
+            && fetchContext.getIndexSettings().isParquetDocValuesEnabled() == false) {
             throw new IllegalArgumentException(
                 "Unable to retrieve the requested [fields] since _source is disabled "
                     + "in the mappings for index ["

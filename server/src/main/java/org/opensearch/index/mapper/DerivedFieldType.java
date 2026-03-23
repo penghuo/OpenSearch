@@ -497,7 +497,7 @@ public class DerivedFieldType extends MappedFieldType implements GeoShapeQueryab
         QueryShardContext context,
         SearchLookup searchLookup
     ) {
-        if (!context.documentMapper("").sourceMapper().enabled()) {
+        if (!context.documentMapper("").sourceMapper().enabled() && !context.getIndexSettings().isParquetDocValuesEnabled()) {
             throw new IllegalArgumentException(
                 "DerivedFieldQuery error: unable to fetch fields from _source field: _source is disabled in the mappings "
                     + "for index ["
