@@ -123,14 +123,11 @@
         index: [ test ]
 
   - do:
-      catch: bad_request
       search:
         index: test
         body:
           fields: [keyword]
-  - match: { error.root_cause.0.type: "illegal_argument_exception" }
-  - match: { error.root_cause.0.reason: "Unable to retrieve the requested [fields] since _source is disabled
-        in the mappings for index [test]" }
+  - match: { hits.hits.0.fields.keyword.0: a }
 
 ---
 "Test ignore malformed":
