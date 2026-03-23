@@ -5,12 +5,18 @@ setup:
           body:
             settings:
               index.codec.doc_values.format: parquet
+            mappings:
+              _source:
+                enabled: false
   - do:
       indices.create:
           index:  test_1
           body:
             settings:
               index.codec.doc_values.format: parquet
+            mappings:
+              _source:
+                enabled: false
   - do:
       index:
           index:  test_1

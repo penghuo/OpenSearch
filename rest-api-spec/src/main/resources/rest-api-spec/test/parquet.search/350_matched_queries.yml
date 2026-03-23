@@ -11,6 +11,9 @@ setup:
         body:
           settings:
             index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
 
   - do:
       bulk:
@@ -63,6 +66,9 @@ setup:
         body:
           settings:
             index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
 
   - do:
       bulk:
@@ -121,6 +127,9 @@ setup:
         body:
           settings:
             index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
 
   - do:
       bulk:
@@ -172,6 +181,9 @@ setup:
         body:
           settings:
             index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
 
   - do:
       bulk:

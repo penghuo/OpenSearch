@@ -7,6 +7,8 @@ setup:
               index.codec.doc_values.format: parquet
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 number:
                   type: integer
@@ -209,6 +211,8 @@ setup:
               # test has 4 docs and 5 shards makes sure we get one empty.
               number_of_shards: 5
             mappings:
+              _source:
+                enabled: false
               properties:
                 date:
                   type: date
@@ -285,6 +289,8 @@ setup:
               # test has 4 docs and 5 shards makes sure we get one empty.
               number_of_shards: 5
             mappings:
+              _source:
+                enabled: false
               properties:
                 date:
                   type : date
@@ -338,6 +344,8 @@ setup:
               # test has 4 docs and 5 shards makes sure we get one empty.
               number_of_shards: 5
             mappings:
+              _source:
+                enabled: false
               properties:
                 range:
                   type : date_range
@@ -389,6 +397,8 @@ setup:
               # test has 4 docs and 5 shards makes sure we get one empty.
               number_of_shards: 5
             mappings:
+              _source:
+                enabled: false
               properties:
                 range:
                   type : date_range
@@ -498,6 +508,8 @@ setup:
               number_of_replicas: 0
               number_of_shards: 1
             mappings:
+              _source:
+                enabled: false
               properties:
                 n:
                   type: long
@@ -555,6 +567,8 @@ setup:
               number_of_replicas: 0
               number_of_shards: 1
             mappings:
+              _source:
+                enabled: false
               properties:
                 date:
                   type: date
@@ -601,6 +615,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               range:
                 type: long_range
@@ -651,6 +667,8 @@ setup:
             number_of_shards: 1
             refresh_interval: -1
           mappings:
+            _source:
+              enabled: false
             properties:
               date:
                 type: date

@@ -8,6 +8,8 @@ setup:
               number_of_shards: 5
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 str:
                    type: keyword

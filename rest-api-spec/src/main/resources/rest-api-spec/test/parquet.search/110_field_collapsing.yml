@@ -6,9 +6,11 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
-              properties:
-                numeric_group: { type: integer }
-                tag: { type: keyword }
+            _source:
+              enabled: false
+            properties:
+              numeric_group: { type: integer }
+              tag: { type: keyword }
 
   - do:
       index:
@@ -417,6 +419,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               numeric_group: { type: alias, path: other_numeric_group }
               other_numeric_group: { type: integer }
@@ -512,6 +516,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               sort_field: { type: integer }
               collapse_field: { type: integer }
@@ -562,6 +568,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               sort_field: { type: integer }
               collapse_field: { type: integer }

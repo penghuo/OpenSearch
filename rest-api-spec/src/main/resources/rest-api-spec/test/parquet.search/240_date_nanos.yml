@@ -8,6 +8,8 @@ setup:
               number_of_shards: 3
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 date:
                   type: date_nanos
@@ -23,6 +25,8 @@ setup:
               number_of_shards: 3
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 date:
                   type: date
@@ -188,6 +192,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               nested_field:
                 type: nested

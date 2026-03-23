@@ -8,6 +8,8 @@ setup:
               number_of_shards: 1
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 str:
                    type: keyword
@@ -32,6 +34,8 @@ setup:
               index.codec.doc_values.format: parquet
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 number:
                   type: double
@@ -808,6 +812,8 @@ setup:
               index.codec.doc_values.format: parquet
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 number:
                   type: unsigned_long
@@ -1092,6 +1098,8 @@ setup:
               number_of_shards: 1
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 str:
                    type: keyword

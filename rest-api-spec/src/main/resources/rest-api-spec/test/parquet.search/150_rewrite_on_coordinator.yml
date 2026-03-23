@@ -9,6 +9,8 @@
               index.codec.doc_values.format: parquet
               number_of_shards: 5
             mappings:
+              _source:
+                enabled: false
               properties:
                 user:
                    type: keyword
@@ -49,6 +51,8 @@
               index.codec.doc_values.format: parquet
               number_of_shards: 1
             mappings:
+              _source:
+                enabled: false
               properties:
                 followers:
                    type: keyword

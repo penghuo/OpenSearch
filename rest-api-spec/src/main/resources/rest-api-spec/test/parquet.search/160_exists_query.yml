@@ -9,6 +9,8 @@ setup:
             settings:
               index.codec.doc_values.format: parquet
             mappings:
+              _source:
+                enabled: false
               dynamic: false
               properties:
                 binary:
@@ -135,6 +137,8 @@ setup:
             settings:
               index.codec.doc_values.format: parquet
             mappings:
+              _source:
+                enabled: false
               dynamic: false
               properties:
                 binary:
@@ -276,6 +280,8 @@ setup:
             settings:
               index.codec.doc_values.format: parquet
             mappings:
+              _source:
+                enabled: false
               dynamic: false
               properties:
                 unrelated:
@@ -295,6 +301,8 @@ setup:
             settings:
               index.codec.doc_values.format: parquet
             mappings:
+              _source:
+                enabled: false
               dynamic: false
               properties:
                 binary:

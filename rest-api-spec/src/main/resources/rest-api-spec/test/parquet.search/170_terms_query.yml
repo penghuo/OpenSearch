@@ -9,11 +9,13 @@
                   number_of_shards: 1
                   index.max_terms_count: 2
               mappings:
-                  properties:
-                      user:
-                          type: keyword
-                      followers:
-                          type: keyword
+                _source:
+                  enabled: false
+                properties:
+                    user:
+                        type: keyword
+                    followers:
+                        type: keyword
   - do:
       bulk:
           refresh: true

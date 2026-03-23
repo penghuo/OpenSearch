@@ -11,12 +11,14 @@
                 index.codec.doc_values.format: parquet
                 number_of_shards: "1"
             mappings:
-                properties:
-                    text:
-                        type: match_only_text
-                        fielddata: true
-                    class:
-                        type: keyword
+              _source:
+                enabled: false
+              properties:
+                  text:
+                      type: match_only_text
+                      fielddata: true
+                  class:
+                      type: keyword
 
   - do:
       index:

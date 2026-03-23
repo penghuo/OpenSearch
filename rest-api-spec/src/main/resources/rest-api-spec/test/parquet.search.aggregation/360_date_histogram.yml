@@ -11,6 +11,8 @@ setup:
             # test has 4 docs and 5 shards makes sure we get one empty.
             number_of_shards: 5
           mappings:
+            _source:
+              enabled: false
             properties:
               range:
                 type: date_range
@@ -115,6 +117,8 @@ setup:
             number_of_replicas: 0
             refresh_interval: -1
           mappings:
+            _source:
+              enabled: false
             properties:
               date:
                 type: date

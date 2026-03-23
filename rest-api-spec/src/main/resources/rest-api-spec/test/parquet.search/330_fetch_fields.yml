@@ -7,6 +7,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               keyword:
                 type: keyword
@@ -52,6 +54,8 @@
             index.codec.doc_values.format: parquet
             index.number_of_shards: 1
           mappings:
+            _source:
+              enabled: false
             properties:
               keyword:
                 type: keyword
@@ -138,6 +142,8 @@
             index.codec.doc_values.format: parquet
             number_of_shards: 1
           mappings:
+            _source:
+              enabled: false
             properties:
               keyword:
                 type: keyword
@@ -185,6 +191,8 @@
             index.codec.doc_values.format: parquet
             number_of_shards: 1
           mappings:
+            _source:
+              enabled: false
             properties:
               keyword:
                 type: keyword
@@ -231,6 +239,8 @@
             index.codec.doc_values.format: parquet
             index.number_of_shards: 1
           mappings:
+            _source:
+              enabled: false
             properties:
               date:
                 type: date
@@ -271,6 +281,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               count:
                 type: token_count

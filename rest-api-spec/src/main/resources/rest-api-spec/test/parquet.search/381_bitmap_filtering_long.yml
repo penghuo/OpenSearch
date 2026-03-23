@@ -13,6 +13,8 @@ setup:
             number_of_shards: 1
             number_of_replicas: 0
           mappings:
+            _source:
+              enabled: false
             properties:
               employee_id:
                 type: long
@@ -37,6 +39,8 @@ setup:
             number_of_shards: 1
             number_of_replicas: 0
           mappings:
+            _source:
+              enabled: false
             properties:
               members:
                 type: binary

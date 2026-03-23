@@ -7,6 +7,8 @@ setup:
               index.codec.doc_values.format: parquet
               number_of_replicas: 0
             mappings:
+              _source:
+                enabled: false
               properties:
                 ip:
                    type: ip
@@ -398,6 +400,9 @@ setup:
               index.codec.doc_values.format: parquet
               number_of_shards: 1
               number_of_replicas: 0
+            mappings:
+              _source:
+                enabled: false
   - do:
       search:
         index: test_a_unmapped
@@ -541,6 +546,8 @@ setup:
             number_of_shards: 1
             refresh_interval: -1
           mappings:
+            _source:
+              enabled: false
             properties:
               ip:
                 type: ip
@@ -669,6 +676,15 @@ setup:
       version: " - 2.99.99"
       reason: Backport fix to 2.16
 
+  - do:
+      indices.create:
+        index: range-agg-w-query
+        body:
+          settings:
+            index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
   - do:
       bulk:
         refresh: true

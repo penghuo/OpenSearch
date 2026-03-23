@@ -10,6 +10,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: long
@@ -21,6 +23,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: double
@@ -82,6 +86,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: unsigned_long
@@ -92,6 +98,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: long
@@ -102,6 +110,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: double
@@ -144,6 +154,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: long
@@ -155,6 +167,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: double
@@ -166,6 +180,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               counter:
                 type: half_float

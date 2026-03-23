@@ -5,6 +5,9 @@
           body:
             settings:
               index.codec.doc_values.format: parquet
+            mappings:
+              _source:
+                enabled: false
   - do:
       index:
           index:  test
@@ -105,6 +108,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               timestamp:
                 type: date
@@ -194,6 +199,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               timestamp:
                 type: date_nanos
@@ -261,6 +268,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               population:
                 type: unsigned_long
@@ -337,6 +346,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               population:
                 type: half_float
@@ -474,6 +485,8 @@
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               halffloat:
                 type: half_float

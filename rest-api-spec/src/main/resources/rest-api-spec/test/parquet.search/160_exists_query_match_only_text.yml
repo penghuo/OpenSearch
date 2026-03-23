@@ -11,6 +11,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             dynamic: false
             properties:
               match_only_text:
@@ -57,6 +59,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             dynamic: false
             properties:
               unrelated:
@@ -76,6 +80,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             dynamic: false
             properties:
               match_only_text:

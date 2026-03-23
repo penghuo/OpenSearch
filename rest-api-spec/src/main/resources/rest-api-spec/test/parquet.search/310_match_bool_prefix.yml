@@ -8,6 +8,8 @@ setup:
           settings:
             index.codec.doc_values.format: parquet
           mappings:
+            _source:
+              enabled: false
             properties:
               my_field1:
                 type: text

@@ -9,12 +9,14 @@ setup:
                   number_of_shards: 1
                   index.highlight.max_analyzed_offset: 10
               mappings:
-                  properties:
-                      field1:
-                          type: text
-                      field2:
-                          type: text
-                          index_options: offsets
+                _source:
+                  enabled: false
+                properties:
+                    field1:
+                        type: text
+                    field2:
+                        type: text
+                        index_options: offsets
 
   - do:
       index:

@@ -7,6 +7,8 @@ setup:
             settings:
               index.codec.doc_values.format: parquet
             mappings:
+              _source:
+                enabled: false
               properties:
                 my_date:
                   type: date
@@ -23,6 +25,8 @@ setup:
             index.codec.doc_values.format: parquet
             index.mapping.ignore_malformed: true
           mappings:
+            _source:
+              enabled: false
             properties:
               my_date:
                 type: date

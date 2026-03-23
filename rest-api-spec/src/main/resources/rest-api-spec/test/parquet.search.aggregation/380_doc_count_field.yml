@@ -7,6 +7,8 @@ setup:
             index.codec.doc_values.format: parquet
             number_of_replicas: 0
           mappings:
+            _source:
+              enabled: false
             properties:
               str:
                 type: keyword
@@ -73,6 +75,15 @@ setup:
   - skip:
       version: "1.0.0 - "
       reason: "until this is released and we know exact version"
+  - do:
+      indices.create:
+        index: test_2
+        body:
+          settings:
+            index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
   - do:
       bulk:
         index: test_2

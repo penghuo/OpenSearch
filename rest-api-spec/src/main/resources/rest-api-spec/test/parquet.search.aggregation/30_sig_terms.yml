@@ -8,12 +8,14 @@
                 index.codec.doc_values.format: parquet
                 number_of_shards: "1"
             mappings:
-                properties:
-                    text:
-                        type: text
-                        fielddata: true
-                    class:
-                        type: keyword
+              _source:
+                enabled: false
+              properties:
+                  text:
+                      type: text
+                      fielddata: true
+                  class:
+                      type: keyword
 
   - do:
       index:
@@ -82,9 +84,11 @@
             settings:
               index.codec.doc_values.format: parquet
             mappings:
-                properties:
-                    ip:
-                        type: ip
+              _source:
+                enabled: false
+              properties:
+                  ip:
+                      type: ip
 
   - do:
       index:

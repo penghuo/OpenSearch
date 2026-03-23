@@ -7,6 +7,9 @@ setup:
               index.codec.doc_values.format: parquet
               index.max_docvalue_fields_search: 2
               index.max_script_fields: 2
+            mappings:
+              _source:
+                enabled: false
 
   - do:
       index:

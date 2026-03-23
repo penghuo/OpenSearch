@@ -13,6 +13,9 @@
           settings:
             index.codec.doc_values.format: parquet
             number_of_replicas: 0
+          mappings:
+            _source:
+              enabled: false
   # Wait for index to be fully ready (avoids race in multi-node clusters)
   - do:
       cluster.health:
@@ -26,6 +29,9 @@
           settings:
             index.codec.doc_values.format: parquet
             number_of_replicas: 0
+          mappings:
+            _source:
+              enabled: false
   - do:
       cluster.health:
         index: main_index

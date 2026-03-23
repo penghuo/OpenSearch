@@ -4,6 +4,15 @@
       version: "- 2.8.99"
       reason: "the fix was introduced in 2.9.0"
   - do:
+      indices.create:
+        index: test
+        body:
+          settings:
+            index.codec.doc_values.format: parquet
+          mappings:
+            _source:
+              enabled: false
+  - do:
       index:
         index: test
         id: 1

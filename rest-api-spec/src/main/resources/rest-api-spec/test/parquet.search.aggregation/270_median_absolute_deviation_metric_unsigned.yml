@@ -11,6 +11,8 @@ setup:
                 index.codec.doc_values.format: parquet
                 number_of_replicas: 0
               mappings:
+                _source:
+                  enabled: false
                 properties:
                   unsigned_field:
                     type: unsigned_long
