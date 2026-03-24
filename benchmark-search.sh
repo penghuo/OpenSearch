@@ -4,16 +4,21 @@ set -euo pipefail
 OS_HOME="/local/home/penghuo/oss/OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
 RESULTS_DIR="benchmark-results"
 INGEST_PCT="${1:-1}"
-MODE="${2:-all}"  # baseline, parquet, or all
+MODE="${2:-all}"      # baseline, parquet, or all
+CLEAN="${3:-no}"      # clean, no (default: no — reuse existing data)
 
 mkdir -p "$RESULTS_DIR"
 chmod 777 "$RESULTS_DIR"
 
 start_opensearch() {
-    echo "=== Cleaning data ==="
-    rm -rf "$OS_HOME/data"
+    if [ "$CLEAN" = "clean" ]; then
+        echo "=== Cleaning data ==="
+        rm -rf "$OS_HOME/data"
+    else
+        echo "=== Reusing existing data (pass 'clean' as 3rd arg to wipe) ==="
+    fi
     echo "=== Starting OpenSearch ==="
-    OPENSEARCH_JAVA_OPTS="-Xms16g -Xmx16g" \
+    OPENSEARCH_JAVA_OPTS="-Xms32g -Xmx32g" \
         "$OS_HOME/bin/opensearch" \
         -Eopensearch.experimental.feature.parquet_doc_values.enabled=true \
         -Ediscovery.type=single-node \
@@ -34,8 +39,16 @@ start_opensearch() {
 
 stop_opensearch() {
     echo "=== Stopping OpenSearch ==="
-    kill "$(cat "$OS_HOME/opensearch.pid" 2>/dev/null)" 2>/dev/null || true
-    sleep 5
+    local pid
+    pid=$(cat "$OS_HOME/opensearch.pid" 2>/dev/null) || return 0
+    kill "$pid" 2>/dev/null || true
+    for i in $(seq 1 60); do
+        kill -0 "$pid" 2>/dev/null || { echo "OpenSearch stopped"; return 0; }
+        sleep 2
+    done
+    echo "WARN: force-killing OpenSearch"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 2
 }
 
 osb_run() {
@@ -64,7 +77,7 @@ cat > "$RESULTS_DIR/baseline-params.json" <<PARAMS
 PARAMS
 
 cat > "$RESULTS_DIR/parquet-params.json" <<PARAMS
-{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "warmup_iterations": 5, "iterations": 20, "index_settings": {"index.codec.doc_values.format": "parquet"}}
+{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "warmup_iterations": 5, "iterations": 20, "source_enabled": false, "index_settings": {"index.codec.doc_values.format": "parquet"}}
 PARAMS
 
 # ── Run selected mode(s) ────────────────────────────────────────────────────

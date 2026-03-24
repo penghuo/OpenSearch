@@ -4,15 +4,21 @@ set -euo pipefail
 OS_HOME="/local/home/penghuo/oss/OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
 RESULTS_DIR="benchmark-results"
 INGEST_PCT="${1:-1}"
+MODE="${2:-all}"      # baseline, parquet, or all
+CLEAN="${3:-no}"      # clean, no (default: no — reuse existing data)
 
 mkdir -p "$RESULTS_DIR"
 chmod 777 "$RESULTS_DIR"
 
 start_opensearch() {
-    echo "=== Cleaning data ==="
-    rm -rf "$OS_HOME/data"
+    if [ "$CLEAN" = "clean" ]; then
+        echo "=== Cleaning data ==="
+        rm -rf "$OS_HOME/data"
+    else
+        echo "=== Reusing existing data (pass 'clean' as 3rd arg to wipe) ==="
+    fi
     echo "=== Starting OpenSearch ==="
-    OPENSEARCH_JAVA_OPTS="-Xms16g -Xmx16g" \
+    OPENSEARCH_JAVA_OPTS="-Xms32g -Xmx32g" \
         "$OS_HOME/bin/opensearch" \
         -Eopensearch.experimental.feature.parquet_doc_values.enabled=true \
         -Ediscovery.type=single-node \
@@ -33,8 +39,16 @@ start_opensearch() {
 
 stop_opensearch() {
     echo "=== Stopping OpenSearch ==="
-    kill "$(cat "$OS_HOME/opensearch.pid" 2>/dev/null)" 2>/dev/null || true
-    sleep 5
+    local pid
+    pid=$(cat "$OS_HOME/opensearch.pid" 2>/dev/null) || return 0
+    kill "$pid" 2>/dev/null || true
+    for i in $(seq 1 60); do
+        kill -0 "$pid" 2>/dev/null || { echo "OpenSearch stopped"; return 0; }
+        sleep 2
+    done
+    echo "WARN: force-killing OpenSearch"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 2
 }
 
 capture_storage() {
@@ -63,31 +77,34 @@ osb_run() {
         2>&1 | tee "$RESULTS_DIR/${tag}-output.txt"
 }
 
-# ── Clean old results ────────────────────────────────────────────────────────
-rm -f "$RESULTS_DIR/baseline.csv" "$RESULTS_DIR/parquet.csv" "$RESULTS_DIR/summary.md"
-
 # ── Write param files ────────────────────────────────────────────────────────
 cat > "$RESULTS_DIR/baseline-params.json" <<PARAMS
 {"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}}
 PARAMS
 
 cat > "$RESULTS_DIR/parquet-params.json" <<PARAMS
-{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "index_settings": {"index.codec.doc_values.format": "parquet"}}
+{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "source_enabled": false, "index_settings": {"index.codec.doc_values.format": "parquet"}}
 PARAMS
 
 # ── Baseline ─────────────────────────────────────────────────────────────────
-start_opensearch
-echo "=== Baseline run (${INGEST_PCT}% corpus) ==="
-osb_run "baseline" "$RESULTS_DIR/baseline-params.json" "baseline.csv"
-capture_storage "baseline"
-stop_opensearch
+if [ "$MODE" = "baseline" ] || [ "$MODE" = "all" ]; then
+    rm -f "$RESULTS_DIR/baseline.csv"
+    start_opensearch
+    echo "=== Baseline run (${INGEST_PCT}% corpus) ==="
+    osb_run "baseline" "$RESULTS_DIR/baseline-params.json" "baseline.csv"
+    capture_storage "baseline"
+    stop_opensearch
+fi
 
 # ── Parquet ──────────────────────────────────────────────────────────────────
-start_opensearch
-echo "=== Parquet run (${INGEST_PCT}% corpus) ==="
-osb_run "parquet" "$RESULTS_DIR/parquet-params.json" "parquet.csv"
-capture_storage "parquet"
-stop_opensearch
+if [ "$MODE" = "parquet" ] || [ "$MODE" = "all" ]; then
+    rm -f "$RESULTS_DIR/parquet.csv"
+    start_opensearch
+    echo "=== Parquet run (${INGEST_PCT}% corpus) ==="
+    osb_run "parquet" "$RESULTS_DIR/parquet-params.json" "parquet.csv"
+    capture_storage "parquet"
+    stop_opensearch
+fi
 
 # ── Extract metrics from CSVs ────────────────────────────────────────────────
 extract_metric() {
@@ -95,6 +112,7 @@ extract_metric() {
     grep "^${metric}," "$file" | head -1 | awk -F',' '{print $3}'
 }
 
+if [ -f "$RESULTS_DIR/baseline.csv" ] && [ -f "$RESULTS_DIR/parquet.csv" ]; then
 B_STORE_GB=$(extract_metric "$RESULTS_DIR/baseline.csv" "Store size")
 P_STORE_GB=$(extract_metric "$RESULTS_DIR/parquet.csv" "Store size")
 B_INDEX_TIME=$(extract_metric "$RESULTS_DIR/baseline.csv" "Cumulative indexing time of primary shards")
@@ -122,3 +140,6 @@ Note: Median Throughput not available (1% corpus completes during OSB warmup pha
 - Storage reduction: $STORAGE_DIFF (target: significant reduction)
 - Indexing time: $TIME_DIFF (target: no major regression)
 EOF
+else
+    echo "=== Summary skipped (need both baseline and parquet CSVs) ==="
+fi
