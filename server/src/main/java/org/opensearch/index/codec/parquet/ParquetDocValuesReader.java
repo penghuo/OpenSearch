@@ -1143,27 +1143,19 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         }
         ColumnReader reader = fieldData.reader;
         BytesRef[] rawValues = new BytesRef[docIds.length];
+        java.util.TreeSet<BytesRef> uniqueValues = new java.util.TreeSet<>();
         for (int i = 0; i < docIds.length; i++) {
             rawValues[i] = new BytesRef(reader.getBinary().getBytes().clone());
+            uniqueValues.add(rawValues[i]);
             reader.consume();
         }
-        Map<BytesRef, Integer> valueToOrd = new HashMap<>();
-        List<BytesRef> sortedDict = new ArrayList<>();
-        for (BytesRef val : rawValues) {
-            if (valueToOrd.containsKey(val) == false) {
-                valueToOrd.put(val, sortedDict.size());
-                sortedDict.add(val);
-            }
-        }
-        sortedDict.sort(BytesRef::compareTo);
-        for (int i = 0; i < sortedDict.size(); i++) {
-            valueToOrd.put(sortedDict.get(i), i);
-        }
+        // Build sorted dictionary from TreeSet (already sorted, no HashMap)
+        BytesRef[] dict = uniqueValues.toArray(new BytesRef[0]);
+        // Assign ordinals via binary search
         int[] ords = new int[docIds.length];
         for (int i = 0; i < docIds.length; i++) {
-            ords[i] = valueToOrd.get(rawValues[i]);
+            ords[i] = java.util.Arrays.binarySearch(dict, rawValues[i]);
         }
-        BytesRef[] dict = sortedDict.toArray(new BytesRef[0]);
         return new CachedSorted(docIds, ords, dict, fieldData.isDense);
     }
 
@@ -1775,44 +1767,40 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         }
         ColumnReader reader = fieldData.reader;
         int totalValues = (int) reader.getTotalValueCount();
-        List<List<BytesRef>> docBytesRefs = new ArrayList<>();
+
+        // Read all values per doc, collecting unique values in a TreeSet (sorted, no HashMap)
+        java.util.TreeSet<BytesRef> uniqueValues = new java.util.TreeSet<>();
+        List<BytesRef[]> docRawValues = new ArrayList<>();
         List<BytesRef> currentDoc = new ArrayList<>();
         for (int i = 0; i < totalValues; i++) {
             int rep = reader.getCurrentRepetitionLevel();
             int def = reader.getCurrentDefinitionLevel();
             if (rep == 0 && i > 0) {
-                docBytesRefs.add(new ArrayList<>(currentDoc));
+                BytesRef[] arr = currentDoc.toArray(new BytesRef[0]);
+                docRawValues.add(arr);
                 currentDoc.clear();
             }
             if (def == 1) {
-                currentDoc.add(new BytesRef(reader.getBinary().getBytes().clone()));
+                BytesRef val = new BytesRef(reader.getBinary().getBytes().clone());
+                currentDoc.add(val);
+                uniqueValues.add(val);
             }
             reader.consume();
         }
         if (totalValues > 0) {
-            docBytesRefs.add(new ArrayList<>(currentDoc));
+            docRawValues.add(currentDoc.toArray(new BytesRef[0]));
         }
-        Map<BytesRef, Integer> valueToOrd = new HashMap<>();
-        List<BytesRef> sortedDict = new ArrayList<>();
-        for (List<BytesRef> docVals : docBytesRefs) {
-            for (BytesRef val : docVals) {
-                if (valueToOrd.containsKey(val) == false) {
-                    valueToOrd.put(val, sortedDict.size());
-                    sortedDict.add(val);
-                }
-            }
-        }
-        sortedDict.sort(BytesRef::compareTo);
-        for (int i = 0; i < sortedDict.size(); i++) {
-            valueToOrd.put(sortedDict.get(i), i);
-        }
-        BytesRef[] dict = sortedDict.toArray(new BytesRef[0]);
-        long[][] docOrds = new long[docBytesRefs.size()][];
-        for (int d = 0; d < docBytesRefs.size(); d++) {
-            List<BytesRef> vals = docBytesRefs.get(d);
-            long[] ordArr = new long[vals.size()];
-            for (int v = 0; v < vals.size(); v++) {
-                ordArr[v] = valueToOrd.get(vals.get(v));
+
+        // Build sorted dictionary from TreeSet (already sorted)
+        BytesRef[] dict = uniqueValues.toArray(new BytesRef[0]);
+
+        // Assign ordinals via binary search (no HashMap needed)
+        long[][] docOrds = new long[docRawValues.size()][];
+        for (int d = 0; d < docRawValues.size(); d++) {
+            BytesRef[] vals = docRawValues.get(d);
+            long[] ordArr = new long[vals.length];
+            for (int v = 0; v < vals.length; v++) {
+                ordArr[v] = java.util.Arrays.binarySearch(dict, vals[v]);
             }
             java.util.Arrays.sort(ordArr);
             docOrds[d] = ordArr;
