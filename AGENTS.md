@@ -4,18 +4,47 @@
 
 - NEVER delete, remove, or modify tests without explicit user approval. If tests fail, propose the fix and wait for confirmation before changing any test file.
 
-## Benchmark Rules
+## Long-Running Task Rules
 
-- NEVER run benchmark-search.sh synchronously — always background and poll.
-- Launch in subshell so shell returns immediately:
-  ```
-  (./benchmark-search.sh ... > output.txt 2>&1 &)
-  echo "launched"
-  ```
-- Poll every 5-10s: `sleep 5; tail -1 output.txt | strings | tail -1`
-- Analyze each poll result. If ERROR/FAILURE, stop benchmark and diagnose immediately.
-- Never launch a benchmark and then do something else — monitoring IS the task until it completes.
-- NEVER run commands that take >5 minutes synchronously — background them and poll
+Any command that may take longer than 2 minutes MUST be run asynchronously. This includes: benchmarks, builds (`localDistro`), compilation, integration tests (`internalClusterTest`, `yamlRestTest`, `yamlRestTestParquet`), and `check`/`precommit`.
+
+### Async Execution Pattern
+
+1. **NEVER run long-running commands synchronously** — always background and poll.
+2. **Launch in background** so the shell returns immediately:
+   ```bash
+   nohup <command> > /tmp/<task>-output.txt 2>&1 &
+   echo "PID: $!"
+   ```
+3. **Poll for completion** — check if the process is still running and inspect output:
+   ```bash
+   # Check if still running
+   kill -0 <PID> 2>/dev/null && echo "RUNNING" || echo "DONE"
+   # Inspect tail of output
+   tail -5 /tmp/<task>-output.txt
+   ```
+4. **Poll interval**: every 10-30s for benchmarks, every 30-60s for builds/tests.
+5. **Analyze each poll result** — if ERROR/FAILURE appears in output, stop and diagnose immediately.
+6. **Monitoring IS the task** — never launch a long-running command and then do something else.
+
+### Common Long-Running Commands
+
+| Command | Est. Time | Output File |
+|---|---|---|
+| `./gradlew localDistro -x test -x internalClusterTest` | 3-10 min | `/tmp/build-output.txt` |
+| `./gradlew :rest-api-spec:yamlRestTestParquet` | 5-15 min | `/tmp/yamlrest-output.txt` |
+| `./gradlew :server:internalClusterTest` | 10-30 min | `/tmp/ict-output.txt` |
+| `./gradlew check` | 15-45 min | `/tmp/check-output.txt` |
+| `./gradlew precommit` | 5-15 min | `/tmp/precommit-output.txt` |
+| `./benchmark-search.sh 5 parquet clean` | 10-20 min | `benchmark-results/parquet-output.txt` |
+
+### Benchmark-Specific Rules
+
+- Use **5% dataset** for all benchmark runs unless explicitly told otherwise.
+- Always run with `clean` flag when code has changed (re-indexes data).
+- Use `search-only` mode to reuse existing indexed data when only queries changed.
+- Save results to `benchmark-results/{YYYYMMDD}_{HHMMSS}.md` after each run.
+- NEVER use shell polling loops with `sleep` inside OpenSearch — use `_cluster/health?wait_for_status=yellow&timeout=60s`.
 
 ## Repository Structure
 
