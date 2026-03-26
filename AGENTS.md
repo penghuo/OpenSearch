@@ -11,16 +11,14 @@ Any command that may take longer than 2 minutes MUST be run asynchronously. This
 ### Async Execution Pattern
 
 1. **NEVER run long-running commands synchronously** — always background and poll.
-2. **Launch in background** so the shell returns immediately:
+2. **Launch in a subshell** so the parent shell returns immediately:
    ```bash
-   nohup <command> > /tmp/<task>-output.txt 2>&1 &
-   echo "PID: $!"
+   nohup bash -c 'cd /path/to/repo && JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto ./gradlew <task> > /tmp/<task>-output.txt 2>&1' &>/dev/null &
+   echo "launched"
    ```
-3. **Poll for completion** — check if the process is still running and inspect output:
+   **CRITICAL**: Plain `nohup cmd &` or `(cmd &)` does NOT work — the shell hangs waiting for the background process. You MUST use `nohup bash -c '...' &>/dev/null &`.
+3. **Poll for completion** — check output tail for success/failure:
    ```bash
-   # Check if still running
-   kill -0 <PID> 2>/dev/null && echo "RUNNING" || echo "DONE"
-   # Inspect tail of output
    tail -5 /tmp/<task>-output.txt
    ```
 4. **Poll interval**: every 10-30s for benchmarks, every 30-60s for builds/tests.
