@@ -25,7 +25,11 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.LongValues;
+import org.apache.lucene.util.packed.DirectReader;
+import org.apache.lucene.util.packed.DirectWriter;
 import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.ColumnReader;
@@ -71,6 +75,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ParquetDocValuesReader extends DocValuesProducer {
 
     private final IndexInput dataIn;
+    private final int version;
     private final Map<String, FieldMeta> fields = new HashMap<>();
 
     // Segment-level caches for decoded field data, keyed by field name.
@@ -80,6 +85,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     private final ConcurrentHashMap<String, CachedSorted> sortedCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CachedSortedNumeric> sortedNumericCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, CachedSortedSet> sortedSetCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, BlockPackedData> skipperCache = new ConcurrentHashMap<>();
 
     /** Cached decoded data for NUMERIC fields. */
     private static class CachedNumeric {
@@ -215,11 +221,11 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         ChecksumIndexInput metaInput = null;
         try {
             dataInput = state.directory.openInput(dataFileName, state.context);
-            CodecUtil.checkIndexHeader(
+            int dataVersion = CodecUtil.checkIndexHeader(
                 dataInput,
                 dataCodec,
-                ParquetDocValuesWriter.VERSION_CURRENT,
-                ParquetDocValuesWriter.VERSION_CURRENT,
+                ParquetDocValuesWriter.VERSION_START,
+                ParquetDocValuesWriter.VERSION_SKIP_INDEX,
                 state.segmentInfo.getId(),
                 state.segmentSuffix
             );
@@ -228,16 +234,17 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             CodecUtil.checkIndexHeader(
                 metaInput,
                 metaCodec,
-                ParquetDocValuesWriter.VERSION_CURRENT,
-                ParquetDocValuesWriter.VERSION_CURRENT,
+                ParquetDocValuesWriter.VERSION_START,
+                ParquetDocValuesWriter.VERSION_SKIP_INDEX,
                 state.segmentInfo.getId(),
                 state.segmentSuffix
             );
 
-            readFields(metaInput);
+            readFields(metaInput, dataVersion);
             CodecUtil.checkFooter(metaInput);
 
             this.dataIn = dataInput;
+            this.version = dataVersion;
             success = true;
         } finally {
             if (success == false) {
@@ -252,7 +259,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         this(state, dataExtension, metaExtension, ParquetDocValuesWriter.DATA_CODEC, ParquetDocValuesWriter.META_CODEC);
     }
 
-    private void readFields(IndexInput metaIn) throws IOException {
+    private void readFields(IndexInput metaIn, int version) throws IOException {
         String fieldName = metaIn.readString();
         while (fieldName.equals(ParquetDocValuesWriter.END_MARKER) == false) {
             String dvTypeName = metaIn.readString();
@@ -416,7 +423,310 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         }
     }
 
+    /** Cached data for NUMERIC fields using mmap'd packed values (version 3+). */
+    private static class CachedNumericPacked extends CachedNumeric {
+        final LongValues packedValues;
+        /** Doc count for bounds checking; used instead of docIds.length when docIds is null (dense). */
+        final int docCount;
+
+        CachedNumericPacked(int[] docIds, LongValues packedValues, boolean isDense, int docCount) {
+            super(docIds, null, isDense);
+            this.packedValues = packedValues;
+            this.docCount = docCount;
+        }
+    }
+
+    /** Cached data for SORTED_NUMERIC singleton fields using mmap'd packed values (version 3+). */
+    private static class CachedSortedNumericPacked extends CachedSortedNumeric {
+        final LongValues packedValues;
+        /** Doc count for bounds checking; used instead of docIds.length when docIds is null (dense). */
+        final int docCount;
+
+        CachedSortedNumericPacked(int[] docIds, LongValues packedValues, boolean isDense, int docCount) {
+            super(docIds, new long[0][], isDense);
+            this.packedValues = packedValues;
+            this.docCount = docCount;
+        }
+    }
+
+    /** Block-level metadata from the packed values section, used to build DocValuesSkipper. */
+    static class BlockPackedData {
+        final LongValues values;
+        final int numBlocks;
+        final long[] blockMinValues;
+        final long[] blockMaxValues;
+        final int docCount;
+        final boolean isDense;
+        final int[] docIds;
+
+        BlockPackedData(LongValues values, int numBlocks, long[] blockMinValues, long[] blockMaxValues, int docCount, boolean isDense, int[] docIds) {
+            this.values = values;
+            this.numBlocks = numBlocks;
+            this.blockMinValues = blockMinValues;
+            this.blockMaxValues = blockMaxValues;
+            this.docCount = docCount;
+            this.isDense = isDense;
+            this.docIds = docIds;
+        }
+    }
+
+    /** Doc IDs, dense flag, doc count, and end offset read from the .pdvd file without parquet page decompression. */
+    private static class DocIdData {
+        /** Doc IDs array. Null for dense fields to avoid allocating a sequential int[docCount]. */
+        final int[] docIds;
+        final boolean isDense;
+        final int docCount;
+        /** Absolute file offset where the doc ID section ends. */
+        final long endOffset;
+
+        DocIdData(int[] docIds, boolean isDense, int docCount, long endOffset) {
+            this.docIds = docIds;
+            this.isDense = isDense;
+            this.docCount = docCount;
+            this.endOffset = endOffset;
+        }
+    }
+
+    /**
+     * Reads ONLY the doc ID section from .pdvd, skipping parquet page decompression.
+     * Also computes the absolute file offset where the doc ID section ends.
+     * For dense fields, docIds is null to avoid wasteful int[docCount] allocation.
+     */
+    private DocIdData readDocIdsOnly(FieldMeta meta) throws IOException {
+        long absDocIdStart = meta.dataStartOffset + meta.docIdOffset;
+        // Use a fresh clone to avoid position interference
+        IndexInput in = dataIn.clone();
+        in.seek(absDocIdStart);
+        byte denseFlag = in.readByte();
+        int docCount = in.readInt();
+        boolean isDense = (denseFlag == ParquetDocValuesWriter.DENSE_FLAG);
+        int[] docIds;
+        if (isDense) {
+            // Dense: doc IDs are [0..docCount-1], no need to allocate an array
+            docIds = null;
+        } else {
+            // Sparse field: doc IDs stored explicitly
+            docIds = new int[docCount];
+            for (int i = 0; i < docCount; i++) {
+                docIds[i] = in.readInt();
+            }
+        }
+        // Compute absolute end offset: start + 1 (flag) + 4 (count) + sparse doc IDs
+        long docIdSectionSize = 1 + 4 + (isDense ? 0 : 4L * docCount);
+        long endOffset = absDocIdStart + docIdSectionSize;
+        return new DocIdData(docIds, isDense, docCount, endOffset);
+    }
+
+    /**
+     * Loads packed values via mmap'd DirectReader for O(1) random access.
+     * Uses a RandomAccessInput slice from the main data input for thread-safe reads.
+     * Format at packedValuesOffset: [long: minValue][long: gcd][byte: bitsPerValue][packed data...]
+     * Used for VERSION_PACKED_VALUES (3) backward compatibility.
+     */
+    private LongValues loadPackedValues(long packedValuesOffset, int docCount) throws IOException {
+        // Use a fresh clone to avoid position interference
+        IndexInput in = dataIn.clone();
+        in.seek(packedValuesOffset);
+        long minValue = in.readLong();
+        long gcd = in.readLong();
+        int bitsPerValue = in.readByte();
+
+        if (bitsPerValue == 0) {
+            // All values are identical — return constant
+            final long constValue = minValue;
+            return new LongValues() {
+                @Override
+                public long get(long index) {
+                    return constValue;
+                }
+            };
+        }
+
+        // Create a thread-safe RandomAccessInput over the packed data for DirectReader.
+        long packedDataStart = packedValuesOffset + 17; // 8 (minValue) + 8 (gcd) + 1 (bitsPerValue)
+        long packedDataLength = DirectWriter.bytesRequired(docCount, bitsPerValue);
+        RandomAccessInput rai = threadSafeRandomAccess(packedDataStart, packedDataLength);
+        LongValues packed = DirectReader.getInstance(rai, bitsPerValue);
+
+        final long fMinValue = minValue;
+        final long fGcd = gcd;
+        return new LongValues() {
+            @Override
+            public long get(long index) {
+                return fMinValue + packed.get(index) * fGcd;
+            }
+        };
+    }
+
+    /**
+     * Loads block-based packed values via DirectReader for O(1) random access.
+     * Each block of BLOCK_SIZE docs has its own minValue, gcd, bitsPerValue, and DirectReader instance.
+     * V4 format: 25 bytes/block (offset, min, gcd, bpv)
+     * V5 format: 33 bytes/block (offset, min, max, gcd, bpv) — adds maxValue for DocValuesSkipper
+     */
+    private BlockPackedData loadBlockPackedData(long packedValuesOffset, int docCount, boolean isDense, int[] docIds) throws IOException {
+        // Use a fresh clone to avoid position interference
+        IndexInput in = dataIn.clone();
+        in.seek(packedValuesOffset);
+        int numBlocks = in.readInt();
+
+        boolean hasMaxValues = version >= ParquetDocValuesWriter.VERSION_SKIP_INDEX;
+        int bytesPerBlock = hasMaxValues ? 33 : 25;
+
+        long[] blockOffsets = new long[numBlocks];
+        long[] blockMinValues = new long[numBlocks];
+        long[] blockMaxValues = new long[numBlocks];
+        long[] blockGcds = new long[numBlocks];
+        int[] blockBitsPerValue = new int[numBlocks];
+
+        for (int b = 0; b < numBlocks; b++) {
+            blockOffsets[b] = in.readLong();
+            blockMinValues[b] = in.readLong();
+            if (hasMaxValues) {
+                blockMaxValues[b] = in.readLong();
+            }
+            blockGcds[b] = in.readLong();
+            blockBitsPerValue[b] = in.readByte();
+        }
+
+        // For V4 (no maxValues stored), set maxValues = Long.MAX_VALUE as safe upper bound.
+        // The skipper will still work but won't skip blocks as aggressively.
+        if (hasMaxValues == false) {
+            for (int b = 0; b < numBlocks; b++) {
+                blockMaxValues[b] = (blockBitsPerValue[b] == 0) ? blockMinValues[b] : Long.MAX_VALUE;
+            }
+        }
+
+        long blockDataStart = packedValuesOffset + 4 + (long) bytesPerBlock * numBlocks;
+
+        // Pre-create DirectReader instances per block (cached for O(1) access)
+        final LongValues[] blockReaders = new LongValues[numBlocks];
+        for (int b = 0; b < numBlocks; b++) {
+            int bpv = blockBitsPerValue[b];
+            if (bpv == 0) {
+                // All values in this block are identical
+                final long constValue = blockMinValues[b];
+                blockReaders[b] = new LongValues() {
+                    @Override
+                    public long get(long index) {
+                        return constValue;
+                    }
+                };
+            } else {
+                int blockStart = b << ParquetDocValuesWriter.BLOCK_SHIFT;
+                int blockEnd = Math.min(blockStart + ParquetDocValuesWriter.BLOCK_SIZE, docCount);
+                int blockCount = blockEnd - blockStart;
+                long dataOffset = blockDataStart + blockOffsets[b];
+                long dataLength = DirectWriter.bytesRequired(blockCount, bpv);
+                RandomAccessInput rai = threadSafeRandomAccess(dataOffset, dataLength);
+                LongValues packed = DirectReader.getInstance(rai, bpv);
+                final long minVal = blockMinValues[b];
+                final long gcd = blockGcds[b];
+                blockReaders[b] = new LongValues() {
+                    @Override
+                    public long get(long index) {
+                        return minVal + packed.get(index) * gcd;
+                    }
+                };
+            }
+        }
+
+        final int blockShift = ParquetDocValuesWriter.BLOCK_SHIFT;
+        final int blockMask = ParquetDocValuesWriter.BLOCK_SIZE - 1;
+        LongValues longValues = new LongValues() {
+            @Override
+            public long get(long index) {
+                int blockIdx = (int) (index >> blockShift);
+                int inBlockIdx = (int) (index & blockMask);
+                return blockReaders[blockIdx].get(inBlockIdx);
+            }
+        };
+        return new BlockPackedData(longValues, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds);
+    }
+
+    /**
+     * Returns a thread-safe RandomAccessInput for the given region of the data file.
+     * Uses IndexInput.randomAccessSlice() which provides zero-copy mmap'd access
+     * for MMapDirectory. All reads are positional (absolute offset) with no mutable
+     * cursor state, making them inherently thread-safe on shared memory.
+     */
+    private RandomAccessInput threadSafeRandomAccess(long offset, long length) throws IOException {
+        return dataIn.randomAccessSlice(offset, length);
+    }
+
+    /**
+     * Thread-safe RandomAccessInput backed by a byte array.
+     * All reads are position-based with no shared mutable state.
+     * Uses little-endian byte order to match DirectWriter/DirectReader expectations.
+     */
+    private static class ByteArrayRandomAccessInput implements RandomAccessInput {
+        private final byte[] data;
+
+        ByteArrayRandomAccessInput(byte[] data) {
+            this.data = data;
+        }
+
+        @Override
+        public long length() {
+            return data.length;
+        }
+
+        @Override
+        public byte readByte(long pos) {
+            return data[(int) pos];
+        }
+
+        @Override
+        public short readShort(long pos) {
+            int p = (int) pos;
+            return (short) ((data[p] & 0xFF) | (data[p + 1] & 0xFF) << 8);
+        }
+
+        @Override
+        public int readInt(long pos) {
+            int p = (int) pos;
+            return (data[p] & 0xFF)
+                | (data[p + 1] & 0xFF) << 8
+                | (data[p + 2] & 0xFF) << 16
+                | (data[p + 3] & 0xFF) << 24;
+        }
+
+        @Override
+        public long readLong(long pos) {
+            int p = (int) pos;
+            return ((long) (data[p] & 0xFF))
+                | ((long) (data[p + 1] & 0xFF) << 8)
+                | ((long) (data[p + 2] & 0xFF) << 16)
+                | ((long) (data[p + 3] & 0xFF) << 24)
+                | ((long) (data[p + 4] & 0xFF) << 32)
+                | ((long) (data[p + 5] & 0xFF) << 40)
+                | ((long) (data[p + 6] & 0xFF) << 48)
+                | ((long) (data[p + 7] & 0xFF) << 56);
+        }
+    }
+
     private CachedNumeric loadNumeric(FieldMeta meta) throws IOException {
+        // Fast path: use mmap'd packed values when available (version 3+)
+        if (version >= ParquetDocValuesWriter.VERSION_PACKED_VALUES) {
+            DocIdData docIdData = readDocIdsOnly(meta);
+            if (docIdData.docCount == 0) {
+                return new CachedNumeric(docIdData.docIds, new long[0], docIdData.isDense);
+            }
+            // Packed values section starts right after doc IDs in the .pdvd file
+            long fieldEndOffset = meta.dataStartOffset + meta.dataLength;
+            if (docIdData.endOffset < fieldEndOffset) {
+                LongValues packedValues;
+                if (version >= ParquetDocValuesWriter.VERSION_BLOCK_PACKED) {
+                    BlockPackedData bpd = loadBlockPackedData(docIdData.endOffset, docIdData.docCount, docIdData.isDense, docIdData.docIds);
+                    skipperCache.putIfAbsent(meta.fieldName, bpd);
+                    packedValues = bpd.values;
+                } else {
+                    packedValues = loadPackedValues(docIdData.endOffset, docIdData.docCount);
+                }
+                return new CachedNumericPacked(docIdData.docIds, packedValues, docIdData.isDense, docIdData.docCount);
+            }
+        }
+        // Fallback: decode from parquet pages (version 2 or no packed section)
         PrimitiveType parquetType = ParquetTypeMapping.numericType(meta.fieldName);
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
@@ -457,20 +767,31 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         }
         CachedNumeric cached = computeNumericCache(field.name, meta);
         int[] docIds = cached.docIds;
-        long[] values = cached.values;
 
-        if (docIds.length == 0) {
+        // For dense packed fields, docIds is null; use docCount from CachedNumericPacked
+        final int docCount = (cached instanceof CachedNumericPacked)
+            ? ((CachedNumericPacked) cached).docCount
+            : (docIds != null ? docIds.length : 0);
+
+        if (docCount == 0) {
             return DocValues.emptyNumeric();
         }
 
+        // Use mmap'd packed values for O(1) random access when available (version 3+),
+        // otherwise fall back to heap long[] from parquet page decoding
+        final boolean usePacked = (cached instanceof CachedNumericPacked);
+        final LongValues packedValues = usePacked ? ((CachedNumericPacked) cached).packedValues : null;
+        final long[] values = usePacked ? null : cached.values;
+
         if (cached.isDense) {
-            final int maxDoc = docIds.length;
+            // Dense: docIds may be null (packed path), use docCount for bounds
+            final int maxDoc = docCount;
             return new NumericDocValues() {
                 private int doc = -1;
 
                 @Override
                 public long longValue() {
-                    return values[doc];
+                    return usePacked ? packedValues.get(doc) : values[doc];
                 }
 
                 @Override
@@ -515,28 +836,47 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
             @Override
             public long longValue() {
-                return values[idx];
+                return usePacked ? packedValues.get(idx) : values[idx];
             }
 
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int start = 0;
-                // Linear probe for sequential (forward) access pattern
-                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
-                    start = idx;
-                    int i = linearScanForward(docIds, start, target);
-                    if (i >= 0) {
-                        if (docIds[i] == target) {
-                            idx = i;
+                if (idx >= 0 && idx < docIds.length) {
+                    if (docIds[idx] == target) {
+                        return true;
+                    } else if (docIds[idx] < target) {
+                        // Forward: try linear scan first
+                        int i = linearScanForward(docIds, idx, target);
+                        if (i >= 0) {
+                            if (docIds[i] == target) {
+                                idx = i;
+                                return true;
+                            }
+                            idx = i - 1;
+                            return false;
+                        }
+                        int lo = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                        int found = java.util.Arrays.binarySearch(docIds, lo, docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
                             return true;
                         }
-                        idx = i - 1;
+                        idx = -found - 2;
+                        return false;
+                    } else {
+                        // Backward: narrow search to [0, idx)
+                        int found = java.util.Arrays.binarySearch(docIds, 0, idx, target);
+                        if (found >= 0) {
+                            idx = found;
+                            return true;
+                        }
+                        idx = -found - 2;
                         return false;
                     }
-                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
                 }
-                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                // Cold start: search entire array
+                int found = java.util.Arrays.binarySearch(docIds, 0, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     return true;
@@ -701,21 +1041,41 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int start = 0;
-                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
-                    start = idx;
-                    int i = linearScanForward(docIds, start, target);
-                    if (i >= 0) {
-                        if (docIds[i] == target) {
-                            idx = i;
+                if (idx >= 0 && idx < docIds.length) {
+                    if (docIds[idx] == target) {
+                        return true;
+                    } else if (docIds[idx] < target) {
+                        // Forward: try linear scan first
+                        int i = linearScanForward(docIds, idx, target);
+                        if (i >= 0) {
+                            if (docIds[i] == target) {
+                                idx = i;
+                                return true;
+                            }
+                            idx = i - 1;
+                            return false;
+                        }
+                        int lo = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                        int found = java.util.Arrays.binarySearch(docIds, lo, docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
                             return true;
                         }
-                        idx = i - 1;
+                        idx = -found - 2;
+                        return false;
+                    } else {
+                        // Backward: narrow search to [0, idx)
+                        int found = java.util.Arrays.binarySearch(docIds, 0, idx, target);
+                        if (found >= 0) {
+                            idx = found;
+                            return true;
+                        }
+                        idx = -found - 2;
                         return false;
                     }
-                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
                 }
-                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                // Cold start: search entire array
+                int found = java.util.Arrays.binarySearch(docIds, 0, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     return true;
@@ -906,21 +1266,41 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int start = 0;
-                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
-                    start = idx;
-                    int i = linearScanForward(docIds, start, target);
-                    if (i >= 0) {
-                        if (docIds[i] == target) {
-                            idx = i;
+                if (idx >= 0 && idx < docIds.length) {
+                    if (docIds[idx] == target) {
+                        return true;
+                    } else if (docIds[idx] < target) {
+                        // Forward: try linear scan first
+                        int i = linearScanForward(docIds, idx, target);
+                        if (i >= 0) {
+                            if (docIds[i] == target) {
+                                idx = i;
+                                return true;
+                            }
+                            idx = i - 1;
+                            return false;
+                        }
+                        int lo = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                        int found = java.util.Arrays.binarySearch(docIds, lo, docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
                             return true;
                         }
-                        idx = i - 1;
+                        idx = -found - 2;
+                        return false;
+                    } else {
+                        // Backward: narrow search to [0, idx)
+                        int found = java.util.Arrays.binarySearch(docIds, 0, idx, target);
+                        if (found >= 0) {
+                            idx = found;
+                            return true;
+                        }
+                        idx = -found - 2;
                         return false;
                     }
-                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
                 }
-                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                // Cold start: search entire array
+                int found = java.util.Arrays.binarySearch(docIds, 0, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     return true;
@@ -980,6 +1360,26 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     }
 
     private CachedSortedNumeric loadSortedNumeric(FieldMeta meta) throws IOException {
+        // Fast path: use mmap'd packed values for singleton sorted numeric fields (version 3+)
+        if (version >= ParquetDocValuesWriter.VERSION_PACKED_VALUES) {
+            DocIdData docIdData = readDocIdsOnly(meta);
+            if (docIdData.docCount == 0) {
+                return new CachedSortedNumeric(docIdData.docIds, new long[0][], docIdData.isDense);
+            }
+            long fieldEndOffset = meta.dataStartOffset + meta.dataLength;
+            if (docIdData.endOffset < fieldEndOffset) {
+                LongValues packedValues;
+                if (version >= ParquetDocValuesWriter.VERSION_BLOCK_PACKED) {
+                    BlockPackedData bpd = loadBlockPackedData(docIdData.endOffset, docIdData.docCount, docIdData.isDense, docIdData.docIds);
+                    skipperCache.putIfAbsent(meta.fieldName, bpd);
+                    packedValues = bpd.values;
+                } else {
+                    packedValues = loadPackedValues(docIdData.endOffset, docIdData.docCount);
+                }
+                return new CachedSortedNumericPacked(docIdData.docIds, packedValues, docIdData.isDense, docIdData.docCount);
+            }
+        }
+        // Fallback: decode from parquet pages (version 2 or multi-valued)
         PrimitiveType parquetType = ParquetTypeMapping.sortedNumericType(meta.fieldName);
         FieldData fieldData = readFieldData(meta, parquetType);
         int[] docIds = fieldData.docIds;
@@ -1029,30 +1429,35 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         int[] docIds = cached.docIds;
         long[][] allValues = cached.allValues;
 
-        if (docIds.length == 0) {
+        // For dense packed fields, docIds is null; use docCount from CachedSortedNumericPacked
+        final int docCount = (cached instanceof CachedSortedNumericPacked)
+            ? ((CachedSortedNumericPacked) cached).docCount
+            : (docIds != null ? docIds.length : 0);
+
+        if (docCount == 0) {
             return DocValues.emptySortedNumeric();
         }
 
-        // Singleton optimization: if every document has exactly one value,
-        // use a flat array for faster value access. The SortedNumericDocValues
-        // still reports docValueCount()=1 and nextValue() uses 1D array access
-        // instead of 2D array access (allValues[doc][0] → singleValues[doc]).
-        if (cached.singletonValues != null) {
-            final long[] singleValues = cached.singletonValues;
+        // Singleton optimization: wrap NumericDocValues with DocValues.singleton()
+        // so that DocValues.unwrapSingleton() returns the underlying NumericDocValues
+        // in the sort comparator path (LongValuesComparatorSource → LongComparator).
+        // This enables the optimized single-valued sort path instead of the slower
+        // multi-valued iterator path.
+        if (cached instanceof CachedSortedNumericPacked || cached.singletonValues != null) {
+            final boolean usePacked = (cached instanceof CachedSortedNumericPacked);
+            final LongValues packedValues = usePacked ? ((CachedSortedNumericPacked) cached).packedValues : null;
+            final long[] singleValues = usePacked ? null : cached.singletonValues;
+            final int[] sDocIds = cached.docIds;
 
+            NumericDocValues numeric;
             if (cached.isDense) {
-                final int maxDoc = docIds.length;
-                return new SortedNumericDocValues() {
+                final int maxDoc = docCount;
+                numeric = new NumericDocValues() {
                     private int doc = -1;
 
                     @Override
-                    public long nextValue() {
-                        return singleValues[doc];
-                    }
-
-                    @Override
-                    public int docValueCount() {
-                        return 1;
+                    public long longValue() {
+                        return usePacked ? packedValues.get(doc) : singleValues[doc];
                     }
 
                     @Override
@@ -1068,20 +1473,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
                     @Override
                     public int nextDoc() {
-                        doc++;
-                        if (doc >= maxDoc) {
-                            doc = NO_MORE_DOCS;
-                        }
-                        return doc;
+                        return (++doc >= maxDoc) ? (doc = NO_MORE_DOCS) : doc;
                     }
 
                     @Override
                     public int advance(int target) {
-                        doc = target;
-                        if (doc >= maxDoc) {
-                            doc = NO_MORE_DOCS;
-                        }
-                        return doc;
+                        return (target >= maxDoc) ? (doc = NO_MORE_DOCS) : (doc = target);
                     }
 
                     @Override
@@ -1089,95 +1486,111 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                         return maxDoc;
                     }
                 };
-            }
+            } else {
+                numeric = new NumericDocValues() {
+                    private int idx = -1;
+                    private int doc = -1;
 
-            return new SortedNumericDocValues() {
-                private int idx = -1;
-                private int doc = -1;
+                    @Override
+                    public long longValue() {
+                        return usePacked ? packedValues.get(idx) : singleValues[idx];
+                    }
 
-                @Override
-                public long nextValue() {
-                    return singleValues[idx];
-                }
-
-                @Override
-                public int docValueCount() {
-                    return 1;
-                }
-
-                @Override
-                public boolean advanceExact(int target) {
-                    doc = target;
-                    int start = 0;
-                    if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
-                        start = idx;
-                        int i = linearScanForward(docIds, start, target);
-                        if (i >= 0) {
-                            if (docIds[i] == target) {
-                                idx = i;
+                    @Override
+                    public boolean advanceExact(int target) {
+                        doc = target;
+                        if (idx >= 0 && idx < sDocIds.length) {
+                            if (sDocIds[idx] == target) {
                                 return true;
+                            } else if (sDocIds[idx] < target) {
+                                // Forward: try linear scan first
+                                int i = linearScanForward(sDocIds, idx, target);
+                                if (i >= 0) {
+                                    if (sDocIds[i] == target) {
+                                        idx = i;
+                                        return true;
+                                    }
+                                    idx = i - 1;
+                                    return false;
+                                }
+                                int lo = Math.min(idx + LINEAR_SCAN_THRESHOLD, sDocIds.length);
+                                int found = java.util.Arrays.binarySearch(sDocIds, lo, sDocIds.length, target);
+                                if (found >= 0) {
+                                    idx = found;
+                                    return true;
+                                }
+                                idx = -found - 2;
+                                return false;
+                            } else {
+                                // Backward: narrow search to [0, idx)
+                                int found = java.util.Arrays.binarySearch(sDocIds, 0, idx, target);
+                                if (found >= 0) {
+                                    idx = found;
+                                    return true;
+                                }
+                                idx = -found - 2;
+                                return false;
                             }
-                            idx = i - 1;
-                            return false;
                         }
-                        start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
-                    }
-                    int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
-                    if (found >= 0) {
-                        idx = found;
-                        return true;
-                    }
-                    idx = -found - 2;
-                    return false;
-                }
-
-                @Override
-                public int docID() {
-                    return doc;
-                }
-
-                @Override
-                public int nextDoc() {
-                    idx++;
-                    if (idx >= docIds.length) {
-                        doc = NO_MORE_DOCS;
-                    } else {
-                        doc = docIds[idx];
-                    }
-                    return doc;
-                }
-
-                @Override
-                public int advance(int target) {
-                    int start = Math.max(idx + 1, 0);
-                    if (start < docIds.length && docIds[start] <= target) {
-                        int i = linearScanForward(docIds, start, target);
-                        if (i >= 0) {
-                            idx = i;
-                            doc = docIds[idx];
-                            return doc;
+                        // Cold start: search entire array
+                        int found = java.util.Arrays.binarySearch(sDocIds, 0, sDocIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
+                            return true;
                         }
-                        start = Math.min(start + LINEAR_SCAN_THRESHOLD, docIds.length);
+                        idx = -found - 2;
+                        return false;
                     }
-                    int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
-                    if (found >= 0) {
-                        idx = found;
-                    } else {
-                        idx = -found - 1;
-                    }
-                    if (idx >= docIds.length) {
-                        doc = NO_MORE_DOCS;
-                    } else {
-                        doc = docIds[idx];
-                    }
-                    return doc;
-                }
 
-                @Override
-                public long cost() {
-                    return docIds.length;
-                }
-            };
+                    @Override
+                    public int docID() {
+                        return doc;
+                    }
+
+                    @Override
+                    public int nextDoc() {
+                        idx++;
+                        if (idx >= sDocIds.length) {
+                            doc = NO_MORE_DOCS;
+                        } else {
+                            doc = sDocIds[idx];
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public int advance(int target) {
+                        int start = Math.max(idx + 1, 0);
+                        if (start < sDocIds.length && sDocIds[start] <= target) {
+                            int i = linearScanForward(sDocIds, start, target);
+                            if (i >= 0) {
+                                idx = i;
+                                doc = sDocIds[idx];
+                                return doc;
+                            }
+                            start = Math.min(start + LINEAR_SCAN_THRESHOLD, sDocIds.length);
+                        }
+                        int found = java.util.Arrays.binarySearch(sDocIds, start, sDocIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
+                        } else {
+                            idx = -found - 1;
+                        }
+                        if (idx >= sDocIds.length) {
+                            doc = NO_MORE_DOCS;
+                        } else {
+                            doc = sDocIds[idx];
+                        }
+                        return doc;
+                    }
+
+                    @Override
+                    public long cost() {
+                        return sDocIds.length;
+                    }
+                };
+            }
+            return DocValues.singleton(numeric);
         }
 
         if (cached.isDense) {
@@ -1253,22 +1666,45 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int start = 0;
-                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
-                    start = idx;
-                    int i = linearScanForward(docIds, start, target);
-                    if (i >= 0) {
-                        if (docIds[i] == target) {
-                            idx = i;
+                if (idx >= 0 && idx < docIds.length) {
+                    if (docIds[idx] == target) {
+                        valueIdx = 0;
+                        return true;
+                    } else if (docIds[idx] < target) {
+                        // Forward: try linear scan first
+                        int i = linearScanForward(docIds, idx, target);
+                        if (i >= 0) {
+                            if (docIds[i] == target) {
+                                idx = i;
+                                valueIdx = 0;
+                                return true;
+                            }
+                            idx = i - 1;
+                            return false;
+                        }
+                        int lo = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                        int found = java.util.Arrays.binarySearch(docIds, lo, docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
                             valueIdx = 0;
                             return true;
                         }
-                        idx = i - 1;
+                        idx = -found - 2;
+                        return false;
+                    } else {
+                        // Backward: narrow search to [0, idx)
+                        int found = java.util.Arrays.binarySearch(docIds, 0, idx, target);
+                        if (found >= 0) {
+                            idx = found;
+                            valueIdx = 0;
+                            return true;
+                        }
+                        idx = -found - 2;
                         return false;
                     }
-                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
                 }
-                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                // Cold start: search entire array
+                int found = java.util.Arrays.binarySearch(docIds, 0, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     valueIdx = 0;
@@ -1494,7 +1930,31 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                     @Override
                     public boolean advanceExact(int target) {
                         doc = target;
-                        int found = java.util.Arrays.binarySearch(docIds, Math.max(idx, 0), docIds.length, target);
+                        if (idx >= 0 && idx < docIds.length) {
+                            if (docIds[idx] == target) {
+                                return true;
+                            } else if (docIds[idx] < target) {
+                                // Forward: search from current position
+                                int found = java.util.Arrays.binarySearch(docIds, idx, docIds.length, target);
+                                if (found >= 0) {
+                                    idx = found;
+                                    return true;
+                                }
+                                idx = -found - 2;
+                                return false;
+                            } else {
+                                // Backward: narrow search to [0, idx)
+                                int found = java.util.Arrays.binarySearch(docIds, 0, idx, target);
+                                if (found >= 0) {
+                                    idx = found;
+                                    return true;
+                                }
+                                idx = -found - 2;
+                                return false;
+                            }
+                        }
+                        // Cold start: search entire array
+                        int found = java.util.Arrays.binarySearch(docIds, 0, docIds.length, target);
                         if (found >= 0) {
                             idx = found;
                             return true;
@@ -1638,22 +2098,45 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             @Override
             public boolean advanceExact(int target) {
                 doc = target;
-                int start = 0;
-                if (idx >= 0 && idx < docIds.length && docIds[idx] <= target) {
-                    start = idx;
-                    int i = linearScanForward(docIds, start, target);
-                    if (i >= 0) {
-                        if (docIds[i] == target) {
-                            idx = i;
+                if (idx >= 0 && idx < docIds.length) {
+                    if (docIds[idx] == target) {
+                        ordIdx = 0;
+                        return true;
+                    } else if (docIds[idx] < target) {
+                        // Forward: try linear scan first
+                        int i = linearScanForward(docIds, idx, target);
+                        if (i >= 0) {
+                            if (docIds[i] == target) {
+                                idx = i;
+                                ordIdx = 0;
+                                return true;
+                            }
+                            idx = i - 1;
+                            return false;
+                        }
+                        int lo = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
+                        int found = java.util.Arrays.binarySearch(docIds, lo, docIds.length, target);
+                        if (found >= 0) {
+                            idx = found;
                             ordIdx = 0;
                             return true;
                         }
-                        idx = i - 1;
+                        idx = -found - 2;
+                        return false;
+                    } else {
+                        // Backward: narrow search to [0, idx)
+                        int found = java.util.Arrays.binarySearch(docIds, 0, idx, target);
+                        if (found >= 0) {
+                            idx = found;
+                            ordIdx = 0;
+                            return true;
+                        }
+                        idx = -found - 2;
                         return false;
                     }
-                    start = Math.min(idx + LINEAR_SCAN_THRESHOLD, docIds.length);
                 }
-                int found = java.util.Arrays.binarySearch(docIds, start, docIds.length, target);
+                // Cold start: search entire array
+                int found = java.util.Arrays.binarySearch(docIds, 0, docIds.length, target);
                 if (found >= 0) {
                     idx = found;
                     ordIdx = 0;
@@ -1717,136 +2200,220 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
     @Override
     public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
-        // Range query regressions are prevented upstream: DateFieldMapper and NumberFieldMapper
-        // disable the doc_values query path when parquet is enabled, so this skipper is only
-        // used by Lucene's competitive iterator optimization for sort/scroll queries.
-        FieldMeta meta = fields.get(field.name);
-        if (meta == null) return null;
-
-        String dvType = meta.dvTypeName;
-        int blockSize = 128;
-        int[] docIds;
-        long[] blockMin, blockMax;
-        int[] blockMinDocId, blockMaxDocId, blockDocCount;
-        long globalMin = Long.MAX_VALUE, globalMax = Long.MIN_VALUE;
-        int globalDocCount;
-
-        if (dvType.equals("NUMERIC")) {
-            CachedNumeric cached = computeNumericCache(field.name, meta);
-            if (cached.docIds.length == 0) return null;
-            docIds = cached.docIds;
-            globalDocCount = docIds.length;
-            int numBlocks = (docIds.length + blockSize - 1) / blockSize;
-            blockMin = new long[numBlocks];
-            blockMax = new long[numBlocks];
-            blockMinDocId = new int[numBlocks];
-            blockMaxDocId = new int[numBlocks];
-            blockDocCount = new int[numBlocks];
-            for (int b = 0; b < numBlocks; b++) {
-                int start = b * blockSize;
-                int end = Math.min(start + blockSize, docIds.length);
-                long bMin = Long.MAX_VALUE, bMax = Long.MIN_VALUE;
-                for (int i = start; i < end; i++) {
-                    bMin = Math.min(bMin, cached.values[i]);
-                    bMax = Math.max(bMax, cached.values[i]);
-                }
-                blockMin[b] = bMin;
-                blockMax[b] = bMax;
-                blockMinDocId[b] = cached.isDense ? start : docIds[start];
-                blockMaxDocId[b] = cached.isDense ? (end - 1) : docIds[end - 1];
-                blockDocCount[b] = end - start;
-                globalMin = Math.min(globalMin, bMin);
-                globalMax = Math.max(globalMax, bMax);
-            }
-        } else if (dvType.equals("SORTED_NUMERIC")) {
-            CachedSortedNumeric cached = sortedNumericCache.computeIfAbsent(field.name, k -> {
-                try {
-                    return loadSortedNumeric(meta);
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            });
-            if (cached.docIds.length == 0) return null;
-            docIds = cached.docIds;
-            globalDocCount = docIds.length;
-            int numBlocks = (docIds.length + blockSize - 1) / blockSize;
-            blockMin = new long[numBlocks];
-            blockMax = new long[numBlocks];
-            blockMinDocId = new int[numBlocks];
-            blockMaxDocId = new int[numBlocks];
-            blockDocCount = new int[numBlocks];
-            for (int b = 0; b < numBlocks; b++) {
-                int start = b * blockSize;
-                int end = Math.min(start + blockSize, docIds.length);
-                long bMin = Long.MAX_VALUE, bMax = Long.MIN_VALUE;
-                for (int i = start; i < end; i++) {
-                    for (long v : cached.allValues[i]) {
-                        bMin = Math.min(bMin, v);
-                        bMax = Math.max(bMax, v);
-                    }
-                }
-                blockMin[b] = bMin;
-                blockMax[b] = bMax;
-                blockMinDocId[b] = cached.isDense ? start : docIds[start];
-                blockMaxDocId[b] = cached.isDense ? (end - 1) : docIds[end - 1];
-                blockDocCount[b] = end - start;
-                globalMin = Math.min(globalMin, bMin);
-                globalMax = Math.max(globalMax, bMax);
-            }
-        } else {
+        BlockPackedData bpd = skipperCache.get(field.name);
+        if (bpd == null || bpd.numBlocks == 0) {
             return null;
         }
+        // Compute global min/max across all blocks
+        long globalMin = bpd.blockMinValues[0];
+        long globalMax = bpd.blockMaxValues[0];
+        for (int b = 1; b < bpd.numBlocks; b++) {
+            globalMin = Math.min(globalMin, bpd.blockMinValues[b]);
+            globalMax = Math.max(globalMax, bpd.blockMaxValues[b]);
+        }
+        final long gMin = globalMin;
+        final long gMax = globalMax;
+        final int gDocCount = bpd.docCount;
+        final int numBlocks = bpd.numBlocks;
+        final long[] blockMinValues = bpd.blockMinValues;
+        final long[] blockMaxValues = bpd.blockMaxValues;
+        final boolean isDense = bpd.isDense;
+        final int[] docIds = bpd.docIds;
+        final int blockShift = ParquetDocValuesWriter.BLOCK_SHIFT;
+        final int blockSize = ParquetDocValuesWriter.BLOCK_SIZE;
+        final int docCount = bpd.docCount;
 
-        final long gMin = globalMin, gMax = globalMax;
-        final int gDocCount = globalDocCount;
-        final int firstDocId = docIds[0];
-        final int lastDocId = docIds[docIds.length - 1];
+        // GROUP_SHIFT=4 means each higher level groups 16 entries from the level below
+        final int GROUP_SHIFT = 4;
+        final int GROUP_SIZE = 1 << GROUP_SHIFT; // 16
+
+        // Pre-compute level-0 per-block minDocID/maxDocID/docCount arrays
+        final int[] block0MinDocIDs = new int[numBlocks];
+        final int[] block0MaxDocIDs = new int[numBlocks];
+        final int[] block0DocCounts = new int[numBlocks];
+        for (int b = 0; b < numBlocks; b++) {
+            if (isDense) {
+                block0MinDocIDs[b] = b << blockShift;
+                int blockEnd = Math.min((b + 1) << blockShift, docCount);
+                block0MaxDocIDs[b] = blockEnd - 1;
+                block0DocCounts[b] = blockEnd - block0MinDocIDs[b];
+            } else {
+                int startIdx = b << blockShift;
+                int endIdx = Math.min((b + 1) << blockShift, docIds.length) - 1;
+                block0MinDocIDs[b] = docIds[startIdx];
+                block0MaxDocIDs[b] = docIds[endIdx];
+                block0DocCounts[b] = endIdx - startIdx + 1;
+            }
+        }
+
+        // Build higher levels by aggregating groups of GROUP_SIZE from the level below.
+        // Each level stores: minValues, maxValues, minDocIDs, maxDocIDs, docCounts.
+        // We only add a level if it has >1 group (otherwise it doesn't help skipping).
+        // levelData[i] corresponds to level i+1 (level 0 is the per-block data).
+        int maxExtraLevels = 3; // levels 1, 2, 3
+        // Arrays of arrays for each extra level
+        long[][] lvlMinValues = new long[maxExtraLevels][];
+        long[][] lvlMaxValues = new long[maxExtraLevels][];
+        int[][] lvlMinDocIDs = new int[maxExtraLevels][];
+        int[][] lvlMaxDocIDs = new int[maxExtraLevels][];
+        int[][] lvlDocCounts = new int[maxExtraLevels][];
+        int actualExtraLevels = 0;
+
+        // Source arrays for aggregation: start with level-0 block data
+        long[] srcMin = blockMinValues;
+        long[] srcMax = blockMaxValues;
+        int[] srcMinDoc = block0MinDocIDs;
+        int[] srcMaxDoc = block0MaxDocIDs;
+        int[] srcDocCount = block0DocCounts;
+        int srcLen = numBlocks;
+
+        for (int lvl = 0; lvl < maxExtraLevels; lvl++) {
+            int numGroups = (srcLen + GROUP_SIZE - 1) >>> GROUP_SHIFT;
+            if (numGroups <= 1) break; // This level wouldn't help skipping
+            long[] lMin = new long[numGroups];
+            long[] lMax = new long[numGroups];
+            int[] lMinDoc = new int[numGroups];
+            int[] lMaxDoc = new int[numGroups];
+            int[] lDocCount = new int[numGroups];
+            for (int g = 0; g < numGroups; g++) {
+                int from = g << GROUP_SHIFT;
+                int to = Math.min(from + GROUP_SIZE, srcLen);
+                long mn = srcMin[from];
+                long mx = srcMax[from];
+                int mnDoc = srcMinDoc[from];
+                int mxDoc = srcMaxDoc[from];
+                int dc = srcDocCount[from];
+                for (int i = from + 1; i < to; i++) {
+                    mn = Math.min(mn, srcMin[i]);
+                    mx = Math.max(mx, srcMax[i]);
+                    mnDoc = Math.min(mnDoc, srcMinDoc[i]);
+                    mxDoc = Math.max(mxDoc, srcMaxDoc[i]);
+                    dc += srcDocCount[i];
+                }
+                lMin[g] = mn;
+                lMax[g] = mx;
+                lMinDoc[g] = mnDoc;
+                lMaxDoc[g] = mxDoc;
+                lDocCount[g] = dc;
+            }
+            lvlMinValues[lvl] = lMin;
+            lvlMaxValues[lvl] = lMax;
+            lvlMinDocIDs[lvl] = lMinDoc;
+            lvlMaxDocIDs[lvl] = lMaxDoc;
+            lvlDocCounts[lvl] = lDocCount;
+            actualExtraLevels++;
+            // Next iteration aggregates from this level's groups
+            srcMin = lMin;
+            srcMax = lMax;
+            srcMinDoc = lMinDoc;
+            srcMaxDoc = lMaxDoc;
+            srcDocCount = lDocCount;
+            srcLen = numGroups;
+        }
+
+        final int numLevels = 1 + actualExtraLevels;
+        // Capture final references for the anonymous class
+        final long[][] fLvlMinValues = lvlMinValues;
+        final long[][] fLvlMaxValues = lvlMaxValues;
+        final int[][] fLvlMinDocIDs = lvlMinDocIDs;
+        final int[][] fLvlMaxDocIDs = lvlMaxDocIDs;
+        final int[][] fLvlDocCounts = lvlDocCounts;
+        final int fGroupShift = GROUP_SHIFT;
 
         return new DocValuesSkipper() {
             private int currentBlock = -1;
-            private final int numBlocks = blockMin.length;
+            // Level 0 state
+            private int minDocID0 = -1;
+            private int maxDocID0 = -1;
+            private long minValue0;
+            private long maxValue0;
+            private int docCount0;
+            // Higher level current group indices
+            private final int[] currentGroup = new int[numLevels - 1];
 
             @Override
-            public void advance(int target) {
-                currentBlock++;
-                while (currentBlock < numBlocks && blockMaxDocId[currentBlock] < target) {
-                    currentBlock++;
+            public void advance(int target) throws IOException {
+                if (isDense) {
+                    if (target >= docCount) {
+                        minDocID0 = Integer.MAX_VALUE;
+                        maxDocID0 = Integer.MAX_VALUE;
+                        return;
+                    }
+                    currentBlock = target >> blockShift;
+                } else {
+                    // For sparse fields, find the value index for the first doc >= target
+                    int startIdx = (currentBlock + 1) << blockShift;
+                    if (startIdx < 0) startIdx = 0;
+                    int idx;
+                    if (startIdx >= docIds.length) {
+                        idx = docIds.length;
+                    } else if (docIds[startIdx] >= target) {
+                        // Already past target, use this position
+                        idx = startIdx;
+                    } else {
+                        idx = java.util.Arrays.binarySearch(docIds, startIdx, docIds.length, target);
+                        if (idx < 0) idx = -idx - 1;
+                    }
+                    if (idx >= docIds.length) {
+                        minDocID0 = Integer.MAX_VALUE;
+                        maxDocID0 = Integer.MAX_VALUE;
+                        return;
+                    }
+                    currentBlock = idx >> blockShift;
+                }
+                if (currentBlock >= numBlocks) {
+                    minDocID0 = Integer.MAX_VALUE;
+                    maxDocID0 = Integer.MAX_VALUE;
+                    return;
+                }
+                // Level 0: per-block values
+                minValue0 = blockMinValues[currentBlock];
+                maxValue0 = blockMaxValues[currentBlock];
+                minDocID0 = block0MinDocIDs[currentBlock];
+                maxDocID0 = block0MaxDocIDs[currentBlock];
+                docCount0 = block0DocCounts[currentBlock];
+
+                // Compute group index for each higher level
+                int blockIdx = currentBlock;
+                for (int lvl = 0; lvl < numLevels - 1; lvl++) {
+                    blockIdx = blockIdx >>> fGroupShift;
+                    currentGroup[lvl] = blockIdx;
                 }
             }
 
             @Override
             public int numLevels() {
-                return 2;
+                return numLevels;
             }
 
             @Override
             public int minDocID(int level) {
-                if (level > 0) return firstDocId;
-                return currentBlock < numBlocks ? blockMinDocId[currentBlock] : Integer.MAX_VALUE;
+                if (level == 0) return minDocID0;
+                return fLvlMinDocIDs[level - 1][currentGroup[level - 1]];
             }
 
             @Override
             public int maxDocID(int level) {
-                if (level > 0) return lastDocId;
-                return currentBlock < numBlocks ? blockMaxDocId[currentBlock] : Integer.MAX_VALUE;
+                if (level == 0) return maxDocID0;
+                return fLvlMaxDocIDs[level - 1][currentGroup[level - 1]];
             }
 
             @Override
             public long minValue(int level) {
-                if (level > 0) return gMin;
-                return currentBlock < numBlocks ? blockMin[currentBlock] : 0;
+                if (level == 0) return minValue0;
+                return fLvlMinValues[level - 1][currentGroup[level - 1]];
             }
 
             @Override
             public long maxValue(int level) {
-                if (level > 0) return gMax;
-                return currentBlock < numBlocks ? blockMax[currentBlock] : 0;
+                if (level == 0) return maxValue0;
+                return fLvlMaxValues[level - 1][currentGroup[level - 1]];
             }
 
             @Override
             public int docCount(int level) {
-                if (level > 0) return gDocCount;
-                return currentBlock < numBlocks ? blockDocCount[currentBlock] : 0;
+                if (level == 0) return docCount0;
+                return fLvlDocCounts[level - 1][currentGroup[level - 1]];
             }
 
             @Override

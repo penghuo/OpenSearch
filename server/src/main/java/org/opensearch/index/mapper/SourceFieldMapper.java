@@ -296,9 +296,6 @@ public class SourceFieldMapper extends MetadataFieldMapper {
         if (context.indexSettings().isDerivedSourceEnabled()) {
             return;
         }
-        // Parquet doc_values: store _source normally to avoid expensive per-document
-        // reconstruction from doc_values during scroll/search (which caused +87% p90 regression).
-        // Doc_values are still encoded in parquet format for aggregations and sorting.
         BytesReference originalSource = context.sourceToParse().source();
         MediaType contentType = context.sourceToParse().getMediaType();
         final BytesReference adaptedSource = applyFilters(originalSource, contentType);

@@ -531,7 +531,7 @@ public final class DateFieldMapper extends ParametrizedFieldMapper {
                 resolution,
                 (l, u, nowUsed) -> {
                     // When parquet doc_values are enabled and the field is indexed, skip the
-                    // doc_values query path. Parquet doc_values lack skip data, making the
+                    // doc_values query path. Parquet doc_values lack efficient skip data, making the
                     // doc_values path in IndexOrDocValuesQuery much slower than the point index path.
                     boolean effectiveHasDocValues = hasDocValues()
                         && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());

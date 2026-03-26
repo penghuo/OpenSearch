@@ -23,6 +23,8 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.MathUtil;
+import org.apache.lucene.util.packed.DirectWriter;
 import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.ColumnWriteStore;
@@ -70,7 +72,15 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
 
     static final String DATA_CODEC = "ParquetDocValuesData";
     static final String META_CODEC = "ParquetDocValuesMeta";
-    static final int VERSION_CURRENT = 2;
+    static final int VERSION_START = 2;
+    static final int VERSION_PACKED_VALUES = 3;
+    static final int VERSION_BLOCK_PACKED = 4;
+    static final int VERSION_SKIP_INDEX = 5;
+    static final int VERSION_CURRENT = VERSION_SKIP_INDEX;
+
+    /** Block shift for block-based packed values encoding (2^14 = 16384 docs per block, matching Lucene90). */
+    static final int BLOCK_SHIFT = 14;
+    static final int BLOCK_SIZE = 1 << BLOCK_SHIFT;
     static final String END_MARKER = "__END__";
 
     /** Flag byte: field has a value for every doc in the segment (no doc IDs stored). */
@@ -118,10 +128,13 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
         IntArrayBuilder docIds = new IntArrayBuilder();
+        LongArrayBuilder collectedValues = new LongArrayBuilder();
         NumericDocValues values = valuesProducer.getNumeric(field);
         while (values.nextDoc() != NumericDocValues.NO_MORE_DOCS) {
             docIds.add(values.docID());
-            cw.write(values.longValue(), 0, 0);
+            long v = values.longValue();
+            collectedValues.add(v);
+            cw.write(v, 0, 0);
             writeStore.endRecord();
         }
         writeStore.flush();
@@ -130,6 +143,10 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         pageWriter.writeDictionaryPageToOutput();
         long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
         writeDocIds(docIds);
+
+        // Write packed values section for mmap'd DirectReader access (version 3+)
+        long packedValuesOffset = writePackedValues(collectedValues);
+
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
         writeFieldMeta(
@@ -240,14 +257,24 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
 
         IntArrayBuilder docIds = new IntArrayBuilder();
+        // Collect singleton values for packed encoding; set to null if multi-valued detected
+        LongArrayBuilder singletonValues = new LongArrayBuilder();
+        boolean isSingleton = true;
         SortedNumericDocValues values = valuesProducer.getSortedNumeric(field);
         while (values.nextDoc() != SortedNumericDocValues.NO_MORE_DOCS) {
             docIds.add(values.docID());
             int count = values.docValueCount();
             if (count == 0) {
                 cw.writeNull(0, 0);
+                isSingleton = false;
             } else {
-                cw.write(values.nextValue(), 0, 1);
+                long firstVal = values.nextValue();
+                cw.write(firstVal, 0, 1);
+                if (count == 1 && isSingleton) {
+                    singletonValues.add(firstVal);
+                } else {
+                    isSingleton = false;
+                }
                 for (int i = 1; i < count; i++) {
                     cw.write(values.nextValue(), 1, 1);
                 }
@@ -260,6 +287,12 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         pageWriter.writeDictionaryPageToOutput();
         long docIdOffset = dataOut.getFilePointer() - dataStartOffset;
         writeDocIds(docIds);
+
+        // Write packed values only for singleton sorted numeric fields
+        long packedValuesOffset = (isSingleton && singletonValues.size() > 0)
+            ? writePackedValues(singletonValues)
+            : -1L;
+
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
         writeFieldMeta(
@@ -324,6 +357,112 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             pageWriter.hasDictionary(),
             docIdOffset
         );
+    }
+
+    /**
+     * Writes block-based bit-packed values using Lucene's DirectWriter for mmap'd O(1) random access.
+     * Each block of BLOCK_SIZE docs has its own minValue, maxValue, gcd, and bitsPerValue for better compression.
+     * Format:
+     *   [int: numBlocks]
+     *   [block index: numBlocks × (long: blockOffset, long: blockMinValue, long: blockMaxValue, long: blockGcd, byte: blockBitsPerValue)]
+     *   [block data: for each block, DirectWriter packed data]
+     * Block index is 33 bytes per block. Block offsets are relative to the start of block data section.
+     * The per-block minValue/maxValue enable DocValuesSkipper in the reader for skipping non-competitive blocks.
+     * Returns the absolute file offset where packed section begins.
+     */
+    private long writePackedValues(LongArrayBuilder values) throws IOException {
+        if (values.size() == 0) {
+            return -1L;
+        }
+        long packedValuesOffset = dataOut.getFilePointer();
+        int numValues = values.size();
+        int numBlocks = (numValues + BLOCK_SIZE - 1) >>> BLOCK_SHIFT;
+
+        // Compute per-block stats
+        long[] blockMinValues = new long[numBlocks];
+        long[] blockMaxValues = new long[numBlocks];
+        long[] blockGcds = new long[numBlocks];
+        int[] blockBitsPerValue = new int[numBlocks];
+
+        for (int b = 0; b < numBlocks; b++) {
+            int start = b << BLOCK_SHIFT;
+            int end = Math.min(start + BLOCK_SIZE, numValues);
+
+            long minValue = values.get(start);
+            long maxValue = values.get(start);
+            for (int i = start + 1; i < end; i++) {
+                long v = values.get(i);
+                minValue = Math.min(minValue, v);
+                maxValue = Math.max(maxValue, v);
+            }
+
+            long gcd = 0;
+            if (minValue != maxValue) {
+                gcd = maxValue - minValue;
+                for (int i = start; i < end; i++) {
+                    long v = values.get(i);
+                    // Guard against overflow in delta computation (same as Lucene90DocValuesConsumer)
+                    if (v < Long.MIN_VALUE / 2 || v > Long.MAX_VALUE / 2) {
+                        gcd = 1;
+                        break;
+                    }
+                    gcd = MathUtil.gcd(gcd, v - minValue);
+                }
+            }
+
+            long maxDelta = gcd != 0 ? (maxValue - minValue) / gcd : 0;
+            int bpv = (minValue != maxValue) ? DirectWriter.unsignedBitsRequired(maxDelta) : 0;
+
+            blockMinValues[b] = minValue;
+            blockMaxValues[b] = maxValue;
+            blockGcds[b] = gcd;
+            blockBitsPerValue[b] = bpv;
+        }
+
+        // Pre-compute block offsets using DirectWriter.bytesRequired
+        long[] blockOffsets = new long[numBlocks];
+        long runningOffset = 0;
+        for (int b = 0; b < numBlocks; b++) {
+            blockOffsets[b] = runningOffset;
+            int start = b << BLOCK_SHIFT;
+            int end = Math.min(start + BLOCK_SIZE, numValues);
+            int blockCount = end - start;
+            if (blockBitsPerValue[b] > 0) {
+                runningOffset += DirectWriter.bytesRequired(blockCount, blockBitsPerValue[b]);
+            }
+        }
+
+        // Write header: number of blocks
+        dataOut.writeInt(numBlocks);
+
+        // Write block index with pre-computed offsets (33 bytes per block)
+        for (int b = 0; b < numBlocks; b++) {
+            dataOut.writeLong(blockOffsets[b]);
+            dataOut.writeLong(blockMinValues[b]);
+            dataOut.writeLong(blockMaxValues[b]);
+            dataOut.writeLong(blockGcds[b]);
+            dataOut.writeByte((byte) blockBitsPerValue[b]);
+        }
+
+        // Write block data
+        for (int b = 0; b < numBlocks; b++) {
+            int start = b << BLOCK_SHIFT;
+            int end = Math.min(start + BLOCK_SIZE, numValues);
+            int blockCount = end - start;
+            int bpv = blockBitsPerValue[b];
+
+            if (bpv > 0) {
+                DirectWriter writer = DirectWriter.getInstance(dataOut, blockCount, bpv);
+                long minVal = blockMinValues[b];
+                long gcd = blockGcds[b];
+                for (int i = start; i < end; i++) {
+                    writer.add(gcd != 0 ? (values.get(i) - minVal) / gcd : 0);
+                }
+                writer.finish();
+            }
+        }
+
+        return packedValuesOffset;
     }
 
     private void writeDocIds(IntArrayBuilder docIds) throws IOException {
@@ -558,6 +697,34 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         }
 
         int get(int index) {
+            return data[index];
+        }
+
+        int size() {
+            return size;
+        }
+    }
+
+    /**
+     * Growable primitive long array for collecting numeric values during indexing.
+     * Used to write packed values section for mmap'd DirectReader access.
+     */
+    static class LongArrayBuilder {
+        private long[] data;
+        private int size;
+
+        LongArrayBuilder() {
+            this.data = new long[1024];
+        }
+
+        void add(long value) {
+            if (size == data.length) {
+                data = Arrays.copyOf(data, data.length + (data.length >> 1));
+            }
+            data[size++] = value;
+        }
+
+        long get(int index) {
             return data[index];
         }
 
