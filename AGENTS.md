@@ -4,6 +4,19 @@
 
 - NEVER delete, remove, or modify tests without explicit user approval. If tests fail, propose the fix and wait for confirmation before changing any test file.
 
+## Benchmark Rules
+
+- NEVER run benchmark-search.sh synchronously — always background and poll.
+- Launch in subshell so shell returns immediately:
+  ```
+  (./benchmark-search.sh ... > output.txt 2>&1 &)
+  echo "launched"
+  ```
+- Poll every 5-10s: `sleep 5; tail -1 output.txt | strings | tail -1`
+- Analyze each poll result. If ERROR/FAILURE, stop benchmark and diagnose immediately.
+- Never launch a benchmark and then do something else — monitoring IS the task until it completes.
+- NEVER run commands that take >5 minutes synchronously — background them and poll
+
 ## Repository Structure
 
 Key components:
