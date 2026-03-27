@@ -50,12 +50,13 @@ public class DerivedFieldGenerator {
     }
 
     /**
-     * Generate the derived field value based on the preference of derived field and field value type
+     * Generate the derived field value based on the preference of derived field and field value type.
+     * Uses writeDirect to bypass intermediate List allocation when the fetcher supports it.
      * @param builder - builder to store the derived source filed
      * @param reader - leafReader to read data from
      * @param docId - docId for which we want to generate the source
      */
     public void generate(XContentBuilder builder, LeafReader reader, int docId) throws IOException {
-        fieldValueFetcher.write(builder, fieldValueFetcher.fetch(reader, docId));
+        fieldValueFetcher.writeDirect(builder, reader, docId);
     }
 }

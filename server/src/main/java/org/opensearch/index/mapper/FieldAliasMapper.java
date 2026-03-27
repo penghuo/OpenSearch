@@ -32,10 +32,9 @@
 
 package org.opensearch.index.mapper;
 
+import org.apache.lucene.index.LeafReader;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.XContentBuilder;
-
-import org.apache.lucene.index.LeafReader;
 
 import java.io.IOException;
 import java.util.Collections;

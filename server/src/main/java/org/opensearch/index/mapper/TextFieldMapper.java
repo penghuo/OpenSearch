@@ -42,9 +42,9 @@ import org.apache.lucene.analysis.shingle.FixedShingleFilter;
 import org.apache.lucene.analysis.tokenattributes.BytesTermAttribute;
 import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
 import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
-import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
+import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.queries.intervals.Intervals;
@@ -1257,19 +1257,15 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
     @Override
     protected DerivedFieldGenerator derivedFieldGenerator() {
         if (parquetEnabled) {
-            return new DerivedFieldGenerator(
-                mappedFieldType,
-                new SortedSetDocValuesFetcher(mappedFieldType, simpleName()) {
-                    @Override
-                    public Object convert(Object value) {
-                        if (value instanceof BytesRef) {
-                            return ((BytesRef) value).utf8ToString();
-                        }
-                        return value;
+            return new DerivedFieldGenerator(mappedFieldType, new SortedSetDocValuesFetcher(mappedFieldType, simpleName()) {
+                @Override
+                public Object convert(Object value) {
+                    if (value instanceof BytesRef) {
+                        return ((BytesRef) value).utf8ToString();
                     }
-                },
-                new StoredFieldFetcher(mappedFieldType, simpleName())
-            ) {
+                    return value;
+                }
+            }, new StoredFieldFetcher(mappedFieldType, simpleName())) {
                 @Override
                 public FieldValueType getDerivedFieldPreference() {
                     return FieldValueType.DOC_VALUES;

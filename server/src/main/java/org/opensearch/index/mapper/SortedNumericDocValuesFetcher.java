@@ -10,6 +10,7 @@ package org.opensearch.index.mapper;
 
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SortedNumericDocValues;
+import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -63,6 +64,33 @@ public class SortedNumericDocValuesFetcher extends FieldValueFetcher {
                 values.add(dv.nextValue());
             }
             return values;
+        } catch (Exception e) {
+            throw new IOException("Failed to read doc values for document " + docId + " in field " + mappedFieldType.name(), e);
+        }
+    }
+
+    /**
+     * Writes numeric doc values directly to the builder, avoiding intermediate List allocation.
+     * Uses convert() (not valueForDisplay) because subclasses like BooleanFieldMapper override
+     * convert() to map raw long values (0/1) to boolean (false/true).
+     */
+    @Override
+    void writeDirect(XContentBuilder builder, LeafReader reader, int docId) throws IOException {
+        try {
+            final SortedNumericDocValues dv = getDv(reader);
+            if (dv == null || !dv.advanceExact(docId)) {
+                return;
+            }
+            int count = dv.docValueCount();
+            if (count == 1) {
+                builder.field(simpleName, convert(dv.nextValue()));
+            } else {
+                builder.startArray(simpleName);
+                for (int i = 0; i < count; i++) {
+                    builder.value(convert(dv.nextValue()));
+                }
+                builder.endArray();
+            }
         } catch (Exception e) {
             throw new IOException("Failed to read doc values for document " + docId + " in field " + mappedFieldType.name(), e);
         }

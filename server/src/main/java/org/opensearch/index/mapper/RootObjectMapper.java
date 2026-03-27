@@ -72,9 +72,7 @@ import static org.opensearch.index.mapper.TypeParsers.parseDateTimeFormatter;
 @PublicApi(since = "1.0.0")
 public class RootObjectMapper extends ObjectMapper {
     private static final DeprecationLogger DEPRECATION_LOGGER = DeprecationLogger.getLogger(RootObjectMapper.class);
-    private static final ThreadLocal<ByteArrayOutputStream> REUSABLE_BOS = ThreadLocal.withInitial(
-        () -> new ByteArrayOutputStream(512)
-    );
+    private static final ThreadLocal<ByteArrayOutputStream> REUSABLE_BOS = ThreadLocal.withInitial(() -> new ByteArrayOutputStream(512));
 
     /**
      * Default parameters for root object

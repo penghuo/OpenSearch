@@ -45,6 +45,18 @@ public abstract class FieldValueFetcher {
     }
 
     /**
+     * Writes field values directly to the builder from the underlying storage (doc values or stored fields),
+     * bypassing intermediate List allocation. Subclasses should override this for zero-copy writes.
+     * Default implementation falls back to fetch() + write().
+     * @param builder - builder to write field value(s) to
+     * @param reader - LeafReader to read data from
+     * @param docId - document id to read
+     */
+    void writeDirect(XContentBuilder builder, LeafReader reader, int docId) throws IOException {
+        write(builder, fetch(reader, docId));
+    }
+
+    /**
      * Writes the field value(s) to the builder
      * It calls clear() to empty the list containing values after writing them to builder
      * For each value, it calls convert to transform the field value to required representation

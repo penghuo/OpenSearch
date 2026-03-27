@@ -1122,7 +1122,9 @@ public class ObjectMapper extends Mapper implements Cloneable {
         // Find child doc IDs between previous parent and current parent
         int prevParent = docId > 0 ? parentBits.prevSetBit(docId - 1) : -1;
         List<Integer> childDocIds = new ArrayList<>();
-        for (int childId = childBits.nextSetBit(prevParent + 1); childId >= 0 && childId < docId; childId = childBits.nextSetBit(childId + 1)) {
+        for (int childId = childBits.nextSetBit(prevParent + 1); childId >= 0 && childId < docId; childId = childBits.nextSetBit(
+            childId + 1
+        )) {
             childDocIds.add(childId);
         }
 

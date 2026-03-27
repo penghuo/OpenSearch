@@ -11,6 +11,7 @@ package org.opensearch.index.mapper;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.util.BytesRef;
+import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -67,6 +68,35 @@ public class SortedSetDocValuesFetcher extends FieldValueFetcher {
             }
             return values;
         } catch (IOException e) {
+            throw new IOException("Failed to read doc values for document " + docId + " in field " + mappedFieldType.name(), e);
+        }
+    }
+
+    /**
+     * Writes keyword doc values directly to the builder, avoiding BytesRef.deepCopyOf and
+     * intermediate List allocation. The BytesRef from lookupOrd is only valid until the next
+     * lookupOrd call, but convert() processes it immediately so no copy is needed.
+     */
+    @Override
+    void writeDirect(XContentBuilder builder, LeafReader reader, int docId) throws IOException {
+        try {
+            final SortedSetDocValues dv = getDv(reader);
+            if (dv == null || !dv.advanceExact(docId)) {
+                return;
+            }
+            int count = dv.docValueCount();
+            if (count == 1) {
+                BytesRef value = dv.lookupOrd(dv.nextOrd());
+                builder.field(simpleName, convert(value));
+            } else {
+                builder.startArray(simpleName);
+                for (int i = 0; i < count; i++) {
+                    BytesRef value = dv.lookupOrd(dv.nextOrd());
+                    builder.value(convert(value));
+                }
+                builder.endArray();
+            }
+        } catch (Exception e) {
             throw new IOException("Failed to read doc values for document " + docId + " in field " + mappedFieldType.name(), e);
         }
     }
