@@ -1,145 +1,320 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OS_HOME="/local/home/penghuo/oss/OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
-RESULTS_DIR="benchmark-results"
-INGEST_PCT="${1:-1}"
-MODE="${2:-all}"      # baseline, parquet, or all
-CLEAN="${3:-no}"      # clean, no (default: no — reuse existing data)
+# ── Parquet benchmark harness ────────────────────────────────────────────────
+# Usage: ./benchmark.sh <phase> [mode] [clean]
+#
+# Phases:
+#   build    — build localDistro
+#   test     — run yamlRestTestParquet (correctness gate)
+#   bench    — run OSB benchmark (10 iterations, 1 warmup)
+#   all      — build → test → bench (stops on failure)
+#
+# Mode (bench phase only):
+#   parquet  — parquet run only (default)
+#   baseline — baseline run only
+#   both     — baseline then parquet
+#
+# Clean (bench phase only):
+#   clean    — wipe data before indexing
+#   no       — reuse existing data (default)
+#
+# Examples:
+#   ./benchmark.sh all both clean    # full pipeline, both configs, fresh data
+#   ./benchmark.sh bench parquet no  # benchmark only, reuse data
+#   ./benchmark.sh test              # correctness check only
+#   ./benchmark.sh build             # build only
+
+REPO_ROOT="/local/home/penghuo/oss/OpenSearch"
+OS_HOME="$REPO_ROOT/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
+RESULTS_DIR="$REPO_ROOT/benchmark-results"
+JAVA_HOME="/usr/lib/jvm/java-21-amazon-corretto"
+INGEST_PCT=5
+ITERATIONS=10
+WARMUP=1
+P90_THRESHOLD=10  # percent
+
+PHASE="${1:-all}"
+MODE="${2:-parquet}"
+CLEAN="${3:-no}"
 
 mkdir -p "$RESULTS_DIR"
-chmod 777 "$RESULTS_DIR"
 
-start_opensearch() {
-    if [ "$CLEAN" = "clean" ]; then
-        echo "=== Cleaning data ==="
-        rm -rf "$OS_HOME/data"
-    else
-        echo "=== Reusing existing data (pass 'clean' as 3rd arg to wipe) ==="
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log() { echo "[$(ts)] $*"; }
+die() { log "FATAL: $*" >&2; exit 1; }
+
+# ── Phase: build ─────────────────────────────────────────────────────────────
+do_build() {
+    log "Building localDistro..."
+    cd "$REPO_ROOT"
+    JAVA_HOME="$JAVA_HOME" ./gradlew localDistro -x test -x internalClusterTest 2>&1 | tail -5
+    log "Build complete."
+}
+
+# ── Phase: test ──────────────────────────────────────────────────────────────
+do_test() {
+    log "Running yamlRestTestParquet..."
+    cd "$REPO_ROOT"
+    local out="/tmp/yamlrest-output.txt"
+    JAVA_HOME="$JAVA_HOME" ./gradlew :rest-api-spec:yamlRestTestParquet > "$out" 2>&1
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        log "yamlRestTestParquet FAILED (exit $rc)"
+        tail -20 "$out"
+        die "Correctness gate failed. Fix tests before benchmarking."
     fi
-    echo "=== Starting OpenSearch ==="
+    local tests fails
+    tests=$(grep -oP 'tests:\s*\K\d+' "$out" | tail -1) || tests="?"
+    fails=$(grep -oP 'failures:\s*\K\d+' "$out" | tail -1) || fails="?"
+    log "yamlRestTestParquet PASSED ($tests tests, $fails failures)"
+}
+
+# ── OpenSearch lifecycle ─────────────────────────────────────────────────────
+start_opensearch() {
+    local old_pid
+    old_pid=$(cat "$OS_HOME/opensearch.pid" 2>/dev/null) || true
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        kill -9 "$old_pid" 2>/dev/null || true; sleep 2
+    fi
+    find "$OS_HOME/data" -name "write.lock" -delete 2>/dev/null || true
+
+    if [ "$CLEAN" = "clean" ]; then
+        log "Cleaning data..."
+        rm -rf "$OS_HOME/data"
+    fi
+
+    log "Starting OpenSearch (32GB heap)..."
     OPENSEARCH_JAVA_OPTS="-Xms32g -Xmx32g" \
         "$OS_HOME/bin/opensearch" \
         -Eopensearch.experimental.feature.parquet_doc_values.enabled=true \
         -Ediscovery.type=single-node \
         -d -p "$OS_HOME/opensearch.pid"
-    echo "=== Waiting for cluster ==="
-    for i in $(seq 1 120); do
-        local status
-        status=$(curl -s localhost:9200/_cluster/health 2>/dev/null \
-            | grep -oP '"status"\s*:\s*"\K[^"]+' || true)
-        if [ "$status" = "green" ] || [ "$status" = "yellow" ]; then
-            echo "Cluster is $status"
+
+    for attempt in $(seq 1 60); do
+        local health
+        health=$(curl -s --max-time 5 'localhost:9200/_cluster/health?wait_for_status=yellow&timeout=10s' 2>/dev/null) || true
+        if echo "$health" | grep -qP '"status"\s*:\s*"(green|yellow)"'; then
+            log "Cluster ready ($(echo "$health" | grep -oP '"status"\s*:\s*"\K[^"]+'))"
             return 0
         fi
         sleep 5
     done
-    echo "ERROR: cluster did not start" >&2; return 1
+    die "Cluster did not start after 5 minutes"
 }
 
 stop_opensearch() {
-    echo "=== Stopping OpenSearch ==="
+    log "Stopping OpenSearch..."
+    # Capture logs before stopping
+    local logfile="$OS_HOME/logs/opensearch.log"
+    if [ -f "$logfile" ]; then
+        cp "$logfile" "$RESULTS_DIR/opensearch-${1:-unknown}.log"
+        # Extract FilterRewrite diagnostics
+        grep -i 'FilterRewrite' "$logfile" > "$RESULTS_DIR/filterrewrite-${1:-unknown}.log" 2>/dev/null || true
+    fi
+
     local pid
     pid=$(cat "$OS_HOME/opensearch.pid" 2>/dev/null) || return 0
     kill "$pid" 2>/dev/null || true
-    for i in $(seq 1 60); do
-        kill -0 "$pid" 2>/dev/null || { echo "OpenSearch stopped"; return 0; }
-        sleep 2
+    for i in $(seq 1 30); do
+        kill -0 "$pid" 2>/dev/null || { log "Stopped."; return 0; }
+        sleep 1
     done
-    echo "WARN: force-killing OpenSearch"
-    kill -9 "$pid" 2>/dev/null || true
-    sleep 2
+    kill -9 "$pid" 2>/dev/null || true; sleep 2
 }
 
-capture_storage() {
-    local label="$1"
-    curl -s "localhost:9200/_cat/indices?v&h=index,docs.count,store.size&s=index" >&2
-    curl -s "localhost:9200/_cat/indices?h=store.size&bytes=b" \
-        | awk '{sum+=$1} END {print sum}'
-}
-
+# ── OSB runner ───────────────────────────────────────────────────────────────
 osb_run() {
     local tag="$1" params_file="$2" csv_file="$3"
+    docker ps -q --filter ancestor=opensearchproject/opensearch-benchmark:latest | xargs -r docker kill 2>/dev/null || true
+    docker run --rm -v osb-data:/data alpine sh -c "rm -f /data/.benchmark/.rally.pid /data/.benchmark/.osb.pid" 2>/dev/null || true
+    docker volume rm osb-data 2>/dev/null || true
+
+    log "OSB run: $tag"
     docker run --rm --network host \
       -v osb-data:/opensearch-benchmark/.benchmark \
-      -v "$(pwd)/$RESULTS_DIR:/results" \
+      -v "$RESULTS_DIR:/results" \
       opensearchproject/opensearch-benchmark:latest \
       run \
         --workload http_logs \
         --target-hosts localhost:9200 \
         --pipeline benchmark-only \
-        --test-procedure append-no-conflicts-index-only \
+        --test-procedure append-no-conflicts \
         --workload-params="/results/$(basename "$params_file")" \
         --user-tag="config:$tag" \
         --results-format csv \
         --results-file "/results/$(basename "$csv_file")" \
-        --kill-running-processes \
-        2>&1 | tee "$RESULTS_DIR/${tag}-output.txt"
+        --on-error=abort \
+        > "$RESULTS_DIR/${tag}-output.txt" 2>&1
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        log "OSB run '$tag' FAILED (exit $rc)"
+        tail -20 "$RESULTS_DIR/${tag}-output.txt"
+        return 1
+    fi
+    log "OSB run '$tag' complete."
 }
 
-# ── Write param files ────────────────────────────────────────────────────────
-cat > "$RESULTS_DIR/baseline-params.json" <<PARAMS
-{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}}
+# ── Phase: bench ─────────────────────────────────────────────────────────────
+do_bench() {
+    cd "$REPO_ROOT"
+
+    cat > "$RESULTS_DIR/baseline-params.json" <<PARAMS
+{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "warmup_iterations": ${WARMUP}, "iterations": ${ITERATIONS}}
 PARAMS
 
-cat > "$RESULTS_DIR/parquet-params.json" <<PARAMS
-{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "source_enabled": false, "index_settings": {"index.codec.doc_values.format": "parquet"}}
+    cat > "$RESULTS_DIR/parquet-params.json" <<PARAMS
+{"number_of_replicas": 0, "ingest_percentage": ${INGEST_PCT}, "warmup_iterations": ${WARMUP}, "iterations": ${ITERATIONS}, "source_enabled": false, "index_settings": {"index.codec.doc_values.format": "parquet"}}
 PARAMS
 
-# ── Baseline ─────────────────────────────────────────────────────────────────
-if [ "$MODE" = "baseline" ] || [ "$MODE" = "all" ]; then
-    rm -f "$RESULTS_DIR/baseline.csv"
-    start_opensearch
-    echo "=== Baseline run (${INGEST_PCT}% corpus) ==="
-    osb_run "baseline" "$RESULTS_DIR/baseline-params.json" "baseline.csv"
-    capture_storage "baseline"
-    stop_opensearch
-fi
+    if [ "$MODE" = "baseline" ] || [ "$MODE" = "both" ]; then
+        rm -f "$RESULTS_DIR/search-baseline.csv"
+        start_opensearch
+        osb_run "search-baseline" "$RESULTS_DIR/baseline-params.json" "search-baseline.csv"
+        stop_opensearch "baseline"
+        # After baseline, don't clean for parquet run
+        CLEAN="no"
+    fi
 
-# ── Parquet ──────────────────────────────────────────────────────────────────
-if [ "$MODE" = "parquet" ] || [ "$MODE" = "all" ]; then
-    rm -f "$RESULTS_DIR/parquet.csv"
-    start_opensearch
-    echo "=== Parquet run (${INGEST_PCT}% corpus) ==="
-    osb_run "parquet" "$RESULTS_DIR/parquet-params.json" "parquet.csv"
-    capture_storage "parquet"
-    stop_opensearch
-fi
+    if [ "$MODE" = "parquet" ] || [ "$MODE" = "both" ]; then
+        rm -f "$RESULTS_DIR/search-parquet.csv"
+        start_opensearch
+        osb_run "search-parquet" "$RESULTS_DIR/parquet-params.json" "search-parquet.csv"
+        # Measure storage
+        measure_storage
+        stop_opensearch "parquet"
+    fi
 
-# ── Extract metrics from CSVs ────────────────────────────────────────────────
-extract_metric() {
-    local file="$1" metric="$2"
-    grep "^${metric}," "$file" | head -1 | awk -F',' '{print $3}'
+    generate_summary
 }
 
-if [ -f "$RESULTS_DIR/baseline.csv" ] && [ -f "$RESULTS_DIR/parquet.csv" ]; then
-B_STORE_GB=$(extract_metric "$RESULTS_DIR/baseline.csv" "Store size")
-P_STORE_GB=$(extract_metric "$RESULTS_DIR/parquet.csv" "Store size")
-B_INDEX_TIME=$(extract_metric "$RESULTS_DIR/baseline.csv" "Cumulative indexing time of primary shards")
-P_INDEX_TIME=$(extract_metric "$RESULTS_DIR/parquet.csv" "Cumulative indexing time of primary shards")
-
-pct_diff() {
-    awk "BEGIN { if ($1+0 != 0) printf \"%.1f%%\", (($2 - $1) / $1) * 100; else print \"N/A\" }"
+# ── Storage measurement ──────────────────────────────────────────────────────
+measure_storage() {
+    log "Measuring index storage..."
+    local stats
+    stats=$(curl -s 'localhost:9200/_cat/indices?h=index,store.size&bytes=b' 2>/dev/null) || true
+    echo "$stats" > "$RESULTS_DIR/storage.txt"
+    log "Storage:"
+    echo "$stats"
 }
 
-STORAGE_DIFF=$(pct_diff "${B_STORE_GB:-0}" "${P_STORE_GB:-0}")
-TIME_DIFF=$(pct_diff "${B_INDEX_TIME:-0}" "${P_INDEX_TIME:-0}")
+# ── Summary generation ───────────────────────────────────────────────────────
+generate_summary() {
+    local B_CSV="$RESULTS_DIR/search-baseline.csv"
+    local P_CSV="$RESULTS_DIR/search-parquet.csv"
 
-# ── Summary ──────────────────────────────────────────────────────────────────
-cat <<EOF | tee "$RESULTS_DIR/summary.md"
-# Benchmark Summary (${INGEST_PCT}% http_logs, index-only)
+    if [ ! -f "$B_CSV" ] || [ ! -f "$P_CSV" ]; then
+        log "Summary skipped (need both baseline and parquet CSVs)"
+        return 0
+    fi
 
-| Metric                    | Baseline       | Parquet        | Diff       |
-|---------------------------|----------------|----------------|------------|
-| Store Size (GB)           | $B_STORE_GB    | $P_STORE_GB    | $STORAGE_DIFF |
-| Indexing Time (min)       | $B_INDEX_TIME  | $P_INDEX_TIME  | $TIME_DIFF |
+    local stamp
+    stamp=$(date '+%Y%m%d_%H%M%S')
+    local summary="$RESULTS_DIR/${stamp}_summary.md"
 
-Note: Median Throughput not available (1% corpus completes during OSB warmup phase).
+    # Get operation list from baseline p50
+    local ops
+    ops=$(grep "^50th percentile service time," "$B_CSV" | tr -d '\r' | awk -F',' '$2 != "" && $2 != "index-append" {print $2}' | sort)
 
-## Pass/Fail
-- Storage reduction: $STORAGE_DIFF (target: significant reduction)
-- Indexing time: $TIME_DIFF (target: no major regression)
-EOF
-else
-    echo "=== Summary skipped (need both baseline and parquet CSVs) ==="
-fi
+    # Build summary into temp file, then tee
+    local tmpsum
+    tmpsum=$(mktemp)
+
+    echo "# Benchmark Summary — $(date '+%Y-%m-%d %H:%M')" >> "$tmpsum"
+    echo "" >> "$tmpsum"
+    echo "Dataset: ${INGEST_PCT}% http_logs | Iterations: ${ITERATIONS} | Warmup: ${WARMUP}" >> "$tmpsum"
+    echo "" >> "$tmpsum"
+    echo "| # | Operation | B svc50 | P svc50 | svc Δ | B p90 | P p90 | p90 Δ | Status |" >> "$tmpsum"
+    echo "|---|-----------|--------:|--------:|------:|------:|------:|------:|--------|" >> "$tmpsum"
+
+    local pass=0 fail=0 total=0 n=0
+    while IFS= read -r op; do
+        [ -z "$op" ] && continue
+        n=$((n + 1))
+        total=$((total + 1))
+
+        local b_svc50 p_svc50 b_p90 p_p90
+        b_svc50=$(grep "^50th percentile service time,${op}," "$B_CSV" | head -1 | tr -d '\r' | awk -F',' '{printf "%.2f", $3}') || true
+        p_svc50=$(grep "^50th percentile service time,${op}," "$P_CSV" | head -1 | tr -d '\r' | awk -F',' '{printf "%.2f", $3}') || true
+
+        # Try p90 first, fall back to p100
+        b_p90=$(grep "^90th percentile latency,${op}," "$B_CSV" | head -1 | tr -d '\r' | awk -F',' '{printf "%.2f", $3}') || true
+        p_p90=$(grep "^90th percentile latency,${op}," "$P_CSV" | head -1 | tr -d '\r' | awk -F',' '{printf "%.2f", $3}') || true
+        local metric="p90"
+        if [ -z "$b_p90" ] || [ "$b_p90" = "0.00" ]; then
+            b_p90=$(grep "^100th percentile latency,${op}," "$B_CSV" | head -1 | tr -d '\r' | awk -F',' '{printf "%.2f", $3}') || true
+            p_p90=$(grep "^100th percentile latency,${op}," "$P_CSV" | head -1 | tr -d '\r' | awk -F',' '{printf "%.2f", $3}') || true
+            metric="p100"
+        fi
+
+        local svc_diff p90_diff
+        svc_diff=$(awk "BEGIN { if (${b_svc50:-0}+0 != 0) printf \"%.1f%%\", ((${p_svc50:-0} - ${b_svc50:-0}) / ${b_svc50:-0}) * 100; else print \"N/A\" }")
+        p90_diff=$(awk "BEGIN { if (${b_p90:-0}+0 != 0) printf \"%.1f%%\", ((${p_p90:-0} - ${b_p90:-0}) / ${b_p90:-0}) * 100; else print \"N/A\" }")
+
+        local pct status
+        pct=$(awk "BEGIN { if (${b_p90:-0}+0 != 0) printf \"%.1f\", ((${p_p90:-0} - ${b_p90:-0}) / ${b_p90:-0}) * 100; else print \"999\" }")
+        if awk "BEGIN { exit ($pct <= $P90_THRESHOLD) ? 0 : 1 }"; then
+            status="✅"
+            pass=$((pass + 1))
+        else
+            status="❌ (${metric})"
+            fail=$((fail + 1))
+        fi
+
+        printf "| %d | %s | %s | %s | %s | %s | %s | %s | %s |\n" \
+            "$n" "$op" "$b_svc50" "$p_svc50" "$svc_diff" "$b_p90" "$p_p90" "$p90_diff" "$status" >> "$tmpsum"
+    done <<< "$ops"
+
+    echo "" >> "$tmpsum"
+    echo "**Score: ${pass} PASS / ${fail} FAIL out of ${total} operations (target: ≤${P90_THRESHOLD}% p90 regression)**" >> "$tmpsum"
+
+    # Storage
+    if [ -f "$RESULTS_DIR/storage.txt" ]; then
+        echo "" >> "$tmpsum"
+        echo "## Storage" >> "$tmpsum"
+        cat "$RESULTS_DIR/storage.txt" >> "$tmpsum"
+    fi
+
+    # FilterRewrite diagnostics
+    if [ -f "$RESULTS_DIR/filterrewrite-parquet.log" ] && [ -s "$RESULTS_DIR/filterrewrite-parquet.log" ]; then
+        echo "" >> "$tmpsum"
+        echo "## FilterRewrite Diagnostics" >> "$tmpsum"
+        echo '```' >> "$tmpsum"
+        tail -30 "$RESULTS_DIR/filterrewrite-parquet.log" >> "$tmpsum"
+        echo '```' >> "$tmpsum"
+    fi
+
+    cat "$tmpsum" | tee "$summary"
+    cp "$summary" "$RESULTS_DIR/search-summary.md"
+    rm -f "$tmpsum"
+
+    log "Summary: $summary"
+    log "Result: ${pass}/${total} PASS, ${fail}/${total} FAIL"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+case "$PHASE" in
+    build)
+        do_build
+        ;;
+    test)
+        do_test
+        ;;
+    bench)
+        do_bench
+        ;;
+    all)
+        do_build
+        do_test
+        do_bench
+        ;;
+    summary)
+        generate_summary
+        ;;
+    *)
+        echo "Usage: $0 <build|test|bench|all|summary> [parquet|baseline|both] [clean|no]"
+        exit 1
+        ;;
+esac
+
+log "Done."

@@ -35,13 +35,47 @@ Any command that may take longer than 2 minutes MUST be run asynchronously. This
 | `./gradlew check` | 15-45 min | `/tmp/check-output.txt` |
 | `./gradlew precommit` | 5-15 min | `/tmp/precommit-output.txt` |
 | `./benchmark-search.sh 5 parquet clean` | 10-20 min | `benchmark-results/parquet-output.txt` |
+| `./benchmark.sh all both clean` | 20-45 min | `benchmark-results/YYYYMMDD_HHMMSS_summary.md` |
+
+### Benchmark Harness
+
+`benchmark.sh` is the unified harness for correctness + performance testing of parquet doc_values.
+
+```bash
+./benchmark.sh <phase> [mode] [clean]
+```
+
+| Phase | What it does | Est. Time |
+|-------|-------------|-----------|
+| `build` | `localDistro -x test` | 1-10 min |
+| `test` | `yamlRestTestParquet` correctness gate — aborts if fails | 3-5 min |
+| `bench` | OSB benchmark (10 iterations, 1 warmup, 5% http_logs) | 15-30 min per mode |
+| `all` | build → test → bench (stops on failure) | 20-45 min |
+| `summary` | Regenerate summary from existing CSVs | instant |
+
+Mode (bench/all only): `parquet` (default), `baseline`, `both`
+Clean (bench/all only): `clean` (wipe data), `no` (reuse, default)
+
+Examples:
+```bash
+./benchmark.sh all both clean    # full pipeline, fresh data, both configs
+./benchmark.sh bench parquet no  # parquet benchmark only, reuse data
+./benchmark.sh test              # correctness check only
+./benchmark.sh summary           # regenerate summary from existing CSVs
+```
+
+Output:
+- `benchmark-results/YYYYMMDD_HHMMSS_summary.md` — pass/fail table (≤10% p90 target)
+- `benchmark-results/search-baseline.csv`, `search-parquet.csv` — raw OSB metrics
+- `benchmark-results/opensearch-parquet.log` — full OpenSearch log
+- `benchmark-results/filterrewrite-parquet.log` — FilterRewrite diagnostic lines
+- `benchmark-results/storage.txt` — index sizes
 
 ### Benchmark-Specific Rules
 
 - Use **5% dataset** for all benchmark runs unless explicitly told otherwise.
 - Always run with `clean` flag when code has changed (re-indexes data).
-- Use `search-only` mode to reuse existing indexed data when only queries changed.
-- Save results to `benchmark-results/{YYYYMMDD}_{HHMMSS}.md` after each run.
+- Save results to `benchmark-results/{YYYYMMDD}_{HHMMSS}_summary.md` after each run.
 - NEVER use shell polling loops with `sleep` inside OpenSearch — use `_cluster/health?wait_for_status=yellow&timeout=60s`.
 
 ## Repository Structure
