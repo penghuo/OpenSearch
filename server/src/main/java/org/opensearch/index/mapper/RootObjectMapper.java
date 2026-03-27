@@ -42,6 +42,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.ToXContent;
@@ -49,6 +50,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.mapper.DynamicTemplate.XContentFieldType;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -70,6 +72,9 @@ import static org.opensearch.index.mapper.TypeParsers.parseDateTimeFormatter;
 @PublicApi(since = "1.0.0")
 public class RootObjectMapper extends ObjectMapper {
     private static final DeprecationLogger DEPRECATION_LOGGER = DeprecationLogger.getLogger(RootObjectMapper.class);
+    private static final ThreadLocal<ByteArrayOutputStream> REUSABLE_BOS = ThreadLocal.withInitial(
+        () -> new ByteArrayOutputStream(512)
+    );
 
     /**
      * Default parameters for root object
@@ -563,18 +568,20 @@ public class RootObjectMapper extends ObjectMapper {
     }
 
     public BytesReference deriveSource(LeafReader leafReader, int docId) throws IOException {
-        XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
-        try {
+        ByteArrayOutputStream bos = REUSABLE_BOS.get();
+        bos.reset();
+        try (XContentBuilder builder = XContentFactory.jsonBuilder(bos)) {
+            builder.startObject();
             Iterator<Mapper> mappers = this.iterator();
             while (mappers.hasNext()) {
                 Mapper mapper = mappers.next();
                 mapper.deriveSource(builder, leafReader, docId);
             }
+            builder.endObject();
+            builder.flush();
+            return new BytesArray(bos.toByteArray());
         } catch (Exception e) {
             throw new OpenSearchException("Failed to derive source for doc id [" + docId + "]", e);
-        } finally {
-            builder.endObject();
         }
-        return BytesReference.bytes(builder);
     }
 }
