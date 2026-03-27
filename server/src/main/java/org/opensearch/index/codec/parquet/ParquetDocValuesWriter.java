@@ -289,9 +289,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeDocIds(docIds);
 
         // Write packed values only for singleton sorted numeric fields
-        long packedValuesOffset = (isSingleton && singletonValues.size() > 0)
-            ? writePackedValues(singletonValues)
-            : -1L;
+        long packedValuesOffset = (isSingleton && singletonValues.size() > 0) ? writePackedValues(singletonValues) : -1L;
 
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 

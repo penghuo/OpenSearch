@@ -10,6 +10,8 @@ package org.opensearch.index.codec.parquet;
 
 import com.github.luben.zstd.Zstd;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
@@ -22,7 +24,6 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
@@ -74,6 +75,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class ParquetDocValuesReader extends DocValuesProducer {
 
+    private static final Logger logger = LogManager.getLogger(ParquetDocValuesReader.class);
     private final IndexInput dataIn;
     private final int version;
     private final Map<String, FieldMeta> fields = new HashMap<>();
@@ -246,6 +248,10 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             this.dataIn = dataInput;
             this.version = dataVersion;
             success = true;
+            // Eagerly warm up all field caches during reader construction.
+            // This moves the Zstd decompression + decode cost from the first query
+            // to segment open, eliminating p90 spikes on first-access lazy decode.
+            warmUp();
         } finally {
             if (success == false) {
                 IOUtils.closeWhileHandlingException(dataInput, metaInput);
@@ -285,6 +291,64 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 )
             );
             fieldName = metaIn.readString();
+        }
+    }
+
+    /**
+     * Eagerly pre-populates all field caches so the first query doesn't pay the full
+     * decode cost (Zstd decompression + array allocation). Errors on individual fields
+     * are silently ignored — they will surface on actual access.
+     */
+    private void warmUp() {
+        for (FieldMeta meta : fields.values()) {
+            try {
+                switch (meta.dvTypeName) {
+                    case "NUMERIC":
+                        computeNumericCache(meta.fieldName, meta);
+                        break;
+                    case "SORTED_NUMERIC":
+                        sortedNumericCache.computeIfAbsent(meta.fieldName, k -> {
+                            try {
+                                return loadSortedNumeric(meta);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+                        break;
+                    case "SORTED":
+                        sortedCache.computeIfAbsent(meta.fieldName, k -> {
+                            try {
+                                return loadSorted(meta);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+                        break;
+                    case "SORTED_SET":
+                        sortedSetCache.computeIfAbsent(meta.fieldName, k -> {
+                            try {
+                                return loadSortedSet(meta);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+                        break;
+                    case "BINARY":
+                        binaryCache.computeIfAbsent(meta.fieldName, k -> {
+                            try {
+                                return loadBinary(meta);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+                        break;
+                    default:
+                        break;
+                }
+            } catch (Exception e) {
+                // Ignore — will be retried on actual access
+                logger.trace("warmUp failed for field {}", meta.fieldName, e);
+            }
         }
     }
 
@@ -459,7 +523,15 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final boolean isDense;
         final int[] docIds;
 
-        BlockPackedData(LongValues values, int numBlocks, long[] blockMinValues, long[] blockMaxValues, int docCount, boolean isDense, int[] docIds) {
+        BlockPackedData(
+            LongValues values,
+            int numBlocks,
+            long[] blockMinValues,
+            long[] blockMaxValues,
+            int docCount,
+            boolean isDense,
+            int[] docIds
+        ) {
             this.values = values;
             this.numBlocks = numBlocks;
             this.blockMinValues = blockMinValues;
@@ -599,46 +671,34 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
         long blockDataStart = packedValuesOffset + 4 + (long) bytesPerBlock * numBlocks;
 
-        // Pre-create DirectReader instances per block (cached for O(1) access)
-        final LongValues[] blockReaders = new LongValues[numBlocks];
+        // Decode all block-packed values into a flat long[] to eliminate per-doc virtual dispatch.
+        // The 3-level indirection (blockReaders[blockIdx].get() → DirectReader.get()) adds ~5-10ns
+        // per doc; for 12M docs in a force-merged segment this is 60-120ms overhead.
+        // Memory cost: docCount * 8 bytes (e.g. 12M docs = 96MB), cached per-segment per-field.
+        final long[] decodedValues = new long[docCount];
         for (int b = 0; b < numBlocks; b++) {
+            int blockStart = b << ParquetDocValuesWriter.BLOCK_SHIFT;
+            int blockEnd = Math.min(blockStart + ParquetDocValuesWriter.BLOCK_SIZE, docCount);
+            int blockCount = blockEnd - blockStart;
             int bpv = blockBitsPerValue[b];
             if (bpv == 0) {
-                // All values in this block are identical
-                final long constValue = blockMinValues[b];
-                blockReaders[b] = new LongValues() {
-                    @Override
-                    public long get(long index) {
-                        return constValue;
-                    }
-                };
+                java.util.Arrays.fill(decodedValues, blockStart, blockEnd, blockMinValues[b]);
             } else {
-                int blockStart = b << ParquetDocValuesWriter.BLOCK_SHIFT;
-                int blockEnd = Math.min(blockStart + ParquetDocValuesWriter.BLOCK_SIZE, docCount);
-                int blockCount = blockEnd - blockStart;
                 long dataOffset = blockDataStart + blockOffsets[b];
                 long dataLength = DirectWriter.bytesRequired(blockCount, bpv);
                 RandomAccessInput rai = threadSafeRandomAccess(dataOffset, dataLength);
                 LongValues packed = DirectReader.getInstance(rai, bpv);
-                final long minVal = blockMinValues[b];
-                final long gcd = blockGcds[b];
-                blockReaders[b] = new LongValues() {
-                    @Override
-                    public long get(long index) {
-                        return minVal + packed.get(index) * gcd;
-                    }
-                };
+                long minVal = blockMinValues[b];
+                long gcd = blockGcds[b];
+                for (int i = 0; i < blockCount; i++) {
+                    decodedValues[blockStart + i] = minVal + packed.get(i) * gcd;
+                }
             }
         }
-
-        final int blockShift = ParquetDocValuesWriter.BLOCK_SHIFT;
-        final int blockMask = ParquetDocValuesWriter.BLOCK_SIZE - 1;
         LongValues longValues = new LongValues() {
             @Override
             public long get(long index) {
-                int blockIdx = (int) (index >> blockShift);
-                int inBlockIdx = (int) (index & blockMask);
-                return blockReaders[blockIdx].get(inBlockIdx);
+                return decodedValues[(int) index];
             }
         };
         return new BlockPackedData(longValues, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds);
@@ -685,23 +745,15 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         @Override
         public int readInt(long pos) {
             int p = (int) pos;
-            return (data[p] & 0xFF)
-                | (data[p + 1] & 0xFF) << 8
-                | (data[p + 2] & 0xFF) << 16
-                | (data[p + 3] & 0xFF) << 24;
+            return (data[p] & 0xFF) | (data[p + 1] & 0xFF) << 8 | (data[p + 2] & 0xFF) << 16 | (data[p + 3] & 0xFF) << 24;
         }
 
         @Override
         public long readLong(long pos) {
             int p = (int) pos;
-            return ((long) (data[p] & 0xFF))
-                | ((long) (data[p + 1] & 0xFF) << 8)
-                | ((long) (data[p + 2] & 0xFF) << 16)
-                | ((long) (data[p + 3] & 0xFF) << 24)
-                | ((long) (data[p + 4] & 0xFF) << 32)
-                | ((long) (data[p + 5] & 0xFF) << 40)
-                | ((long) (data[p + 6] & 0xFF) << 48)
-                | ((long) (data[p + 7] & 0xFF) << 56);
+            return ((long) (data[p] & 0xFF)) | ((long) (data[p + 1] & 0xFF) << 8) | ((long) (data[p + 2] & 0xFF) << 16) | ((long) (data[p
+                + 3] & 0xFF) << 24) | ((long) (data[p + 4] & 0xFF) << 32) | ((long) (data[p + 5] & 0xFF) << 40) | ((long) (data[p + 6]
+                    & 0xFF) << 48) | ((long) (data[p + 7] & 0xFF) << 56);
         }
     }
 

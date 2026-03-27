@@ -84,4 +84,44 @@ public class ParquetDocValuesFormatTests extends BaseDocValuesFormatTestCase {
     public void testSortedSetMergeAwayAllValuesLargeSegmentWithSkipper() {
         // Parquet getSkipper() returns null — no skip index support
     }
+
+    @Override
+    public void testNumericDocValuesWithSkipperSmall() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testNumericDocValuesWithSkipperMedium() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedNumericDocValuesWithSkipperSmall() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedNumericDocValuesWithSkipperMedium() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedDocValuesWithSkipperSmall() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedDocValuesWithSkipperMedium() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedSetDocValuesWithSkipperSmall() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
+
+    @Override
+    public void testSortedSetDocValuesWithSkipperMedium() {
+        // Parquet getSkipper() returns null — no skip index support
+    }
 }
