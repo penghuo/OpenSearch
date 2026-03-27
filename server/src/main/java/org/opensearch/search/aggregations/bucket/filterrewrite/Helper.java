@@ -78,7 +78,7 @@ final class Helper {
     private static long[] getShardBounds(final List<LeafReaderContext> leaves, final String fieldName) throws IOException {
         long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
         for (LeafReaderContext leaf : leaves) {
-            final PointValues values = leaf.reader().getPointValues(fieldName);
+            PointValues values = leaf.reader().getPointValues(fieldName);
             if (values != null) {
                 min = Math.min(min, NumericUtils.sortableBytesToLong(values.getMinPackedValue(), 0));
                 max = Math.max(max, NumericUtils.sortableBytesToLong(values.getMaxPackedValue(), 0));
@@ -98,7 +98,7 @@ final class Helper {
      */
     static long[] getSegmentBounds(final LeafReaderContext context, final String fieldName) throws IOException {
         long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
-        final PointValues values = context.reader().getPointValues(fieldName);
+        PointValues values = context.reader().getPointValues(fieldName);
         if (values != null) {
             min = Math.min(min, NumericUtils.sortableBytesToLong(values.getMinPackedValue(), 0));
             max = Math.max(max, NumericUtils.sortableBytesToLong(values.getMaxPackedValue(), 0));

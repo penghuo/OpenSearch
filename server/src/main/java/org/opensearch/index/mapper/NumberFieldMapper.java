@@ -1988,8 +1988,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
             // When parquet doc_values are enabled and the field is indexed, skip the doc_values
             // query path. Parquet doc_values lack efficient skip data, making the doc_values path in
             // IndexOrDocValuesQuery much slower than the point index path.
-            boolean effectiveHasDocValues = hasDocValues()
-                && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
+            boolean effectiveHasDocValues = hasDocValues() && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
             Query query = type.termQuery(name(), value, effectiveHasDocValues, isSearchable());
             if (boost() != 1f) {
                 query = new BoostQuery(query, boost());
@@ -2000,8 +1999,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query termsQuery(List values, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
-            boolean effectiveHasDocValues = hasDocValues()
-                && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
+            boolean effectiveHasDocValues = hasDocValues() && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
             Query query = type.termsQuery(name(), values, effectiveHasDocValues, isSearchable());
             if (boost() != 1f) {
                 query = new BoostQuery(query, boost());
@@ -2017,8 +2015,7 @@ public class NumberFieldMapper extends ParametrizedFieldMapper {
         @Override
         public Query rangeQuery(Object lowerTerm, Object upperTerm, boolean includeLower, boolean includeUpper, QueryShardContext context) {
             failIfNotIndexedAndNoDocValues();
-            boolean effectiveHasDocValues = hasDocValues()
-                && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
+            boolean effectiveHasDocValues = hasDocValues() && !(isSearchable() && context.getIndexSettings().isParquetDocValuesEnabled());
             Query query = type.rangeQuery(
                 name(),
                 lowerTerm,
