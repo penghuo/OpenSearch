@@ -57,6 +57,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /**
  * Reads Lucene doc values from Parquet-encoded {@code .pdvd}/{@code .pdvm} files
@@ -522,6 +523,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final int docCount;
         final boolean isDense;
         final int[] docIds;
+        // Lazy decode metadata
+        final long[] blockOffsets;
+        final long[] blockGcds;
+        final int[] blockBitsPerValue;
+        final long blockDataStart;
+        final IndexInput dataIn;
 
         BlockPackedData(
             LongValues values,
@@ -532,6 +539,23 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             boolean isDense,
             int[] docIds
         ) {
+            this(values, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds, null, null, null, 0, null);
+        }
+
+        BlockPackedData(
+            LongValues values,
+            int numBlocks,
+            long[] blockMinValues,
+            long[] blockMaxValues,
+            int docCount,
+            boolean isDense,
+            int[] docIds,
+            long[] blockOffsets,
+            long[] blockGcds,
+            int[] blockBitsPerValue,
+            long blockDataStart,
+            IndexInput dataIn
+        ) {
             this.values = values;
             this.numBlocks = numBlocks;
             this.blockMinValues = blockMinValues;
@@ -539,6 +563,11 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             this.docCount = docCount;
             this.isDense = isDense;
             this.docIds = docIds;
+            this.blockOffsets = blockOffsets;
+            this.blockGcds = blockGcds;
+            this.blockBitsPerValue = blockBitsPerValue;
+            this.blockDataStart = blockDataStart;
+            this.dataIn = dataIn;
         }
     }
 
@@ -671,37 +700,64 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
         long blockDataStart = packedValuesOffset + 4 + (long) bytesPerBlock * numBlocks;
 
-        // Decode all block-packed values into a flat long[] to eliminate per-doc virtual dispatch.
-        // The 3-level indirection (blockReaders[blockIdx].get() → DirectReader.get()) adds ~5-10ns
-        // per doc; for 12M docs in a force-merged segment this is 60-120ms overhead.
-        // Memory cost: docCount * 8 bytes (e.g. 12M docs = 96MB), cached per-segment per-field.
-        final long[] decodedValues = new long[docCount];
-        for (int b = 0; b < numBlocks; b++) {
-            int blockStart = b << ParquetDocValuesWriter.BLOCK_SHIFT;
-            int blockEnd = Math.min(blockStart + ParquetDocValuesWriter.BLOCK_SIZE, docCount);
-            int blockCount = blockEnd - blockStart;
-            int bpv = blockBitsPerValue[b];
-            if (bpv == 0) {
-                java.util.Arrays.fill(decodedValues, blockStart, blockEnd, blockMinValues[b]);
-            } else {
-                long dataOffset = blockDataStart + blockOffsets[b];
-                long dataLength = DirectWriter.bytesRequired(blockCount, bpv);
-                RandomAccessInput rai = threadSafeRandomAccess(dataOffset, dataLength);
-                LongValues packed = DirectReader.getInstance(rai, bpv);
-                long minVal = blockMinValues[b];
-                long gcd = blockGcds[b];
-                for (int i = 0; i < blockCount; i++) {
-                    decodedValues[blockStart + i] = minVal + packed.get(i) * gcd;
-                }
-            }
-        }
+        // Lazy per-block decode: only decode a block when first accessed.
+        // AtomicReferenceArray provides lock-free per-block caching — if two threads race
+        // to decode the same block, one wins the CAS and the other's result is GC'd.
+        // dataIn.randomAccessSlice() is thread-safe (positional reads, no mutable cursor).
+        final AtomicReferenceArray<long[]> decodedBlocks = new AtomicReferenceArray<>(numBlocks);
+        final long[] finalBlockOffsets = blockOffsets;
+        final long[] finalBlockMinValues = blockMinValues;
+        final long[] finalBlockGcds = blockGcds;
+        final int[] finalBlockBpv = blockBitsPerValue;
+        final long finalBlockDataStart = blockDataStart;
+        final int finalDocCount = docCount;
+        final IndexInput finalDataIn = dataIn;
+
         LongValues longValues = new LongValues() {
             @Override
             public long get(long index) {
-                return decodedValues[(int) index];
+                int idx = (int) index;
+                int blockIdx = idx >>> ParquetDocValuesWriter.BLOCK_SHIFT;
+                long[] block = decodedBlocks.get(blockIdx);
+                if (block == null) {
+                    block = decodeBlock(blockIdx);
+                    decodedBlocks.compareAndSet(blockIdx, null, block);
+                    block = decodedBlocks.get(blockIdx);
+                }
+                int offsetInBlock = idx & (ParquetDocValuesWriter.BLOCK_SIZE - 1);
+                return block[offsetInBlock];
+            }
+
+            private long[] decodeBlock(int b) {
+                int blockStart = b << ParquetDocValuesWriter.BLOCK_SHIFT;
+                int blockEnd = Math.min(blockStart + ParquetDocValuesWriter.BLOCK_SIZE, finalDocCount);
+                int blockCount = blockEnd - blockStart;
+                long[] block = new long[blockCount];
+                int bpv = finalBlockBpv[b];
+                if (bpv == 0) {
+                    java.util.Arrays.fill(block, 0, blockCount, finalBlockMinValues[b]);
+                } else {
+                    try {
+                        long dataOffset = finalBlockDataStart + finalBlockOffsets[b];
+                        long dataLength = DirectWriter.bytesRequired(blockCount, bpv);
+                        RandomAccessInput rai = finalDataIn.randomAccessSlice(dataOffset, dataLength);
+                        LongValues packed = DirectReader.getInstance(rai, bpv);
+                        long minVal = finalBlockMinValues[b];
+                        long gcd = finalBlockGcds[b];
+                        for (int i = 0; i < blockCount; i++) {
+                            block[i] = minVal + packed.get(i) * gcd;
+                        }
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                }
+                return block;
             }
         };
-        return new BlockPackedData(longValues, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds);
+        return new BlockPackedData(
+            longValues, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds,
+            blockOffsets, blockGcds, blockBitsPerValue, blockDataStart, dataIn
+        );
     }
 
     /**
