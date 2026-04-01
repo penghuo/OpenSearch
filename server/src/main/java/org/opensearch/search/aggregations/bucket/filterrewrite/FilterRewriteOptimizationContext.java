@@ -14,6 +14,11 @@ import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.Weight;
 import org.apache.lucene.util.DocIdSetBuilder;
 import org.opensearch.index.mapper.DocCountFieldMapper;
 import org.opensearch.search.aggregations.BucketCollector;
@@ -40,6 +45,7 @@ public final class FilterRewriteOptimizationContext {
     private boolean preparedAtShardLevel = false;
 
     private final AggregatorBridge aggregatorBridge;
+    private final SearchContext searchContext;
     private String shardId;
 
     private Ranges ranges; // built at shard level
@@ -61,6 +67,7 @@ public final class FilterRewriteOptimizationContext {
         SearchContext context
     ) throws IOException {
         this.aggregatorBridge = aggregatorBridge;
+        this.searchContext = context;
         this.canOptimize = this.canOptimize(parent, subAggLength, context);
     }
 
@@ -69,9 +76,13 @@ public final class FilterRewriteOptimizationContext {
      * if the aggregation has any special logic, it should be done using {@link AggregatorBridge}
      */
     private boolean canOptimize(final Object parent, final int subAggLength, SearchContext context) throws IOException {
-        if (context.maxAggRewriteFilters() == 0) return false;
+        if (context.maxAggRewriteFilters() == 0) {
+            return false;
+        }
 
-        if (parent != null) return false;
+        if (parent != null) {
+            return false;
+        }
         this.hasSubAgg = subAggLength > 0;
 
         boolean canOptimize = aggregatorBridge.canOptimize();
@@ -117,12 +128,19 @@ public final class FilterRewriteOptimizationContext {
 
         // Since we explicitly create bitset of matching docIds for each bucket
         // in case of sub-aggregations, deleted documents can be filtered out
-        if (leafCtx.reader().hasDeletions() && hasSubAgg == false) return false;
+        if (leafCtx.reader().hasDeletions() && hasSubAgg == false) {
+            return false;
+        }
 
         PointValues values = leafCtx.reader().getPointValues(aggregatorBridge.fieldType.name());
-        if (values == null) return false;
+        if (values == null) {
+            // Fallback to SortedNumericDocValues when PointValues are not available (e.g. Parquet segments)
+            return tryOptimizeWithDocValues(leafCtx, incrementDocCount, segmentMatchAll);
+        }
         // only proceed if every document corresponds to exactly one point
-        if (values.getDocCount() != values.size()) return false;
+        if (values.getDocCount() != values.size()) {
+            return false;
+        }
 
         NumericDocValues docCountValues = DocValues.getNumeric(leafCtx.reader(), DocCountFieldMapper.NAME);
         if (docCountValues.nextDoc() != NO_MORE_DOCS) {
@@ -135,7 +153,13 @@ public final class FilterRewriteOptimizationContext {
         }
 
         Ranges ranges = getRanges(leafCtx, segmentMatchAll);
-        if (ranges == null) return false;
+        if (ranges == null) {
+            // For filtered queries, fall through to DV-based path which can build ranges from segment bounds
+            if (!segmentMatchAll) {
+                return tryOptimizeWithDocValues(leafCtx, incrementDocCount, segmentMatchAll);
+            }
+            return false;
+        }
 
         if (hasSubAgg && this.segmentThreshold > leafCtx.reader().maxDoc() / ranges.getSize()) {
             // comparing with a rough estimate of docs per range in this segment
@@ -168,6 +192,77 @@ public final class FilterRewriteOptimizationContext {
      * Parameters for {@link org.opensearch.search.aggregations.bucket.filterrewrite.rangecollector.SubAggRangeCollector}
      */
     public record SubAggCollectorParam(BucketCollector collectableSubAggregators, LeafReaderContext leafCtx) {
+    }
+
+    /**
+     * Fallback optimization path using SortedNumericDocValues when PointValues are not available.
+     * This enables the FilterRewrite optimization for segments without BKD trees (e.g. Parquet segments).
+     */
+    private boolean tryOptimizeWithDocValues(
+        final LeafReaderContext leafCtx,
+        final BiConsumer<Long, Long> incrementDocCount,
+        boolean segmentMatchAll
+    ) throws IOException {
+        SortedNumericDocValues dvs = DocValues.getSortedNumeric(leafCtx.reader(), aggregatorBridge.fieldType.name());
+        if (dvs.nextDoc() == NO_MORE_DOCS) {
+            return false;
+        }
+
+        NumericDocValues docCountValues = DocValues.getNumeric(leafCtx.reader(), DocCountFieldMapper.NAME);
+        if (docCountValues.nextDoc() != NO_MORE_DOCS) {
+            logger.debug(
+                "Shard {} segment {} has at least one document with _doc_count field, skip fast filter optimization (doc_values path)",
+                shardId,
+                leafCtx.ord
+            );
+            return false;
+        }
+
+        Ranges ranges = getRanges(leafCtx, segmentMatchAll);
+        if (ranges == null && !segmentMatchAll) {
+            // For filtered queries on segments without PointValues, build ranges from segment bounds
+            try {
+                ranges = aggregatorBridge.tryBuildRangesFromSegment(leafCtx);
+            } catch (IOException e) {
+                logger.warn("Failed to build ranges from segment for filtered query.", e);
+                return false;
+            }
+        }
+        if (ranges == null) {
+            return false;
+        }
+
+        // Re-obtain a fresh SortedNumericDocValues iterator since we consumed one doc above
+        dvs = DocValues.getSortedNumeric(leafCtx.reader(), aggregatorBridge.fieldType.name());
+
+        OptimizeResult optimizeResult;
+        try {
+            if (segmentMatchAll) {
+                optimizeResult = aggregatorBridge.tryOptimizeWithDocValues(dvs, incrementDocCount, ranges);
+            } else {
+                // For filtered queries, get matching docs and do filter-aware DV scan
+                Weight weight = searchContext.query().rewrite(searchContext.searcher())
+                    .createWeight(searchContext.searcher(), ScoreMode.COMPLETE_NO_SCORES, 1f);
+                Scorer scorer = weight.scorer(leafCtx);
+                if (scorer == null) {
+                    return false;
+                }
+                DocIdSetIterator matchingDocs = scorer.iterator();
+                optimizeResult = aggregatorBridge.tryOptimizeWithDocValues(dvs, incrementDocCount, ranges, matchingDocs);
+            }
+            if (optimizeResult == null) {
+                return false;
+            }
+            consumeDebugInfo(optimizeResult);
+        } catch (AbortFilterRewriteOptimizationException e) {
+            logger.error("Abort filter rewrite optimization (doc_values path), fall back to default path");
+            return false;
+        }
+
+        optimizedSegments.incrementAndGet();
+        logger.debug("Fast filter optimization (doc_values path) applied to shard {} segment {}", shardId, leafCtx.ord);
+
+        return true;
     }
 
     static class AbortFilterRewriteOptimizationException extends RuntimeException {

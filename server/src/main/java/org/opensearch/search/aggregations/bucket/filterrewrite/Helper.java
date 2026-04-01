@@ -10,8 +10,10 @@ package org.opensearch.search.aggregations.bucket.filterrewrite;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
@@ -32,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
+import static org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS;
 import static org.opensearch.index.mapper.NumberFieldMapper.NumberType.LONG;
 
 /**
@@ -85,6 +88,17 @@ final class Helper {
             }
         }
 
+        // Fallback to SortedNumericDocValues when PointValues are not available (e.g. Parquet segments)
+        if (min == Long.MAX_VALUE || max == Long.MIN_VALUE) {
+            for (LeafReaderContext leaf : leaves) {
+                long[] dvBounds = getBoundsFromDocValues(leaf, fieldName);
+                if (dvBounds != null) {
+                    min = Math.min(min, dvBounds[0]);
+                    max = Math.max(max, dvBounds[1]);
+                }
+            }
+        }
+
         if (min == Long.MAX_VALUE || max == Long.MIN_VALUE) {
             return null;
         }
@@ -104,6 +118,38 @@ final class Helper {
             max = Math.max(max, NumericUtils.sortableBytesToLong(values.getMaxPackedValue(), 0));
         }
 
+        // Fallback to SortedNumericDocValues when PointValues are not available (e.g. Parquet segments)
+        if (min == Long.MAX_VALUE || max == Long.MIN_VALUE) {
+            long[] dvBounds = getBoundsFromDocValues(context, fieldName);
+            if (dvBounds != null) {
+                min = dvBounds[0];
+                max = dvBounds[1];
+            }
+        }
+
+        if (min == Long.MAX_VALUE || max == Long.MIN_VALUE) {
+            return null;
+        }
+        return new long[] { min, max };
+    }
+
+    /**
+     * Extracts min/max bounds from SortedNumericDocValues by iterating all docs.
+     * Used as fallback when PointValues are not available.
+     *
+     * @return [min, max] or null if no docs
+     */
+    private static long[] getBoundsFromDocValues(final LeafReaderContext context, final String fieldName) throws IOException {
+        SortedNumericDocValues dv = DocValues.getSortedNumeric(context.reader(), fieldName);
+        long min = Long.MAX_VALUE, max = Long.MIN_VALUE;
+        while (dv.nextDoc() != NO_MORE_DOCS) {
+            int count = dv.docValueCount();
+            for (int i = 0; i < count; i++) {
+                long val = dv.nextValue();
+                min = Math.min(min, val);
+                max = Math.max(max, val);
+            }
+        }
         if (min == Long.MAX_VALUE || max == Long.MIN_VALUE) {
             return null;
         }

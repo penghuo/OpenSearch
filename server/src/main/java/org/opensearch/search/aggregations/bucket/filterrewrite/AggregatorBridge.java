@@ -12,6 +12,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Weight;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -95,6 +97,33 @@ public abstract class AggregatorBridge {
         Ranges ranges,
         FilterRewriteOptimizationContext.SubAggCollectorParam subAggCollectorParam
     ) throws IOException;
+
+    /**
+     * Attempts to build aggregation results for a segment using SortedNumericDocValues
+     * when PointValues are not available (e.g. Parquet segments).
+     * Default implementation returns null (unsupported). Subclasses can override.
+     */
+    FilterRewriteOptimizationContext.OptimizeResult tryOptimizeWithDocValues(
+        SortedNumericDocValues dvs,
+        BiConsumer<Long, Long> incrementDocCount,
+        Ranges ranges
+    ) throws IOException {
+        return null;
+    }
+
+    /**
+     * Filter-aware variant of tryOptimizeWithDocValues.
+     * Only counts docs that appear in matchingDocs iterator.
+     * Default implementation returns null (unsupported). Subclasses can override.
+     */
+    FilterRewriteOptimizationContext.OptimizeResult tryOptimizeWithDocValues(
+        SortedNumericDocValues dvs,
+        BiConsumer<Long, Long> incrementDocCount,
+        Ranges ranges,
+        DocIdSetIterator matchingDocs
+    ) throws IOException {
+        return null;
+    }
 
     static FilterRewriteOptimizationContext.OptimizeResult getResult(
         PointValues values,

@@ -11,6 +11,9 @@ package org.opensearch.search.aggregations.bucket.filterrewrite;
 import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.NumericUtils;
 import org.opensearch.common.Rounding;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -150,6 +153,195 @@ public abstract class DateHistogramAggregatorBridge extends AggregatorBridge {
         };
 
         return getResult(values, incrementDocCount, ranges, getBucketOrd, size, subAggCollectorParam);
+    }
+
+    @Override
+    final FilterRewriteOptimizationContext.OptimizeResult tryOptimizeWithDocValues(
+        SortedNumericDocValues dvs,
+        BiConsumer<Long, Long> incrementDocCount,
+        Ranges ranges
+    ) throws IOException {
+        DateFieldMapper.DateFieldType fieldType = getFieldType();
+        int rangeSize = ranges.getSize();
+        long[] counts = new long[rangeSize];
+
+        // Decode range boundaries to longs for efficient comparison
+        long[] lowerVals = new long[rangeSize];
+        long[] upperVals = new long[rangeSize];
+        for (int i = 0; i < rangeSize; i++) {
+            lowerVals[i] = NumericUtils.sortableBytesToLong(ranges.lowers[i], 0);
+            upperVals[i] = NumericUtils.sortableBytesToLong(ranges.uppers[i], 0);
+        }
+
+        // Check if ranges have uniform interval for O(1) bucket computation
+        long interval = upperVals[0] - lowerVals[0];
+        boolean uniformInterval = interval > 0;
+        for (int i = 1; i < rangeSize && uniformInterval; i++) {
+            if (upperVals[i] - lowerVals[i] != interval || lowerVals[i] != upperVals[i - 1]) {
+                uniformInterval = false;
+            }
+        }
+
+        final long rangeMin = lowerVals[0];
+        final long rangeMax = upperVals[rangeSize - 1];
+
+        // Linear scan: iterate all docs and bucket each value
+        while (dvs.nextDoc() != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+            for (int i = 0; i < dvs.docValueCount(); i++) {
+                long val = dvs.nextValue();
+                if (uniformInterval) {
+                    // O(1) direct computation for uniform-interval date histograms
+                    if (val >= rangeMin && val < rangeMax) {
+                        int idx = (int) ((val - rangeMin) / interval);
+                        if (idx >= 0 && idx < rangeSize) {
+                            counts[idx]++;
+                        }
+                    }
+                } else {
+                    // Binary search for the matching range: ranges are sorted, [lower, upper)
+                    int lo = 0, hi = rangeSize - 1;
+                    while (lo <= hi) {
+                        int mid = (lo + hi) >>> 1;
+                        if (val < lowerVals[mid]) {
+                            hi = mid - 1;
+                        } else if (val >= upperVals[mid]) {
+                            lo = mid + 1;
+                        } else {
+                            counts[mid]++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emit counts via incrementDocCount
+        for (int i = 0; i < rangeSize; i++) {
+            if (counts[i] > 0) {
+                long rangeStart = LongPoint.decodeDimension(ranges.lowers[i], 0);
+                rangeStart = fieldType.convertNanosToMillis(rangeStart);
+                long bucketOrd = getBucketOrd(bucketOrdProducer().apply(rangeStart));
+                incrementDocCount.accept(bucketOrd, counts[i]);
+            }
+        }
+
+        return new FilterRewriteOptimizationContext.OptimizeResult();
+    }
+
+    @Override
+    final FilterRewriteOptimizationContext.OptimizeResult tryOptimizeWithDocValues(
+        SortedNumericDocValues dvs,
+        BiConsumer<Long, Long> incrementDocCount,
+        Ranges ranges,
+        DocIdSetIterator matchingDocs
+    ) throws IOException {
+        DateFieldMapper.DateFieldType fieldType = getFieldType();
+        int rangeSize = ranges.getSize();
+        long[] counts = new long[rangeSize];
+
+        // Decode range boundaries to longs for efficient comparison
+        long[] lowerVals = new long[rangeSize];
+        long[] upperVals = new long[rangeSize];
+        for (int i = 0; i < rangeSize; i++) {
+            lowerVals[i] = NumericUtils.sortableBytesToLong(ranges.lowers[i], 0);
+            upperVals[i] = NumericUtils.sortableBytesToLong(ranges.uppers[i], 0);
+        }
+
+        // Check if ranges have uniform interval for O(1) bucket computation
+        long interval = upperVals[0] - lowerVals[0];
+        boolean uniformInterval = interval > 0;
+        for (int i = 1; i < rangeSize && uniformInterval; i++) {
+            if (upperVals[i] - lowerVals[i] != interval || lowerVals[i] != upperVals[i - 1]) {
+                uniformInterval = false;
+            }
+        }
+
+        final long rangeMin = lowerVals[0];
+        final long rangeMax = upperVals[rangeSize - 1];
+
+        // Selectivity-based path: when filter matches >50% of docs, linear DV scan
+        // with filter check is faster than random-access advanceExact per matching doc.
+        long filterCost = matchingDocs.cost();
+        long dvCost = dvs.cost();
+        if (filterCost > dvCost / 2) {
+            // High selectivity: linear DV scan, skip non-matching docs via advance on matchingDocs
+            int filterDoc = matchingDocs.nextDoc();
+            while (dvs.nextDoc() != DocIdSetIterator.NO_MORE_DOCS) {
+                int dvDoc = dvs.docID();
+                // Advance filter iterator to catch up with DV iterator
+                while (filterDoc < dvDoc) {
+                    filterDoc = matchingDocs.nextDoc();
+                }
+                if (filterDoc != dvDoc) continue;
+                for (int i = 0; i < dvs.docValueCount(); i++) {
+                    long val = dvs.nextValue();
+                    if (uniformInterval) {
+                        if (val >= rangeMin && val < rangeMax) {
+                            int idx = (int) ((val - rangeMin) / interval);
+                            if (idx >= 0 && idx < rangeSize) {
+                                counts[idx]++;
+                            }
+                        }
+                    } else {
+                        int lo = 0, hi = rangeSize - 1;
+                        while (lo <= hi) {
+                            int mid = (lo + hi) >>> 1;
+                            if (val < lowerVals[mid]) {
+                                hi = mid - 1;
+                            } else if (val >= upperVals[mid]) {
+                                lo = mid + 1;
+                            } else {
+                                counts[mid]++;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Low selectivity: iterate matching docs, random-access DV via advanceExact
+            int doc;
+            while ((doc = matchingDocs.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                if (dvs.advanceExact(doc)) {
+                    for (int i = 0; i < dvs.docValueCount(); i++) {
+                        long val = dvs.nextValue();
+                        if (uniformInterval) {
+                            if (val >= rangeMin && val < rangeMax) {
+                                int idx = (int) ((val - rangeMin) / interval);
+                                if (idx >= 0 && idx < rangeSize) {
+                                    counts[idx]++;
+                                }
+                            }
+                        } else {
+                            int lo = 0, hi = rangeSize - 1;
+                            while (lo <= hi) {
+                                int mid = (lo + hi) >>> 1;
+                                if (val < lowerVals[mid]) {
+                                    hi = mid - 1;
+                                } else if (val >= upperVals[mid]) {
+                                    lo = mid + 1;
+                                } else {
+                                    counts[mid]++;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emit counts via incrementDocCount
+        for (int i = 0; i < rangeSize; i++) {
+            if (counts[i] > 0) {
+                long rangeStart = LongPoint.decodeDimension(ranges.lowers[i], 0);
+                rangeStart = fieldType.convertNanosToMillis(rangeStart);
+                long bucketOrd = getBucketOrd(bucketOrdProducer().apply(rangeStart));
+                incrementDocCount.accept(bucketOrd, counts[i]);
+            }
+        }
+
+        return new FilterRewriteOptimizationContext.OptimizeResult();
     }
 
     private static long getBucketOrd(long bucketOrd) {
