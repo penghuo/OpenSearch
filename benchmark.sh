@@ -32,7 +32,7 @@ REPO_ROOT="/local/home/penghuo/oss/OpenSearch"
 OS_HOME="$REPO_ROOT/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
 RESULTS_DIR="$REPO_ROOT/benchmark-results"
 JAVA_HOME="/usr/lib/jvm/java-21-amazon-corretto"
-INGEST_PCT=5
+INGEST_PCT=100
 ITERATIONS=10
 WARMUP=1
 P90_THRESHOLD=10  # percent
@@ -175,7 +175,7 @@ run_mode() {
     rm -f "$RESULTS_DIR/$csv_file"
     start_opensearch
     osb_run "search-$tag" "$RESULTS_DIR/$params_file" "$csv_file" "$extra_osb_args"
-    if [ "$tag" = "parquet" ]; then measure_storage; fi
+    measure_storage "$tag"
     stop_opensearch "$tag"
 }
 
@@ -204,10 +204,11 @@ PARAMS
 
 # ── Storage measurement ──────────────────────────────────────────────────────
 measure_storage() {
+    local tag="${1:-unknown}"
     log "Measuring index storage..."
     local stats
     stats=$(curl -s 'localhost:9200/_cat/indices?h=index,store.size&bytes=b' 2>/dev/null) || true
-    echo "$stats" > "$RESULTS_DIR/storage.txt"
+    echo "$stats" > "$RESULTS_DIR/storage-${tag}.txt"
     log "Storage:"
     echo "$stats"
 }

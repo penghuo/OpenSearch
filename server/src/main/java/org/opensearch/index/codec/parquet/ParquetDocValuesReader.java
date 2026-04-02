@@ -823,7 +823,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 if (version >= ParquetDocValuesWriter.VERSION_BLOCK_PACKED) {
                     BlockPackedData bpd = loadBlockPackedData(docIdData.endOffset, docIdData.docCount, docIdData.isDense, docIdData.docIds);
                     skipperCache.putIfAbsent(meta.fieldName, bpd);
-                    bpd.materialize();
                     packedValues = bpd.values;
                 } else {
                     packedValues = loadPackedValues(docIdData.endOffset, docIdData.docCount);
@@ -1469,7 +1468,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 if (version >= ParquetDocValuesWriter.VERSION_BLOCK_PACKED) {
                     BlockPackedData bpd = loadBlockPackedData(docIdData.endOffset, docIdData.docCount, docIdData.isDense, docIdData.docIds);
                     skipperCache.putIfAbsent(meta.fieldName, bpd);
-                    bpd.materialize();
                     packedValues = bpd.values;
                 } else {
                     packedValues = loadPackedValues(docIdData.endOffset, docIdData.docCount);
