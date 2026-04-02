@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ── Parquet benchmark harness ────────────────────────────────────────────────
-# Usage: ./benchmark.sh <phase> [mode] [clean]
+# Usage: ./benchmark.sh <phase> [mode] [clean] [workload]
 #
 # Phases:
 #   build    — build localDistro
 #   test     — run yamlRestTestParquet (correctness gate)
-#   bench    — run OSB benchmark (10 iterations, 1 warmup)
+#   bench    — run OSB benchmark
 #   all      — build → test → bench (stops on failure)
 #
 # Mode (bench phase only):
@@ -19,11 +19,14 @@ set -euo pipefail
 #   clean    — wipe data before indexing
 #   no       — reuse existing data (default)
 #
+# Workload (bench phase only):
+#   http_log       — full http_logs benchmark (16 multi-seg + 4 force-merged) (default)
+#   http_log_basic — skip force-merge and post-merge queries (16 queries only)
+#
 # Examples:
-#   ./benchmark.sh all both clean    # full pipeline, both configs, fresh data
-#   ./benchmark.sh bench parquet no  # benchmark only, reuse data
-#   ./benchmark.sh test              # correctness check only
-#   ./benchmark.sh build             # build only
+#   ./benchmark.sh all both clean              # full pipeline, all 20 queries
+#   ./benchmark.sh bench both clean http_log_basic  # skip force-merge, 16 queries
+#   ./benchmark.sh test                        # correctness check only
 
 REPO_ROOT="/local/home/penghuo/oss/OpenSearch"
 OS_HOME="$REPO_ROOT/build/distribution/local/opensearch-3.6.0-SNAPSHOT"
@@ -37,6 +40,10 @@ P90_THRESHOLD=10  # percent
 PHASE="${1:-all}"
 MODE="${2:-parquet}"
 CLEAN="${3:-no}"
+WORKLOAD="${4:-http_log}"
+
+# Tasks to exclude for http_log_basic (skip force-merge and post-merge queries)
+EXCLUDE_TASKS_BASIC="force-merge-1-seg,refresh-after-force-merge-1-seg,wait-until-merges-1-seg-finish,desc-sort-timestamp-after-force-merge-1-seg,asc-sort-timestamp-after-force-merge-1-seg,desc-sort-with-after-timestamp-after-force-merge-1-seg,asc-sort-with-after-timestamp-after-force-merge-1-seg"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -125,7 +132,7 @@ stop_opensearch() {
 
 # ── OSB runner ───────────────────────────────────────────────────────────────
 osb_run() {
-    local tag="$1" params_file="$2" csv_file="$3"
+    local tag="$1" params_file="$2" csv_file="$3" extra_args="${4:-}"
     docker ps -q --filter ancestor=opensearchproject/opensearch-benchmark:latest | xargs -r docker kill 2>/dev/null || true
     docker run --rm -v osb-data:/data alpine sh -c "rm -f /data/.benchmark/.rally.pid /data/.benchmark/.osb.pid" 2>/dev/null || true
     docker volume rm osb-data 2>/dev/null || true
@@ -145,6 +152,7 @@ osb_run() {
         --results-format csv \
         --results-file "/results/$(basename "$csv_file")" \
         --on-error=abort \
+        $extra_args \
         > "$RESULTS_DIR/${tag}-output.txt" 2>&1
     local rc=$?
     if [ $rc -ne 0 ]; then
@@ -153,6 +161,22 @@ osb_run() {
         return 1
     fi
     log "OSB run '$tag' complete."
+}
+
+# ── Run one mode (baseline or parquet) ───────────────────────────────────────
+run_mode() {
+    local tag="$1" params_file="$2" csv_file="$3"
+    local extra_osb_args=""
+
+    if [ "$WORKLOAD" = "http_log_basic" ]; then
+        extra_osb_args="--exclude-tasks=$EXCLUDE_TASKS_BASIC"
+    fi
+
+    rm -f "$RESULTS_DIR/$csv_file"
+    start_opensearch
+    osb_run "search-$tag" "$RESULTS_DIR/$params_file" "$csv_file" "$extra_osb_args"
+    if [ "$tag" = "parquet" ]; then measure_storage; fi
+    stop_opensearch "$tag"
 }
 
 # ── Phase: bench ─────────────────────────────────────────────────────────────
@@ -168,21 +192,11 @@ PARAMS
 PARAMS
 
     if [ "$MODE" = "baseline" ] || [ "$MODE" = "both" ]; then
-        rm -f "$RESULTS_DIR/search-baseline.csv"
-        start_opensearch
-        osb_run "search-baseline" "$RESULTS_DIR/baseline-params.json" "search-baseline.csv"
-        stop_opensearch "baseline"
-        # After baseline, don't clean for parquet run
-        CLEAN="no"
+        run_mode "baseline" "baseline-params.json" "search-baseline.csv"
     fi
 
     if [ "$MODE" = "parquet" ] || [ "$MODE" = "both" ]; then
-        rm -f "$RESULTS_DIR/search-parquet.csv"
-        start_opensearch
-        osb_run "search-parquet" "$RESULTS_DIR/parquet-params.json" "search-parquet.csv"
-        # Measure storage
-        measure_storage
-        stop_opensearch "parquet"
+        run_mode "parquet" "parquet-params.json" "search-parquet.csv"
     fi
 
     generate_summary
