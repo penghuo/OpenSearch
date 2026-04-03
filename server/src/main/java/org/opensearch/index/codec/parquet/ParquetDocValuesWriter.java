@@ -106,6 +106,8 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     private final String segmentSuffix;
     private final List<ParquetFooterWriter.ColumnChunkInfo> columnChunks;
     private final boolean parquetNativeFormat;
+    /** Absolute file offset where PAR1 magic is written. Footer offsets are relative to this. */
+    private long parquetStartOffset;
 
     /**
      * V7 constructor: writes CodecUtil header + PAR1 magic, Parquet PageHeaders, and Parquet footer.
@@ -119,6 +121,8 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             dataOut = state.directory.createOutput(dataFileName, state.context);
             // Write Lucene CodecUtil header first (required by compound file format)
             CodecUtil.writeIndexHeader(dataOut, DATA_CODEC, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
+            // Record position of PAR1 magic — all footer offsets will be relative to this
+            parquetStartOffset = dataOut.getFilePointer();
             // Then write PAR1 magic for Parquet readers (at a known offset after CodecUtil header)
             dataOut.writeBytes(ParquetFooterWriter.PARQUET_MAGIC, 0, ParquetFooterWriter.PARQUET_MAGIC.length);
             metaOut = null;
@@ -493,18 +497,21 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         int numValues
     ) {
         FieldRepetitionType repetition = convertRepetition(schemaType.getRepetition());
+        // Footer offsets are relative to PAR1 magic (not file start) so external
+        // Parquet readers see correct offsets after stripping the CodecUtil header.
+        long offsetShift = parquetNativeFormat ? parquetStartOffset : 0;
         columnChunks.add(new ParquetFooterWriter.ColumnChunkInfo(
             fieldName,
             dvTypeName,
             repetition,
             parquetFormatType,
-            dataStartOffset,
-            pageWriter.getFirstDataPageOffset(),
-            pageWriter.getDictPageOffset(),
+            dataStartOffset - offsetShift,
+            pageWriter.getFirstDataPageOffset() - offsetShift,
+            pageWriter.hasDictionary() ? pageWriter.getDictPageOffset() - offsetShift : -1,
             pageWriter.getPageCount(),
             pageWriter.hasDictionary(),
             docIdOffset,
-            packedValuesOffset,
+            packedValuesOffset >= 0 ? packedValuesOffset - offsetShift : -1,
             pageWriter.getTotalCompressedSize(),
             pageWriter.getTotalUncompressedSize(),
             numValues,

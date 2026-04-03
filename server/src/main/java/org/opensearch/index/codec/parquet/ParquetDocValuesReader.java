@@ -376,25 +376,42 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         int footerLen = java.nio.ByteBuffer.wrap(footerLenBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt();
         long footerStart = parquetEnd - 8 - footerLen;
 
+        // Footer offsets are relative to PAR1 magic. Add back the CodecUtil header
+        // size to get absolute file offsets for Lucene's IndexInput slicing.
+        long codecHeaderSize = footerStart - footerStart; // will be computed below
+        // Find PAR1 offset by scanning (it's right after CodecUtil header)
+        input.seek(0);
+        byte[] scanBuf = new byte[100];
+        input.readBytes(scanBuf, 0, Math.min(100, (int) input.length()));
+        long parquetMagicOffset = 0;
+        for (int j = 0; j <= scanBuf.length - 4; j++) {
+            if (scanBuf[j] == 'P' && scanBuf[j+1] == 'A' && scanBuf[j+2] == 'R' && scanBuf[j+3] == '1') {
+                parquetMagicOffset = j;
+                break;
+            }
+        }
+
         for (int i = 0; i < columns.size(); i++) {
             ColumnChunk cc = columns.get(i);
             ColumnMetaData colMeta = cc.getMeta_data();
             String fieldName = colMeta.getPath_in_schema().get(0);
             String prefix = "field." + fieldName + ".";
 
-            long dataStartOffset = cc.getFile_offset();
+            // Footer offsets are relative to PAR1; add parquetMagicOffset for absolute file offsets
+            long dataStartOffset = cc.getFile_offset() + parquetMagicOffset;
 
             // Compute dataLength: extends to next column's start or the footer start
             long endOffset;
             if (i + 1 < columns.size()) {
-                endOffset = columns.get(i + 1).getFile_offset();
+                endOffset = columns.get(i + 1).getFile_offset() + parquetMagicOffset;
             } else {
                 endOffset = footerStart;
             }
             long dataLength = endOffset - dataStartOffset;
 
             String packedValStr = kv.get(prefix + "packedValuesOffset");
-            long packedValuesOffset = (packedValStr != null) ? Long.parseLong(packedValStr) : -1L;
+            long packedValuesOffset = (packedValStr != null && !packedValStr.equals("-1"))
+                ? Long.parseLong(packedValStr) + parquetMagicOffset : -1L;
 
             fields.put(fieldName, new FieldMeta(
                 fieldName,
