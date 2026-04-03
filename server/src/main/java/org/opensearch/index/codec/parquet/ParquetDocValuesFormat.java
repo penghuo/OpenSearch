@@ -50,7 +50,7 @@ public class ParquetDocValuesFormat extends DocValuesFormat {
 
     @Override
     public DocValuesConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
-        return new ParquetDocValuesWriter(state, DATA_EXTENSION, META_EXTENSION, DATA_CODEC, META_CODEC);
+        return new ParquetDocValuesWriter(state, DATA_EXTENSION);
     }
 
     @Override

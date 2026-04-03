@@ -36,13 +36,26 @@ import org.apache.parquet.column.page.PageWriteStore;
 import org.apache.parquet.column.page.PageWriter;
 import org.apache.parquet.column.statistics.SizeStatistics;
 import org.apache.parquet.column.statistics.Statistics;
+import org.apache.parquet.format.DataPageHeader;
+import org.apache.parquet.format.DictionaryPageHeader;
+import org.apache.parquet.format.FieldRepetitionType;
+import org.apache.parquet.format.FileMetaData;
+import org.apache.parquet.format.PageHeader;
+import org.apache.parquet.format.PageType;
+import org.apache.parquet.format.Type;
+import org.apache.parquet.format.Util;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.opensearch.common.util.io.IOUtils;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * Writes Lucene doc values using Parquet column encoding with streaming page writes.
@@ -50,21 +63,17 @@ import java.util.Arrays;
  * <p>Pages are written directly to the {@code .pdvd} data file as they are produced
  * by the Parquet column writer, avoiding buffering all encoded data in memory.
  * Doc IDs are accumulated in a compact {@code int[]} and written after the pages.
- * Field metadata is written to the {@code .pdvm} metadata file.</p>
+ * Field metadata is stored in the Parquet footer at the end of the file.</p>
  *
- * <p>File format per field in .pdvd (version 2):
+ * <p>V7 format: the {@code .pdvd} file is a valid Parquet file:
  * <pre>
- *   [ZSTD-compressed data pages...]
- *   [ZSTD-compressed dictionary page (if any)]
- *   [byte: denseFlag][int: docCount][int[]: docIds (if sparse)]
+ *   PAR1 (4 bytes)
+ *   [per-field column data: Parquet PageHeaders + ZSTD-compressed pages...]
+ *   [per-field: doc IDs + optional packed values (Lucene-specific appendix)]
+ *   Parquet footer (Thrift FileMetaData)
+ *   footer length (4 bytes LE)
+ *   PAR1 (4 bytes)
  * </pre>
- * Each data page: [int: compressedSize][int: uncompressedSize][int: valueCount]
- *                  [int: rowCount][String: valuesEncoding][String: rlEncoding]
- *                  [String: dlEncoding][byte[]: ZSTD-compressed page data]
- * Dictionary page: [int: compressedSize][int: uncompressedSize][int: dictSize]
- *                  [String: encoding][byte[]: ZSTD-compressed dict data]
- * Metadata per field in .pdvm includes a {@code docIdOffset} so the reader can
- * locate the doc ID section without scanning pages.
  *
  * @opensearch.experimental
  */
@@ -77,7 +86,8 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     static final int VERSION_BLOCK_PACKED = 4;
     static final int VERSION_SKIP_INDEX = 5;
     static final int VERSION_FLAT_PACKED = 6;
-    static final int VERSION_CURRENT = VERSION_FLAT_PACKED;
+    static final int VERSION_PARQUET_NATIVE = 7;
+    static final int VERSION_CURRENT = VERSION_PARQUET_NATIVE;
 
     /** Block shift for block-based packed values encoding (2^14 = 16384 docs per block, matching Lucene90). */
     static final int BLOCK_SHIFT = 14;
@@ -92,7 +102,39 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     private final IndexOutput dataOut;
     private final IndexOutput metaOut;
     private final int maxDoc;
+    private final String segmentIdHex;
+    private final String segmentSuffix;
+    private final List<ParquetFooterWriter.ColumnChunkInfo> columnChunks;
+    private final boolean parquetNativeFormat;
 
+    /**
+     * V7 constructor: writes PAR1 magic, Parquet PageHeaders, and Parquet footer.
+     * No metadata file is created.
+     */
+    public ParquetDocValuesWriter(SegmentWriteState state, String dataExtension) throws IOException {
+        String dataFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
+        boolean success = false;
+        try {
+            dataOut = state.directory.createOutput(dataFileName, state.context);
+            // Write leading PAR1 magic
+            dataOut.writeBytes(ParquetFooterWriter.PARQUET_MAGIC, 0, ParquetFooterWriter.PARQUET_MAGIC.length);
+            metaOut = null;
+            maxDoc = state.segmentInfo.maxDoc();
+            segmentIdHex = bytesToHex(state.segmentInfo.getId());
+            segmentSuffix = state.segmentSuffix;
+            columnChunks = new ArrayList<>();
+            parquetNativeFormat = true;
+            success = true;
+        } finally {
+            if (success == false) {
+                IOUtils.closeWhileHandlingException(this);
+            }
+        }
+    }
+
+    /**
+     * Legacy constructor for backward compatibility. Delegates to old CodecUtil-based format.
+     */
     public ParquetDocValuesWriter(SegmentWriteState state, String dataExtension, String metaExtension, String dataCodec, String metaCodec)
         throws IOException {
         String dataFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
@@ -100,10 +142,14 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         boolean success = false;
         try {
             dataOut = state.directory.createOutput(dataFileName, state.context);
-            CodecUtil.writeIndexHeader(dataOut, dataCodec, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
+            CodecUtil.writeIndexHeader(dataOut, dataCodec, VERSION_FLAT_PACKED, state.segmentInfo.getId(), state.segmentSuffix);
             metaOut = state.directory.createOutput(metaFileName, state.context);
-            CodecUtil.writeIndexHeader(metaOut, metaCodec, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
+            CodecUtil.writeIndexHeader(metaOut, metaCodec, VERSION_FLAT_PACKED, state.segmentInfo.getId(), state.segmentSuffix);
             maxDoc = state.segmentInfo.maxDoc();
+            segmentIdHex = bytesToHex(state.segmentInfo.getId());
+            segmentSuffix = state.segmentSuffix;
+            columnChunks = new ArrayList<>();
+            parquetNativeFormat = false;
             success = true;
         } finally {
             if (success == false) {
@@ -123,7 +169,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
         long dataStartOffset = dataOut.getFilePointer();
-        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut, parquetNativeFormat);
         StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
@@ -150,16 +196,30 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
 
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
-        writeFieldMeta(
-            field.name,
-            field.getDocValuesType().name(),
-            parquetType,
-            dataStartOffset,
-            dataLength,
-            pageWriter.getPageCount(),
-            pageWriter.hasDictionary(),
-            docIdOffset
-        );
+        if (parquetNativeFormat) {
+            addColumnChunkInfo(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                Type.INT64,
+                dataStartOffset,
+                pageWriter,
+                docIdOffset,
+                packedValuesOffset,
+                docIds.size()
+            );
+        } else {
+            writeFieldMeta(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                dataStartOffset,
+                dataLength,
+                pageWriter.getPageCount(),
+                pageWriter.hasDictionary(),
+                docIdOffset
+            );
+        }
     }
 
     @Override
@@ -169,7 +229,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
         long dataStartOffset = dataOut.getFilePointer();
-        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut, parquetNativeFormat);
         StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
@@ -190,16 +250,30 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeDocIds(docIds);
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
-        writeFieldMeta(
-            field.name,
-            field.getDocValuesType().name(),
-            parquetType,
-            dataStartOffset,
-            dataLength,
-            pageWriter.getPageCount(),
-            pageWriter.hasDictionary(),
-            docIdOffset
-        );
+        if (parquetNativeFormat) {
+            addColumnChunkInfo(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                Type.BYTE_ARRAY,
+                dataStartOffset,
+                pageWriter,
+                docIdOffset,
+                -1L,
+                docIds.size()
+            );
+        } else {
+            writeFieldMeta(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                dataStartOffset,
+                dataLength,
+                pageWriter.getPageCount(),
+                pageWriter.hasDictionary(),
+                docIdOffset
+            );
+        }
     }
 
     @Override
@@ -209,7 +283,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
         long dataStartOffset = dataOut.getFilePointer();
-        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut, parquetNativeFormat);
         StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder()
             .withDictionaryEncoding(true)
@@ -233,16 +307,30 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeDocIds(docIds);
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
-        writeFieldMeta(
-            field.name,
-            field.getDocValuesType().name(),
-            parquetType,
-            dataStartOffset,
-            dataLength,
-            pageWriter.getPageCount(),
-            pageWriter.hasDictionary(),
-            docIdOffset
-        );
+        if (parquetNativeFormat) {
+            addColumnChunkInfo(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                Type.BYTE_ARRAY,
+                dataStartOffset,
+                pageWriter,
+                docIdOffset,
+                -1L,
+                docIds.size()
+            );
+        } else {
+            writeFieldMeta(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                dataStartOffset,
+                dataLength,
+                pageWriter.getPageCount(),
+                pageWriter.hasDictionary(),
+                docIdOffset
+            );
+        }
     }
 
     @Override
@@ -252,7 +340,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
         long dataStartOffset = dataOut.getFilePointer();
-        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut, parquetNativeFormat);
         StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder().build().newColumnWriteStore(schema, pageStore);
         ColumnWriter cw = writeStore.getColumnWriter(descriptor);
@@ -294,16 +382,30 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
 
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
-        writeFieldMeta(
-            field.name,
-            field.getDocValuesType().name(),
-            parquetType,
-            dataStartOffset,
-            dataLength,
-            pageWriter.getPageCount(),
-            pageWriter.hasDictionary(),
-            docIdOffset
-        );
+        if (parquetNativeFormat) {
+            addColumnChunkInfo(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                Type.INT64,
+                dataStartOffset,
+                pageWriter,
+                docIdOffset,
+                packedValuesOffset,
+                docIds.size()
+            );
+        } else {
+            writeFieldMeta(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                dataStartOffset,
+                dataLength,
+                pageWriter.getPageCount(),
+                pageWriter.hasDictionary(),
+                docIdOffset
+            );
+        }
     }
 
     @Override
@@ -313,7 +415,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ColumnDescriptor descriptor = ParquetTypeMapping.columnDescriptor(schema);
 
         long dataStartOffset = dataOut.getFilePointer();
-        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut);
+        StreamingPageWriter pageWriter = new StreamingPageWriter(dataOut, parquetNativeFormat);
         StreamingPageWriteStore pageStore = new StreamingPageWriteStore(pageWriter);
         ColumnWriteStore writeStore = ParquetProperties.builder()
             .withDictionaryEncoding(true)
@@ -346,16 +448,81 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         writeDocIds(docIds);
         long dataLength = dataOut.getFilePointer() - dataStartOffset;
 
-        writeFieldMeta(
-            field.name,
-            field.getDocValuesType().name(),
-            parquetType,
+        if (parquetNativeFormat) {
+            addColumnChunkInfo(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                Type.BYTE_ARRAY,
+                dataStartOffset,
+                pageWriter,
+                docIdOffset,
+                -1L,
+                docIds.size()
+            );
+        } else {
+            writeFieldMeta(
+                field.name,
+                field.getDocValuesType().name(),
+                parquetType,
+                dataStartOffset,
+                dataLength,
+                pageWriter.getPageCount(),
+                pageWriter.hasDictionary(),
+                docIdOffset
+            );
+        }
+    }
+
+    /**
+     * Builds a ColumnChunkInfo from the page writer state and adds it to the list
+     * for the Parquet footer.
+     */
+    private void addColumnChunkInfo(
+        String fieldName,
+        String dvTypeName,
+        PrimitiveType schemaType,
+        Type parquetFormatType,
+        long dataStartOffset,
+        StreamingPageWriter pageWriter,
+        long docIdOffset,
+        long packedValuesOffset,
+        int numValues
+    ) {
+        FieldRepetitionType repetition = convertRepetition(schemaType.getRepetition());
+        columnChunks.add(new ParquetFooterWriter.ColumnChunkInfo(
+            fieldName,
+            dvTypeName,
+            repetition,
+            parquetFormatType,
             dataStartOffset,
-            dataLength,
+            pageWriter.getFirstDataPageOffset(),
+            pageWriter.getDictPageOffset(),
             pageWriter.getPageCount(),
             pageWriter.hasDictionary(),
-            docIdOffset
-        );
+            docIdOffset,
+            packedValuesOffset,
+            pageWriter.getTotalCompressedSize(),
+            pageWriter.getTotalUncompressedSize(),
+            numValues,
+            pageWriter.getEncodings()
+        ));
+    }
+
+    /**
+     * Converts Parquet schema repetition to Thrift FieldRepetitionType.
+     */
+    private static FieldRepetitionType convertRepetition(org.apache.parquet.schema.Type.Repetition repetition) {
+        switch (repetition) {
+            case REQUIRED:
+                return FieldRepetitionType.REQUIRED;
+            case OPTIONAL:
+                return FieldRepetitionType.OPTIONAL;
+            case REPEATED:
+                return FieldRepetitionType.REPEATED;
+            default:
+                throw new IllegalArgumentException("Unknown repetition: " + repetition);
+        }
     }
 
     /**
@@ -467,6 +634,10 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         }
     }
 
+    /**
+     * Writes field metadata to the legacy .pdvm metadata file.
+     * Only used in non-Parquet-native (V6 and earlier) format.
+     */
     private void writeFieldMeta(
         String fieldName,
         String dvTypeName,
@@ -498,35 +669,94 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         closed = true;
         boolean success = false;
         try {
-            if (metaOut != null) {
-                metaOut.writeString(END_MARKER);
-                CodecUtil.writeFooter(metaOut);
-            }
-            if (dataOut != null) {
-                CodecUtil.writeFooter(dataOut);
+            if (parquetNativeFormat) {
+                // Write Parquet footer
+                if (dataOut != null) {
+                    ParquetFooterWriter footerWriter = new ParquetFooterWriter(
+                        String.valueOf(VERSION_CURRENT),
+                        segmentIdHex,
+                        segmentSuffix,
+                        maxDoc,
+                        maxDoc,
+                        columnChunks
+                    );
+                    FileMetaData footer = footerWriter.buildFileMetaData();
+                    byte[] footerBytes = ParquetFooterWriter.serializeFooter(footer);
+                    dataOut.writeBytes(footerBytes, 0, footerBytes.length);
+                    // 4-byte footer length little-endian
+                    byte[] lenBytes = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(footerBytes.length).array();
+                    dataOut.writeBytes(lenBytes, 0, 4);
+                    // Trailing PAR1 magic
+                    dataOut.writeBytes(ParquetFooterWriter.PARQUET_MAGIC, 0, ParquetFooterWriter.PARQUET_MAGIC.length);
+                }
+            } else {
+                // Legacy format: write CodecUtil footers
+                if (metaOut != null) {
+                    metaOut.writeString(END_MARKER);
+                    CodecUtil.writeFooter(metaOut);
+                }
+                if (dataOut != null) {
+                    CodecUtil.writeFooter(dataOut);
+                }
             }
             success = true;
         } finally {
             if (success) {
-                IOUtils.close(metaOut, dataOut);
+                if (parquetNativeFormat) {
+                    IOUtils.close(dataOut);
+                } else {
+                    IOUtils.close(metaOut, dataOut);
+                }
             } else {
-                IOUtils.closeWhileHandlingException(metaOut, dataOut);
+                if (parquetNativeFormat) {
+                    IOUtils.closeWhileHandlingException(dataOut);
+                } else {
+                    IOUtils.closeWhileHandlingException(metaOut, dataOut);
+                }
             }
         }
+    }
+
+    /**
+     * Converts a byte array to a hex string.
+     */
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b & 0xFF));
+        }
+        return sb.toString();
     }
 
     /**
      * A {@link PageWriter} that streams data pages directly to an {@link IndexOutput},
      * avoiding in-memory buffering. Dictionary pages are deferred until after all data
      * pages are written (they arrive during flush, after data pages).
+     *
+     * <p>When {@code parquetNative} is true, pages are written with standard Parquet
+     * {@link PageHeader} Thrift structs. Otherwise, the legacy custom framing is used.</p>
      */
     static class StreamingPageWriter implements PageWriter {
         private final IndexOutput out;
+        private final boolean parquetNative;
         private int pageCount;
         private DictionaryPage dictionaryPage;
 
-        StreamingPageWriter(IndexOutput out) {
+        // Parquet-native tracking fields
+        private long totalCompressedSize;
+        private long totalUncompressedSize;
+        private final List<org.apache.parquet.format.Encoding> encodings;
+        private long firstDataPageOffset = -1;
+        private long dictPageOffset = -1;
+
+        StreamingPageWriter(IndexOutput out, boolean parquetNative) {
             this.out = out;
+            this.parquetNative = parquetNative;
+            this.encodings = new ArrayList<>();
+        }
+
+        StreamingPageWriter(IndexOutput out) {
+            this(out, false);
         }
 
         @Override
@@ -553,14 +783,39 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         ) throws IOException {
             byte[] pageBytes = bytes.toByteArray();
             byte[] compressedBytes = Zstd.compress(pageBytes);
-            out.writeInt(compressedBytes.length);
-            out.writeInt(pageBytes.length);
-            out.writeInt(valueCount);
-            out.writeInt(rowCount);
-            out.writeString(valuesEncoding.name());
-            out.writeString(rlEncoding.name());
-            out.writeString(dlEncoding.name());
-            out.writeBytes(compressedBytes, compressedBytes.length);
+
+            if (parquetNative) {
+                if (firstDataPageOffset < 0) {
+                    firstDataPageOffset = out.getFilePointer();
+                }
+
+                PageHeader ph = new PageHeader(PageType.DATA_PAGE, pageBytes.length, compressedBytes.length);
+                ph.setData_page_header(new DataPageHeader(
+                    valueCount,
+                    convertEncoding(valuesEncoding),
+                    convertEncoding(dlEncoding),
+                    convertEncoding(rlEncoding)
+                ));
+
+                byte[] headerBytes = serializePageHeader(ph);
+                out.writeBytes(headerBytes, headerBytes.length);
+                out.writeBytes(compressedBytes, compressedBytes.length);
+
+                totalCompressedSize += headerBytes.length + compressedBytes.length;
+                totalUncompressedSize += headerBytes.length + pageBytes.length;
+                addEncoding(convertEncoding(valuesEncoding));
+                addEncoding(convertEncoding(rlEncoding));
+                addEncoding(convertEncoding(dlEncoding));
+            } else {
+                out.writeInt(compressedBytes.length);
+                out.writeInt(pageBytes.length);
+                out.writeInt(valueCount);
+                out.writeInt(rowCount);
+                out.writeString(valuesEncoding.name());
+                out.writeString(rlEncoding.name());
+                out.writeString(dlEncoding.name());
+                out.writeBytes(compressedBytes, compressedBytes.length);
+            }
             pageCount++;
         }
 
@@ -620,11 +875,30 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             if (dictionaryPage != null) {
                 byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
                 byte[] compressedBytes = Zstd.compress(dictBytes);
-                out.writeInt(compressedBytes.length);
-                out.writeInt(dictBytes.length);
-                out.writeInt(dictionaryPage.getDictionarySize());
-                out.writeString(dictionaryPage.getEncoding().name());
-                out.writeBytes(compressedBytes, compressedBytes.length);
+
+                if (parquetNative) {
+                    dictPageOffset = out.getFilePointer();
+
+                    PageHeader ph = new PageHeader(PageType.DICTIONARY_PAGE, dictBytes.length, compressedBytes.length);
+                    ph.setDictionary_page_header(new DictionaryPageHeader(
+                        dictionaryPage.getDictionarySize(),
+                        convertEncoding(dictionaryPage.getEncoding())
+                    ));
+
+                    byte[] headerBytes = serializePageHeader(ph);
+                    out.writeBytes(headerBytes, headerBytes.length);
+                    out.writeBytes(compressedBytes, compressedBytes.length);
+
+                    totalCompressedSize += headerBytes.length + compressedBytes.length;
+                    totalUncompressedSize += headerBytes.length + dictBytes.length;
+                    addEncoding(convertEncoding(dictionaryPage.getEncoding()));
+                } else {
+                    out.writeInt(compressedBytes.length);
+                    out.writeInt(dictBytes.length);
+                    out.writeInt(dictionaryPage.getDictionarySize());
+                    out.writeString(dictionaryPage.getEncoding().name());
+                    out.writeBytes(compressedBytes, compressedBytes.length);
+                }
             }
         }
 
@@ -642,6 +916,42 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
 
         boolean hasDictionary() {
             return dictionaryPage != null;
+        }
+
+        long getTotalCompressedSize() {
+            return totalCompressedSize;
+        }
+
+        long getTotalUncompressedSize() {
+            return totalUncompressedSize;
+        }
+
+        List<org.apache.parquet.format.Encoding> getEncodings() {
+            return encodings;
+        }
+
+        long getFirstDataPageOffset() {
+            return firstDataPageOffset;
+        }
+
+        long getDictPageOffset() {
+            return dictPageOffset;
+        }
+
+        private void addEncoding(org.apache.parquet.format.Encoding encoding) {
+            if (!encodings.contains(encoding)) {
+                encodings.add(encoding);
+            }
+        }
+
+        private static org.apache.parquet.format.Encoding convertEncoding(Encoding encoding) {
+            return org.apache.parquet.format.Encoding.valueOf(encoding.name());
+        }
+
+        private static byte[] serializePageHeader(PageHeader header) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            Util.writePageHeader(header, baos);
+            return baos.toByteArray();
         }
     }
 
