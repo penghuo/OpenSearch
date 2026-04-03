@@ -271,27 +271,25 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         try {
             dataInput = state.directory.openInput(dataFileName, state.context);
 
-            // Detect V7 Parquet-native format by checking for leading PAR1 magic
-            byte[] magic = new byte[4];
-            dataInput.readBytes(magic, 0, 4);
-            dataInput.seek(0); // Reset position
+            // Read CodecUtil header (required by all versions including V7 for compound file compat)
+            int dataVersion = CodecUtil.checkIndexHeader(
+                dataInput,
+                dataCodec,
+                ParquetDocValuesWriter.VERSION_START,
+                ParquetDocValuesWriter.VERSION_CURRENT,
+                state.segmentInfo.getId(),
+                state.segmentSuffix
+            );
 
-            if (Arrays.equals(magic, ParquetFooterWriter.PARQUET_MAGIC)) {
-                // V7: Parquet-native format — read footer from EOF
+            if (dataVersion >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE) {
+                // V7+: Parquet-native format — PAR1 magic follows CodecUtil header
+                // Skip the PAR1 magic (4 bytes) — it's for external Parquet readers
+                dataInput.seek(dataInput.getFilePointer() + 4);
+
+                // Read Parquet footer from EOF (before CodecUtil footer)
                 ParquetFooterReader footerReader = new ParquetFooterReader(dataInput);
                 FileMetaData fileMetaData = footerReader.readFooter();
                 Map<String, String> kv = ParquetFooterReader.extractKvMetadata(fileMetaData);
-
-                int dataVersion = Integer.parseInt(kv.get("lucene.codec.version"));
-                // Validate segment ID
-                String expectedSegId = bytesToHex(state.segmentInfo.getId());
-                String actualSegId = kv.get("lucene.segment.id");
-                if (!expectedSegId.equals(actualSegId)) {
-                    throw new CorruptIndexException(
-                        "Segment ID mismatch: expected " + expectedSegId + " but got " + actualSegId,
-                        dataInput.toString()
-                    );
-                }
 
                 this.version = dataVersion;
                 buildFieldsFromFooter(fileMetaData, kv, dataInput);
@@ -299,16 +297,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 this.parquetNative = true;
                 success = true;
             } else {
-                // V2-V6: legacy CodecUtil format with separate .pdvm file
-                int dataVersion = CodecUtil.checkIndexHeader(
-                    dataInput,
-                    dataCodec,
-                    ParquetDocValuesWriter.VERSION_START,
-                    ParquetDocValuesWriter.VERSION_CURRENT,
-                    state.segmentInfo.getId(),
-                    state.segmentSuffix
-                );
-
+                // V2-V6: legacy format with separate .pdvm file
                 String metaFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, metaExtension);
                 metaInput = state.directory.openChecksumInput(metaFileName);
                 CodecUtil.checkIndexHeader(
@@ -2773,12 +2762,8 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
     @Override
     public void checkIntegrity() throws IOException {
-        if (parquetNative) {
-            // V7: Parquet-native format validates via PAR1 magic and Thrift footer deserialization.
-            // No CodecUtil checksum is present.
-        } else {
-            CodecUtil.checksumEntireFile(dataIn);
-        }
+        // All versions (including V7) have CodecUtil header/footer for compound file compat
+        CodecUtil.checksumEntireFile(dataIn);
     }
 
     @Override

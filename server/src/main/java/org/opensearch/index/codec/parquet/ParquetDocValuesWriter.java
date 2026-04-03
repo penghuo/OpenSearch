@@ -108,15 +108,18 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     private final boolean parquetNativeFormat;
 
     /**
-     * V7 constructor: writes PAR1 magic, Parquet PageHeaders, and Parquet footer.
-     * No metadata file is created.
+     * V7 constructor: writes CodecUtil header + PAR1 magic, Parquet PageHeaders, and Parquet footer.
+     * No metadata file is created. The CodecUtil header is required by Lucene's compound file format.
+     * External Parquet readers skip the CodecUtil header bytes to find the PAR1 magic.
      */
     public ParquetDocValuesWriter(SegmentWriteState state, String dataExtension) throws IOException {
         String dataFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
         boolean success = false;
         try {
             dataOut = state.directory.createOutput(dataFileName, state.context);
-            // Write leading PAR1 magic
+            // Write Lucene CodecUtil header first (required by compound file format)
+            CodecUtil.writeIndexHeader(dataOut, DATA_CODEC, VERSION_CURRENT, state.segmentInfo.getId(), state.segmentSuffix);
+            // Then write PAR1 magic for Parquet readers (at a known offset after CodecUtil header)
             dataOut.writeBytes(ParquetFooterWriter.PARQUET_MAGIC, 0, ParquetFooterWriter.PARQUET_MAGIC.length);
             metaOut = null;
             maxDoc = state.segmentInfo.maxDoc();
@@ -688,6 +691,8 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
                     dataOut.writeBytes(lenBytes, 0, 4);
                     // Trailing PAR1 magic
                     dataOut.writeBytes(ParquetFooterWriter.PARQUET_MAGIC, 0, ParquetFooterWriter.PARQUET_MAGIC.length);
+                    // CodecUtil footer (required by Lucene compound file format)
+                    CodecUtil.writeFooter(dataOut);
                 }
             } else {
                 // Legacy format: write CodecUtil footers

@@ -40,40 +40,54 @@ public class ParquetFooterReader {
         this.input = input;
     }
 
+    /** CodecUtil footer is 16 bytes: magic(4) + algorithmID(4) + checksum(8). */
+    static final int CODEC_UTIL_FOOTER_LENGTH = 16;
+
     /**
      * Reads the Parquet footer from the end of the file.
      * <p>
-     * The file must end with: {@code footer bytes | 4-byte footer length (LE) | PAR1}.
+     * File layout: {@code [CodecUtil header][PAR1][data...][Parquet footer][footer_len(4 LE)][PAR1][CodecUtil footer(16)]}.
+     * The CodecUtil footer at the very end is skipped to find the Parquet trailing PAR1.
      *
      * @return the deserialized {@link FileMetaData}
      * @throws IOException if an I/O error occurs or the file is corrupt
      */
     public FileMetaData readFooter() throws IOException {
+        return readFooter(CODEC_UTIL_FOOTER_LENGTH);
+    }
+
+    /**
+     * Reads the Parquet footer, skipping {@code trailingOverhead} bytes at the end of the file
+     * (e.g. CodecUtil footer). If trailingOverhead is 0, the file ends with standard Parquet framing.
+     */
+    public FileMetaData readFooter(int trailingOverhead) throws IOException {
         long fileLen = input.length();
-        if (fileLen < 12) {
+        // Effective end of Parquet content (before CodecUtil footer)
+        long parquetEnd = fileLen - trailingOverhead;
+        if (parquetEnd < 12) {
             throw new CorruptIndexException("File too short for Parquet format", input.toString());
         }
 
-        // Read trailing PAR1 magic (last 4 bytes)
+        // Read trailing PAR1 magic (4 bytes before CodecUtil footer)
         byte[] trailingMagic = new byte[4];
-        input.seek(fileLen - 4);
+        input.seek(parquetEnd - 4);
         input.readBytes(trailingMagic, 0, 4);
         if (!Arrays.equals(trailingMagic, ParquetFooterWriter.PARQUET_MAGIC)) {
             throw new CorruptIndexException("Missing trailing PAR1 magic", input.toString());
         }
 
-        // Read footer length (4 bytes little-endian before trailing magic)
+        // Read footer length (4 bytes little-endian before trailing PAR1)
         byte[] footerLenBytes = new byte[4];
-        input.seek(fileLen - 8);
+        input.seek(parquetEnd - 8);
         input.readBytes(footerLenBytes, 0, 4);
         int footerLen = ByteBuffer.wrap(footerLenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
 
-        if (footerLen <= 0 || footerLen > fileLen - 12) {
+        if (footerLen <= 0 || footerLen > parquetEnd - 12) {
             throw new CorruptIndexException("Invalid footer length: " + footerLen, input.toString());
         }
 
         // Seek to footer start, read bytes, deserialize
-        long footerStart = fileLen - 8 - footerLen;
+        long footerStart = parquetEnd - 8 - footerLen;
         input.seek(footerStart);
         byte[] footerBytes = new byte[footerLen];
         input.readBytes(footerBytes, 0, footerLen);
