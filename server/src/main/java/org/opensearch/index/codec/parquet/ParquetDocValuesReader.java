@@ -678,7 +678,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
      * Each block of BLOCK_SIZE docs has its own minValue, gcd, bitsPerValue, and DirectReader instance.
      * V4 format: 25 bytes/block (offset, min, gcd, bpv)
      * V5 format: 33 bytes/block (offset, min, max, gcd, bpv) — adds maxValue for DocValuesSkipper
-     * V6 format: 16 bytes/block (min, max) + flat packed section (globalMin, globalGcd, globalBpv, DirectWriter)
      */
     private BlockPackedData loadBlockPackedData(long packedValuesOffset, int docCount, boolean isDense, int[] docIds) throws IOException {
         // Use a fresh clone to avoid position interference
@@ -686,54 +685,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         in.seek(packedValuesOffset);
         int numBlocks = in.readInt();
 
-        // V6: flat packed values with separate block skip index
-        if (version >= ParquetDocValuesWriter.VERSION_FLAT_PACKED) {
-            long[] blockMinValues = new long[numBlocks];
-            long[] blockMaxValues = new long[numBlocks];
-
-            // Read block skip index (16 bytes per block: min + max only)
-            for (int b = 0; b < numBlocks; b++) {
-                blockMinValues[b] = in.readLong();
-                blockMaxValues[b] = in.readLong();
-            }
-
-            // Read flat packed section header
-            long globalMin = in.readLong();
-            long globalGcd = in.readLong();
-            int globalBpv = in.readByte();
-
-            // Create single flat DirectReader — identical access pattern to Lucene90
-            LongValues flatValues;
-            if (globalBpv == 0) {
-                final long constValue = globalMin;
-                flatValues = new LongValues() {
-                    @Override
-                    public long get(long index) {
-                        return constValue;
-                    }
-                };
-            } else {
-                long packedDataStart = in.getFilePointer();
-                long packedDataLength = DirectWriter.bytesRequired(docCount, globalBpv);
-                RandomAccessInput rai = dataIn.randomAccessSlice(packedDataStart, packedDataLength);
-                LongValues packed = DirectReader.getInstance(rai, globalBpv);
-
-                final long fMin = globalMin;
-                final long fGcd = globalGcd;
-                flatValues = new LongValues() {
-                    @Override
-                    public long get(long index) {
-                        return fMin + packed.get(index) * fGcd;
-                    }
-                };
-            }
-
-            return new BlockPackedData(
-                flatValues, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds
-            );
-        }
-
-        // V4/V5: per-block DirectReader (backward compatibility)
         boolean hasMaxValues = version >= ParquetDocValuesWriter.VERSION_SKIP_INDEX;
         int bytesPerBlock = hasMaxValues ? 33 : 25;
 
