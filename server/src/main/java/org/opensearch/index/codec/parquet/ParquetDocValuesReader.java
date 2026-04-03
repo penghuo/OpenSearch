@@ -315,12 +315,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
     /**
      * Selectively pre-populates caches for fields that use the mmap'd packed path
-     * (NUMERIC and singleton SORTED_NUMERIC). These are cheap to warm up because
-     * they only load block metadata and create DirectReader views — no heap arrays.
+     * (NUMERIC, SORTED_NUMERIC, SORTED). SORTED fields have small dictionaries
+     * (e.g. country_name, city_name) and are cheap to warm up.
      *
-     * SORTED, SORTED_SET, BINARY, and multi-valued SORTED_NUMERIC are decoded lazily
-     * on first access to avoid massive heap allocation at segment open time.
-     * At 247M docs, eagerly decoding all SORTED_SET fields caused 82s GC and OOM.
+     * SORTED_SET and BINARY are decoded lazily on first access to avoid massive heap
+     * allocation at segment open. At 247M docs, eagerly decoding high-cardinality
+     * SORTED_SET fields (request.raw) caused 82s GC and OOM.
      */
     private void warmUp() {
         for (FieldMeta meta : fields.values()) {
@@ -338,7 +338,16 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                             }
                         });
                         break;
-                    // SORTED, SORTED_SET, BINARY: decode lazily on first access
+                    case "SORTED":
+                        sortedCache.computeIfAbsent(meta.fieldName, k -> {
+                            try {
+                                return loadSorted(meta);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+                        break;
+                    // SORTED_SET, BINARY: decode lazily on first access
                     default:
                         break;
                 }
