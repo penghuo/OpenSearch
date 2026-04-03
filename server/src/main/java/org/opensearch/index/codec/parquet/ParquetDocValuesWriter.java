@@ -76,7 +76,8 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
     static final int VERSION_PACKED_VALUES = 3;
     static final int VERSION_BLOCK_PACKED = 4;
     static final int VERSION_SKIP_INDEX = 5;
-    static final int VERSION_CURRENT = VERSION_SKIP_INDEX;
+    static final int VERSION_FLAT_PACKED = 6;
+    static final int VERSION_CURRENT = VERSION_FLAT_PACKED;
 
     /** Block shift for block-based packed values encoding (2^14 = 16384 docs per block, matching Lucene90). */
     static final int BLOCK_SHIFT = 14;
@@ -361,11 +362,18 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
      * Writes block-based bit-packed values using Lucene's DirectWriter for mmap'd O(1) random access.
      * Each block of BLOCK_SIZE docs has its own minValue, maxValue, gcd, and bitsPerValue for better compression.
      * Format:
+     * V6 (VERSION_FLAT_PACKED) format:
      *   [int: numBlocks]
-     *   [block index: numBlocks × (long: blockOffset, long: blockMinValue, long: blockMaxValue, long: blockGcd, byte: blockBitsPerValue)]
-     *   [block data: for each block, DirectWriter packed data]
-     * Block index is 33 bytes per block. Block offsets are relative to the start of block data section.
-     * The per-block minValue/maxValue enable DocValuesSkipper in the reader for skipping non-competitive blocks.
+     *   [block skip index: numBlocks × (long: blockMinValue, long: blockMaxValue) = 16 bytes/block]
+     *   [long: globalMinValue]
+     *   [long: globalGcd]
+     *   [byte: globalBitsPerValue]
+     *   [flat DirectWriter packed data for ALL values]
+     *
+     * The block skip index provides per-block min/max for DocValuesSkipper competitive pruning.
+     * The flat packed section uses a single DirectReader for O(1) access identical to Lucene90:
+     *   value = globalMin + flatReader.get(idx) * globalGcd
+     *
      * Returns the absolute file offset where packed section begins.
      */
     private long writePackedValues(LongArrayBuilder values) throws IOException {
@@ -376,16 +384,37 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         int numValues = values.size();
         int numBlocks = (numValues + BLOCK_SIZE - 1) >>> BLOCK_SHIFT;
 
-        // Compute per-block stats
+        // Compute global stats
+        long globalMin = values.get(0);
+        long globalMax = values.get(0);
+        for (int i = 1; i < numValues; i++) {
+            long v = values.get(i);
+            globalMin = Math.min(globalMin, v);
+            globalMax = Math.max(globalMax, v);
+        }
+
+        long globalGcd = 0;
+        if (globalMin != globalMax) {
+            globalGcd = globalMax - globalMin;
+            for (int i = 0; i < numValues; i++) {
+                long v = values.get(i);
+                if (v < Long.MIN_VALUE / 2 || v > Long.MAX_VALUE / 2) {
+                    globalGcd = 1;
+                    break;
+                }
+                globalGcd = MathUtil.gcd(globalGcd, v - globalMin);
+            }
+        }
+
+        long maxDelta = globalGcd != 0 ? (globalMax - globalMin) / globalGcd : 0;
+        int globalBpv = (globalMin != globalMax) ? DirectWriter.unsignedBitsRequired(maxDelta) : 0;
+
+        // Compute per-block min/max for skip index
         long[] blockMinValues = new long[numBlocks];
         long[] blockMaxValues = new long[numBlocks];
-        long[] blockGcds = new long[numBlocks];
-        int[] blockBitsPerValue = new int[numBlocks];
-
         for (int b = 0; b < numBlocks; b++) {
             int start = b << BLOCK_SHIFT;
             int end = Math.min(start + BLOCK_SIZE, numValues);
-
             long minValue = values.get(start);
             long maxValue = values.get(start);
             for (int i = start + 1; i < end; i++) {
@@ -393,71 +422,31 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
                 minValue = Math.min(minValue, v);
                 maxValue = Math.max(maxValue, v);
             }
-
-            long gcd = 0;
-            if (minValue != maxValue) {
-                gcd = maxValue - minValue;
-                for (int i = start; i < end; i++) {
-                    long v = values.get(i);
-                    // Guard against overflow in delta computation (same as Lucene90DocValuesConsumer)
-                    if (v < Long.MIN_VALUE / 2 || v > Long.MAX_VALUE / 2) {
-                        gcd = 1;
-                        break;
-                    }
-                    gcd = MathUtil.gcd(gcd, v - minValue);
-                }
-            }
-
-            long maxDelta = gcd != 0 ? (maxValue - minValue) / gcd : 0;
-            int bpv = (minValue != maxValue) ? DirectWriter.unsignedBitsRequired(maxDelta) : 0;
-
             blockMinValues[b] = minValue;
             blockMaxValues[b] = maxValue;
-            blockGcds[b] = gcd;
-            blockBitsPerValue[b] = bpv;
         }
 
-        // Pre-compute block offsets using DirectWriter.bytesRequired
-        long[] blockOffsets = new long[numBlocks];
-        long runningOffset = 0;
-        for (int b = 0; b < numBlocks; b++) {
-            blockOffsets[b] = runningOffset;
-            int start = b << BLOCK_SHIFT;
-            int end = Math.min(start + BLOCK_SIZE, numValues);
-            int blockCount = end - start;
-            if (blockBitsPerValue[b] > 0) {
-                runningOffset += DirectWriter.bytesRequired(blockCount, blockBitsPerValue[b]);
-            }
-        }
-
-        // Write header: number of blocks
+        // Write block skip index header
         dataOut.writeInt(numBlocks);
 
-        // Write block index with pre-computed offsets (33 bytes per block)
+        // Write block skip index (16 bytes per block: min + max only)
         for (int b = 0; b < numBlocks; b++) {
-            dataOut.writeLong(blockOffsets[b]);
             dataOut.writeLong(blockMinValues[b]);
             dataOut.writeLong(blockMaxValues[b]);
-            dataOut.writeLong(blockGcds[b]);
-            dataOut.writeByte((byte) blockBitsPerValue[b]);
         }
 
-        // Write block data
-        for (int b = 0; b < numBlocks; b++) {
-            int start = b << BLOCK_SHIFT;
-            int end = Math.min(start + BLOCK_SIZE, numValues);
-            int blockCount = end - start;
-            int bpv = blockBitsPerValue[b];
+        // Write flat packed section header
+        dataOut.writeLong(globalMin);
+        dataOut.writeLong(globalGcd);
+        dataOut.writeByte((byte) globalBpv);
 
-            if (bpv > 0) {
-                DirectWriter writer = DirectWriter.getInstance(dataOut, blockCount, bpv);
-                long minVal = blockMinValues[b];
-                long gcd = blockGcds[b];
-                for (int i = start; i < end; i++) {
-                    writer.add(gcd != 0 ? (values.get(i) - minVal) / gcd : 0);
-                }
-                writer.finish();
+        // Write flat packed data — single contiguous DirectWriter for all values
+        if (globalBpv > 0) {
+            DirectWriter writer = DirectWriter.getInstance(dataOut, numValues, globalBpv);
+            for (int i = 0; i < numValues; i++) {
+                writer.add(globalGcd != 0 ? (values.get(i) - globalMin) / globalGcd : 0);
             }
+            writer.finish();
         }
 
         return packedValuesOffset;

@@ -168,12 +168,31 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final long[][] docOrds;
         final BytesRef[] dict;
         final boolean isDense;
+        /** Non-null when every document has exactly one ordinal (singleton optimization). */
+        final long[] singletonOrds;
 
         CachedSortedSet(int[] docIds, long[][] docOrds, BytesRef[] dict, boolean isDense) {
             this.docIds = docIds;
             this.docOrds = docOrds;
             this.dict = dict;
             this.isDense = isDense;
+            // Detect singleton: all docs have exactly 1 ordinal
+            boolean singleton = true;
+            for (long[] ords : docOrds) {
+                if (ords.length != 1) {
+                    singleton = false;
+                    break;
+                }
+            }
+            if (singleton && docOrds.length > 0) {
+                long[] flat = new long[docOrds.length];
+                for (int i = 0; i < docOrds.length; i++) {
+                    flat[i] = docOrds[i][0];
+                }
+                this.singletonOrds = flat;
+            } else {
+                this.singletonOrds = null;
+            }
         }
     }
 
@@ -227,7 +246,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 dataInput,
                 dataCodec,
                 ParquetDocValuesWriter.VERSION_START,
-                ParquetDocValuesWriter.VERSION_SKIP_INDEX,
+                ParquetDocValuesWriter.VERSION_CURRENT,
                 state.segmentInfo.getId(),
                 state.segmentSuffix
             );
@@ -237,7 +256,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 metaInput,
                 metaCodec,
                 ParquetDocValuesWriter.VERSION_START,
-                ParquetDocValuesWriter.VERSION_SKIP_INDEX,
+                ParquetDocValuesWriter.VERSION_CURRENT,
                 state.segmentInfo.getId(),
                 state.segmentSuffix
             );
@@ -295,9 +314,13 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     }
 
     /**
-     * Eagerly pre-populates all field caches so the first query doesn't pay the full
-     * decode cost (Zstd decompression + array allocation). Errors on individual fields
-     * are silently ignored — they will surface on actual access.
+     * Selectively pre-populates caches for fields that use the mmap'd packed path
+     * (NUMERIC and singleton SORTED_NUMERIC). These are cheap to warm up because
+     * they only load block metadata and create DirectReader views — no heap arrays.
+     *
+     * SORTED, SORTED_SET, BINARY, and multi-valued SORTED_NUMERIC are decoded lazily
+     * on first access to avoid massive heap allocation at segment open time.
+     * At 247M docs, eagerly decoding all SORTED_SET fields caused 82s GC and OOM.
      */
     private void warmUp() {
         for (FieldMeta meta : fields.values()) {
@@ -315,33 +338,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                             }
                         });
                         break;
-                    case "SORTED":
-                        sortedCache.computeIfAbsent(meta.fieldName, k -> {
-                            try {
-                                return loadSorted(meta);
-                            } catch (IOException e) {
-                                throw new UncheckedIOException(e);
-                            }
-                        });
-                        break;
-                    case "SORTED_SET":
-                        sortedSetCache.computeIfAbsent(meta.fieldName, k -> {
-                            try {
-                                return loadSortedSet(meta);
-                            } catch (IOException e) {
-                                throw new UncheckedIOException(e);
-                            }
-                        });
-                        break;
-                    case "BINARY":
-                        binaryCache.computeIfAbsent(meta.fieldName, k -> {
-                            try {
-                                return loadBinary(meta);
-                            } catch (IOException e) {
-                                throw new UncheckedIOException(e);
-                            }
-                        });
-                        break;
+                    // SORTED, SORTED_SET, BINARY: decode lazily on first access
                     default:
                         break;
                 }
@@ -681,6 +678,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
      * Each block of BLOCK_SIZE docs has its own minValue, gcd, bitsPerValue, and DirectReader instance.
      * V4 format: 25 bytes/block (offset, min, gcd, bpv)
      * V5 format: 33 bytes/block (offset, min, max, gcd, bpv) — adds maxValue for DocValuesSkipper
+     * V6 format: 16 bytes/block (min, max) + flat packed section (globalMin, globalGcd, globalBpv, DirectWriter)
      */
     private BlockPackedData loadBlockPackedData(long packedValuesOffset, int docCount, boolean isDense, int[] docIds) throws IOException {
         // Use a fresh clone to avoid position interference
@@ -688,6 +686,54 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         in.seek(packedValuesOffset);
         int numBlocks = in.readInt();
 
+        // V6: flat packed values with separate block skip index
+        if (version >= ParquetDocValuesWriter.VERSION_FLAT_PACKED) {
+            long[] blockMinValues = new long[numBlocks];
+            long[] blockMaxValues = new long[numBlocks];
+
+            // Read block skip index (16 bytes per block: min + max only)
+            for (int b = 0; b < numBlocks; b++) {
+                blockMinValues[b] = in.readLong();
+                blockMaxValues[b] = in.readLong();
+            }
+
+            // Read flat packed section header
+            long globalMin = in.readLong();
+            long globalGcd = in.readLong();
+            int globalBpv = in.readByte();
+
+            // Create single flat DirectReader — identical access pattern to Lucene90
+            LongValues flatValues;
+            if (globalBpv == 0) {
+                final long constValue = globalMin;
+                flatValues = new LongValues() {
+                    @Override
+                    public long get(long index) {
+                        return constValue;
+                    }
+                };
+            } else {
+                long packedDataStart = in.getFilePointer();
+                long packedDataLength = DirectWriter.bytesRequired(docCount, globalBpv);
+                RandomAccessInput rai = dataIn.randomAccessSlice(packedDataStart, packedDataLength);
+                LongValues packed = DirectReader.getInstance(rai, globalBpv);
+
+                final long fMin = globalMin;
+                final long fGcd = globalGcd;
+                flatValues = new LongValues() {
+                    @Override
+                    public long get(long index) {
+                        return fMin + packed.get(index) * fGcd;
+                    }
+                };
+            }
+
+            return new BlockPackedData(
+                flatValues, numBlocks, blockMinValues, blockMaxValues, docCount, isDense, docIds
+            );
+        }
+
+        // V4/V5: per-block DirectReader (backward compatibility)
         boolean hasMaxValues = version >= ParquetDocValuesWriter.VERSION_SKIP_INDEX;
         int bytesPerBlock = hasMaxValues ? 33 : 25;
 
@@ -708,7 +754,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         }
 
         // For V4 (no maxValues stored), set maxValues = Long.MAX_VALUE as safe upper bound.
-        // The skipper will still work but won't skip blocks as aggressively.
         if (hasMaxValues == false) {
             for (int b = 0; b < numBlocks; b++) {
                 blockMaxValues[b] = (blockBitsPerValue[b] == 0) ? blockMinValues[b] : Long.MAX_VALUE;
@@ -717,9 +762,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
         long blockDataStart = packedValuesOffset + 4 + (long) bytesPerBlock * numBlocks;
 
-        // O(1) per-value access via per-block DirectReader — no block materialization.
-        // Each block's packed data is read directly from mmap'd memory using DirectReader,
-        // computing min + packed.get(offset) * gcd on the fly. Zero heap allocation per block.
         final LongValues[] blockReaders = new LongValues[numBlocks];
         for (int b = 0; b < numBlocks; b++) {
             if (blockBitsPerValue[b] == 0) {
@@ -1933,17 +1975,11 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             return DocValues.emptySortedSet();
         }
 
-        // Singleton detection: if every document has exactly one ordinal,
-        // wrap as DocValues.singleton() so DocValues.unwrapSingleton() succeeds
+        // Singleton detection: use pre-computed singletonOrds from CachedSortedSet.
+        // Wrap as DocValues.singleton() so DocValues.unwrapSingleton() succeeds
         // (required by GlobalOrdinalsStringTermsAggregator).
-        boolean isSingleton = true;
-        for (long[] ords : docOrds) {
-            if (ords.length != 1) {
-                isSingleton = false;
-                break;
-            }
-        }
-        if (isSingleton) {
+        if (cached.singletonOrds != null) {
+            final long[] singletonOrds = cached.singletonOrds;
             SortedDocValues sortedDv;
             if (cached.isDense) {
                 final int maxDoc = docIds.length;
@@ -1952,7 +1988,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
                     @Override
                     public int ordValue() {
-                        return (int) docOrds[doc][0];
+                        return (int) singletonOrds[doc];
                     }
 
                     @Override
@@ -2006,7 +2042,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
                     @Override
                     public int ordValue() {
-                        return (int) docOrds[idx][0];
+                        return (int) singletonOrds[idx];
                     }
 
                     @Override
