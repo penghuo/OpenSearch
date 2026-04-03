@@ -257,7 +257,7 @@ public class ParquetDocValuesWriterTests extends OpenSearchTestCase {
                 org.apache.lucene.codecs.CodecUtil.checkIndexHeader(
                     in,
                     ParquetDocValuesWriter.META_CODEC,
-                    ParquetDocValuesWriter.VERSION_CURRENT,
+                    ParquetDocValuesWriter.VERSION_START,
                     ParquetDocValuesWriter.VERSION_CURRENT,
                     state.segmentInfo.getId(),
                     state.segmentSuffix

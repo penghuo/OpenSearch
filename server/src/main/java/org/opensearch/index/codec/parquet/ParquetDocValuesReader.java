@@ -15,6 +15,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.FieldInfo;
@@ -42,6 +43,13 @@ import org.apache.parquet.column.page.DictionaryPage;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.column.page.PageReader;
 import org.apache.parquet.column.statistics.Statistics;
+import org.apache.parquet.format.ColumnChunk;
+import org.apache.parquet.format.ColumnMetaData;
+import org.apache.parquet.format.DataPageHeader;
+import org.apache.parquet.format.FileMetaData;
+import org.apache.parquet.format.PageHeader;
+import org.apache.parquet.format.RowGroup;
+import org.apache.parquet.format.Util;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.io.api.Converter;
 import org.apache.parquet.io.api.GroupConverter;
@@ -50,9 +58,11 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.opensearch.common.util.io.IOUtils;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -78,6 +88,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     private static final Logger logger = LogManager.getLogger(ParquetDocValuesReader.class);
     private final IndexInput dataIn;
     private final int version;
+    private final boolean parquetNative;
     private final Map<String, FieldMeta> fields = new HashMap<>();
 
     // Segment-level caches for decoded field data, keyed by field name.
@@ -197,7 +208,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     }
 
     /**
-     * Metadata for a single field, read from the {@code .pdvm} file.
+     * Metadata for a single field, read from the {@code .pdvm} file or Parquet footer.
      */
     static class FieldMeta {
         final String fieldName;
@@ -209,6 +220,8 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         final int pageCount;
         final boolean hasDictionary;
         final long docIdOffset;
+        /** Absolute file offset of packed values section. -1 if not present. Only set for V7+. */
+        final long packedValuesOffset;
 
         FieldMeta(
             String fieldName,
@@ -221,6 +234,21 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             boolean hasDictionary,
             long docIdOffset
         ) {
+            this(fieldName, dvTypeName, repetition, primitiveTypeName, dataStartOffset, dataLength, pageCount, hasDictionary, docIdOffset, -1L);
+        }
+
+        FieldMeta(
+            String fieldName,
+            String dvTypeName,
+            String repetition,
+            String primitiveTypeName,
+            long dataStartOffset,
+            long dataLength,
+            int pageCount,
+            boolean hasDictionary,
+            long docIdOffset,
+            long packedValuesOffset
+        ) {
             this.fieldName = fieldName;
             this.dvTypeName = dvTypeName;
             this.repetition = repetition;
@@ -230,43 +258,76 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             this.pageCount = pageCount;
             this.hasDictionary = hasDictionary;
             this.docIdOffset = docIdOffset;
+            this.packedValuesOffset = packedValuesOffset;
         }
     }
 
     public ParquetDocValuesReader(SegmentReadState state, String dataExtension, String metaExtension, String dataCodec, String metaCodec)
         throws IOException {
         String dataFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, dataExtension);
-        String metaFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, metaExtension);
         boolean success = false;
         IndexInput dataInput = null;
         ChecksumIndexInput metaInput = null;
         try {
             dataInput = state.directory.openInput(dataFileName, state.context);
-            int dataVersion = CodecUtil.checkIndexHeader(
-                dataInput,
-                dataCodec,
-                ParquetDocValuesWriter.VERSION_START,
-                ParquetDocValuesWriter.VERSION_CURRENT,
-                state.segmentInfo.getId(),
-                state.segmentSuffix
-            );
 
-            metaInput = state.directory.openChecksumInput(metaFileName);
-            CodecUtil.checkIndexHeader(
-                metaInput,
-                metaCodec,
-                ParquetDocValuesWriter.VERSION_START,
-                ParquetDocValuesWriter.VERSION_CURRENT,
-                state.segmentInfo.getId(),
-                state.segmentSuffix
-            );
+            // Detect V7 Parquet-native format by checking for leading PAR1 magic
+            byte[] magic = new byte[4];
+            dataInput.readBytes(magic, 0, 4);
+            dataInput.seek(0); // Reset position
 
-            readFields(metaInput, dataVersion);
-            CodecUtil.checkFooter(metaInput);
+            if (Arrays.equals(magic, ParquetFooterWriter.PARQUET_MAGIC)) {
+                // V7: Parquet-native format — read footer from EOF
+                ParquetFooterReader footerReader = new ParquetFooterReader(dataInput);
+                FileMetaData fileMetaData = footerReader.readFooter();
+                Map<String, String> kv = ParquetFooterReader.extractKvMetadata(fileMetaData);
 
-            this.dataIn = dataInput;
-            this.version = dataVersion;
-            success = true;
+                int dataVersion = Integer.parseInt(kv.get("lucene.codec.version"));
+                // Validate segment ID
+                String expectedSegId = bytesToHex(state.segmentInfo.getId());
+                String actualSegId = kv.get("lucene.segment.id");
+                if (!expectedSegId.equals(actualSegId)) {
+                    throw new CorruptIndexException(
+                        "Segment ID mismatch: expected " + expectedSegId + " but got " + actualSegId,
+                        dataInput.toString()
+                    );
+                }
+
+                this.version = dataVersion;
+                buildFieldsFromFooter(fileMetaData, kv, dataInput);
+                this.dataIn = dataInput;
+                this.parquetNative = true;
+                success = true;
+            } else {
+                // V2-V6: legacy CodecUtil format with separate .pdvm file
+                int dataVersion = CodecUtil.checkIndexHeader(
+                    dataInput,
+                    dataCodec,
+                    ParquetDocValuesWriter.VERSION_START,
+                    ParquetDocValuesWriter.VERSION_CURRENT,
+                    state.segmentInfo.getId(),
+                    state.segmentSuffix
+                );
+
+                String metaFileName = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, metaExtension);
+                metaInput = state.directory.openChecksumInput(metaFileName);
+                CodecUtil.checkIndexHeader(
+                    metaInput,
+                    metaCodec,
+                    ParquetDocValuesWriter.VERSION_START,
+                    ParquetDocValuesWriter.VERSION_CURRENT,
+                    state.segmentInfo.getId(),
+                    state.segmentSuffix
+                );
+
+                readFields(metaInput, dataVersion);
+                CodecUtil.checkFooter(metaInput);
+
+                this.dataIn = dataInput;
+                this.version = dataVersion;
+                this.parquetNative = false;
+                success = true;
+            }
             // Eagerly warm up all field caches during reader construction.
             // This moves the Zstd decompression + decode cost from the first query
             // to segment open, eliminating p90 spikes on first-access lazy decode.
@@ -311,6 +372,85 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             );
             fieldName = metaIn.readString();
         }
+    }
+
+    /**
+     * Builds FieldMeta entries from the Parquet footer's ColumnMetaData and KV metadata.
+     * Computes each field's dataLength by looking at the next column's offset or the footer start.
+     */
+    private void buildFieldsFromFooter(FileMetaData fileMetaData, Map<String, String> kv, IndexInput input) throws IOException {
+        RowGroup rowGroup = fileMetaData.getRow_groups().get(0);
+        List<ColumnChunk> columns = rowGroup.getColumns();
+
+        // Compute footer start position for determining the last field's boundary
+        // File layout: ... | footer bytes | 4-byte footer length LE | PAR1
+        long fileLen = input.length();
+        input.seek(fileLen - 8);
+        byte[] footerLenBytes = new byte[4];
+        input.readBytes(footerLenBytes, 0, 4);
+        int footerLen = java.nio.ByteBuffer.wrap(footerLenBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt();
+        long footerStart = fileLen - 8 - footerLen;
+
+        for (int i = 0; i < columns.size(); i++) {
+            ColumnChunk cc = columns.get(i);
+            ColumnMetaData colMeta = cc.getMeta_data();
+            String fieldName = colMeta.getPath_in_schema().get(0);
+            String prefix = "field." + fieldName + ".";
+
+            long dataStartOffset = cc.getFile_offset();
+
+            // Compute dataLength: extends to next column's start or the footer start
+            long endOffset;
+            if (i + 1 < columns.size()) {
+                endOffset = columns.get(i + 1).getFile_offset();
+            } else {
+                endOffset = footerStart;
+            }
+            long dataLength = endOffset - dataStartOffset;
+
+            String packedValStr = kv.get(prefix + "packedValuesOffset");
+            long packedValuesOffset = (packedValStr != null) ? Long.parseLong(packedValStr) : -1L;
+
+            fields.put(fieldName, new FieldMeta(
+                fieldName,
+                kv.get(prefix + "dvTypeName"),
+                kv.get(prefix + "repetition"),
+                colMeta.getType().name(),
+                dataStartOffset,
+                dataLength,
+                Integer.parseInt(kv.get(prefix + "pageCount")),
+                Boolean.parseBoolean(kv.get(prefix + "hasDictionary")),
+                Long.parseLong(kv.get(prefix + "docIdOffset")),
+                packedValuesOffset
+            ));
+        }
+    }
+
+    /**
+     * Reads a Parquet PageHeader from the given IndexInput using Thrift deserialization.
+     * Reads a buffer, deserializes the header, and advances the input past the header bytes.
+     */
+    private static PageHeader readPageHeader(IndexInput input) throws IOException {
+        long startPos = input.getFilePointer();
+        int bufSize = (int) Math.min(256, input.length() - startPos);
+        byte[] buf = new byte[bufSize];
+        input.readBytes(buf, 0, bufSize);
+        ByteArrayInputStream bais = new ByteArrayInputStream(buf, 0, bufSize);
+        PageHeader ph = Util.readPageHeader(bais);
+        // Advance input to actual position after the header
+        input.seek(startPos + (bufSize - bais.available()));
+        return ph;
+    }
+
+    /**
+     * Converts a byte array to a hex string.
+     */
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b & 0xFF));
+        }
+        return sb.toString();
     }
 
     /**
@@ -401,43 +541,87 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         List<DataPage> dataPages = new ArrayList<>();
         long totalValueCount = 0;
         long totalRowCount = 0;
-        for (int i = 0; i < meta.pageCount; i++) {
-            int compressedSize = slice.readInt();
-            int uncompressedSize = slice.readInt();
-            int valueCount = slice.readInt();
-            int rowCount = slice.readInt();
-            String valuesEncodingName = slice.readString();
-            String rlEncodingName = slice.readString();
-            String dlEncodingName = slice.readString();
-            byte[] compressedBytes = new byte[compressedSize];
-            slice.readBytes(compressedBytes, 0, compressedSize);
-            byte[] pageBytes = Zstd.decompress(compressedBytes, uncompressedSize);
-            dataPages.add(
-                new DataPageV1(
+
+        if (version >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE) {
+            // V7: read standard Parquet PageHeader (Thrift)
+            for (int i = 0; i < meta.pageCount; i++) {
+                PageHeader ph = readPageHeader(slice);
+                int compressedSize = ph.getCompressed_page_size();
+                int uncompressedSize = ph.getUncompressed_page_size();
+
+                DataPageHeader dph = ph.getData_page_header();
+                int valueCount = dph.getNum_values();
+
+                byte[] compressedBytes = new byte[compressedSize];
+                slice.readBytes(compressedBytes, 0, compressedSize);
+                byte[] pageBytes = Zstd.decompress(compressedBytes, uncompressedSize);
+
+                dataPages.add(new DataPageV1(
                     BytesInput.from(pageBytes),
                     valueCount,
                     uncompressedSize,
                     Statistics.getBuilderForReading(parquetType).build(),
-                    Encoding.valueOf(rlEncodingName),
-                    Encoding.valueOf(dlEncodingName),
-                    Encoding.valueOf(valuesEncodingName)
-                )
-            );
-            totalValueCount += valueCount;
-            totalRowCount += rowCount;
+                    Encoding.valueOf(dph.getRepetition_level_encoding().name()),
+                    Encoding.valueOf(dph.getDefinition_level_encoding().name()),
+                    Encoding.valueOf(dph.getEncoding().name())
+                ));
+                totalValueCount += valueCount;
+                totalRowCount += valueCount;
+            }
+        } else {
+            // V2-V6: legacy custom page format
+            for (int i = 0; i < meta.pageCount; i++) {
+                int compressedSize = slice.readInt();
+                int uncompressedSize = slice.readInt();
+                int valueCount = slice.readInt();
+                int rowCount = slice.readInt();
+                String valuesEncodingName = slice.readString();
+                String rlEncodingName = slice.readString();
+                String dlEncodingName = slice.readString();
+                byte[] compressedBytes = new byte[compressedSize];
+                slice.readBytes(compressedBytes, 0, compressedSize);
+                byte[] pageBytes = Zstd.decompress(compressedBytes, uncompressedSize);
+                dataPages.add(
+                    new DataPageV1(
+                        BytesInput.from(pageBytes),
+                        valueCount,
+                        uncompressedSize,
+                        Statistics.getBuilderForReading(parquetType).build(),
+                        Encoding.valueOf(rlEncodingName),
+                        Encoding.valueOf(dlEncodingName),
+                        Encoding.valueOf(valuesEncodingName)
+                    )
+                );
+                totalValueCount += valueCount;
+                totalRowCount += rowCount;
+            }
         }
 
         // Read dictionary page (after data pages, before doc IDs)
         DictionaryPage dictPage = null;
         if (meta.hasDictionary) {
-            int compressedSize = slice.readInt();
-            int uncompressedSize = slice.readInt();
-            int dictSize = slice.readInt();
-            String dictEncodingName = slice.readString();
-            byte[] compressedBytes = new byte[compressedSize];
-            slice.readBytes(compressedBytes, 0, compressedSize);
-            byte[] dictBytes = Zstd.decompress(compressedBytes, uncompressedSize);
-            dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
+            if (version >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE) {
+                // V7: read Thrift PageHeader for dictionary page
+                PageHeader ph = readPageHeader(slice);
+                int compressedSize = ph.getCompressed_page_size();
+                int uncompressedSize = ph.getUncompressed_page_size();
+                int dictSize = ph.getDictionary_page_header().getNum_values();
+                String dictEncodingName = ph.getDictionary_page_header().getEncoding().name();
+                byte[] compressedBytes = new byte[compressedSize];
+                slice.readBytes(compressedBytes, 0, compressedSize);
+                byte[] dictBytes = Zstd.decompress(compressedBytes, uncompressedSize);
+                dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
+            } else {
+                // V2-V6: legacy custom dict page format
+                int compressedSize = slice.readInt();
+                int uncompressedSize = slice.readInt();
+                int dictSize = slice.readInt();
+                String dictEncodingName = slice.readString();
+                byte[] compressedBytes = new byte[compressedSize];
+                slice.readBytes(compressedBytes, 0, compressedSize);
+                byte[] dictBytes = Zstd.decompress(compressedBytes, uncompressedSize);
+                dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
+            }
         }
 
         final DictionaryPage finalDictPage = dictPage;
@@ -867,16 +1051,24 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             if (docIdData.docCount == 0) {
                 return new CachedNumeric(docIdData.docIds, new long[0], docIdData.isDense);
             }
-            // Packed values section starts right after doc IDs in the .pdvd file
-            long fieldEndOffset = meta.dataStartOffset + meta.dataLength;
-            if (docIdData.endOffset < fieldEndOffset) {
+            // For V7, use packedValuesOffset from footer; for V3-V6, derive from docId end
+            long packedStart = -1;
+            if (version >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE && meta.packedValuesOffset >= 0) {
+                packedStart = meta.packedValuesOffset;
+            } else {
+                long fieldEndOffset = meta.dataStartOffset + meta.dataLength;
+                if (docIdData.endOffset < fieldEndOffset) {
+                    packedStart = docIdData.endOffset;
+                }
+            }
+            if (packedStart >= 0) {
                 LongValues packedValues;
                 if (version >= ParquetDocValuesWriter.VERSION_BLOCK_PACKED) {
-                    BlockPackedData bpd = loadBlockPackedData(docIdData.endOffset, docIdData.docCount, docIdData.isDense, docIdData.docIds);
+                    BlockPackedData bpd = loadBlockPackedData(packedStart, docIdData.docCount, docIdData.isDense, docIdData.docIds);
                     skipperCache.putIfAbsent(meta.fieldName, bpd);
                     packedValues = bpd.values;
                 } else {
-                    packedValues = loadPackedValues(docIdData.endOffset, docIdData.docCount);
+                    packedValues = loadPackedValues(packedStart, docIdData.docCount);
                 }
                 return new CachedNumericPacked(docIdData.docIds, packedValues, docIdData.isDense, docIdData.docCount);
             }
@@ -1513,15 +1705,24 @@ public class ParquetDocValuesReader extends DocValuesProducer {
             if (docIdData.docCount == 0) {
                 return new CachedSortedNumeric(docIdData.docIds, new long[0][], docIdData.isDense);
             }
-            long fieldEndOffset = meta.dataStartOffset + meta.dataLength;
-            if (docIdData.endOffset < fieldEndOffset) {
+            // For V7, use packedValuesOffset from footer; for V3-V6, derive from docId end
+            long packedStart = -1;
+            if (version >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE && meta.packedValuesOffset >= 0) {
+                packedStart = meta.packedValuesOffset;
+            } else {
+                long fieldEndOffset = meta.dataStartOffset + meta.dataLength;
+                if (docIdData.endOffset < fieldEndOffset) {
+                    packedStart = docIdData.endOffset;
+                }
+            }
+            if (packedStart >= 0) {
                 LongValues packedValues;
                 if (version >= ParquetDocValuesWriter.VERSION_BLOCK_PACKED) {
-                    BlockPackedData bpd = loadBlockPackedData(docIdData.endOffset, docIdData.docCount, docIdData.isDense, docIdData.docIds);
+                    BlockPackedData bpd = loadBlockPackedData(packedStart, docIdData.docCount, docIdData.isDense, docIdData.docIds);
                     skipperCache.putIfAbsent(meta.fieldName, bpd);
                     packedValues = bpd.values;
                 } else {
-                    packedValues = loadPackedValues(docIdData.endOffset, docIdData.docCount);
+                    packedValues = loadPackedValues(packedStart, docIdData.docCount);
                 }
                 return new CachedSortedNumericPacked(docIdData.docIds, packedValues, docIdData.isDense, docIdData.docCount);
             }
@@ -2572,7 +2773,12 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
     @Override
     public void checkIntegrity() throws IOException {
-        CodecUtil.checksumEntireFile(dataIn);
+        if (parquetNative) {
+            // V7: Parquet-native format validates via PAR1 magic and Thrift footer deserialization.
+            // No CodecUtil checksum is present.
+        } else {
+            CodecUtil.checksumEntireFile(dataIn);
+        }
     }
 
     @Override
