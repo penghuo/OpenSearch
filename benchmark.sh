@@ -43,7 +43,7 @@ CLEAN="${3:-no}"
 WORKLOAD="${4:-http_log}"
 
 # Tasks to exclude for http_log_basic (skip force-merge and post-merge queries)
-EXCLUDE_TASKS_BASIC="force-merge-1-seg,refresh-after-force-merge-1-seg,wait-until-merges-1-seg-finish,desc-sort-timestamp-after-force-merge-1-seg,asc-sort-timestamp-after-force-merge-1-seg,desc-sort-with-after-timestamp-after-force-merge-1-seg,asc-sort-with-after-timestamp-after-force-merge-1-seg"
+EXCLUDE_TASKS_BASIC="force-merge-1-seg,refresh-after-force-merge-1-seg,wait-until-merges-1-seg-finish,desc-sort-timestamp-after-force-merge-1-seg,asc-sort-timestamp-after-force-merge-1-seg,desc-sort-with-after-timestamp-after-force-merge-1-seg,asc-sort-with-after-timestamp-after-force-merge-1-seg,scroll"
 
 mkdir -p "$RESULTS_DIR"
 
