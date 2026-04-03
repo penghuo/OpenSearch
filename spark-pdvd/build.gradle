@@ -1,0 +1,23 @@
+plugins {
+    id 'java'
+}
+
+group = 'org.opensearch.spark'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly 'org.apache.parquet:parquet-common:1.16.0'
+}
+
+jar {
+    archiveBaseName = 'opensearch-spark-pdvd'
+}
