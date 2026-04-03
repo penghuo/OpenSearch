@@ -753,11 +753,16 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
         private final List<org.apache.parquet.format.Encoding> encodings;
         private long firstDataPageOffset = -1;
         private long dictPageOffset = -1;
+        // V7: buffer data pages so dict page can be written first (standard Parquet order)
+        private ByteArrayOutputStream bufferedDataPages;
 
         StreamingPageWriter(IndexOutput out, boolean parquetNative) {
             this.out = out;
             this.parquetNative = parquetNative;
             this.encodings = new ArrayList<>();
+            if (parquetNative) {
+                this.bufferedDataPages = new ByteArrayOutputStream();
+            }
         }
 
         StreamingPageWriter(IndexOutput out) {
@@ -790,10 +795,7 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             byte[] compressedBytes = Zstd.compress(pageBytes);
 
             if (parquetNative) {
-                if (firstDataPageOffset < 0) {
-                    firstDataPageOffset = out.getFilePointer();
-                }
-
+                // V7: buffer data pages — dict page will be written first in writeDictionaryPageToOutput()
                 PageHeader ph = new PageHeader(PageType.DATA_PAGE, pageBytes.length, compressedBytes.length);
                 ph.setData_page_header(new DataPageHeader(
                     valueCount,
@@ -803,8 +805,8 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
                 ));
 
                 byte[] headerBytes = serializePageHeader(ph);
-                out.writeBytes(headerBytes, headerBytes.length);
-                out.writeBytes(compressedBytes, compressedBytes.length);
+                bufferedDataPages.write(headerBytes);
+                bufferedDataPages.write(compressedBytes);
 
                 totalCompressedSize += headerBytes.length + compressedBytes.length;
                 totalUncompressedSize += headerBytes.length + pageBytes.length;
@@ -875,13 +877,19 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
             );
         }
 
-        /** Writes the buffered dictionary page to the output, if any. */
+        /**
+         * Writes the buffered dictionary page and data pages to the output.
+         * For V7 (parquetNative): writes dict page FIRST, then buffered data pages.
+         * This ensures standard Parquet page order (dict before data).
+         * For legacy: writes dict page after data pages (existing behavior).
+         */
         void writeDictionaryPageToOutput() throws IOException {
-            if (dictionaryPage != null) {
-                byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
-                byte[] compressedBytes = Zstd.compress(dictBytes);
+            if (parquetNative) {
+                // V7: write dict page first (standard Parquet order), then flush buffered data pages
+                if (dictionaryPage != null) {
+                    byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
+                    byte[] compressedBytes = Zstd.compress(dictBytes);
 
-                if (parquetNative) {
                     dictPageOffset = out.getFilePointer();
 
                     PageHeader ph = new PageHeader(PageType.DICTIONARY_PAGE, dictBytes.length, compressedBytes.length);
@@ -897,7 +905,20 @@ public class ParquetDocValuesWriter extends DocValuesConsumer {
                     totalCompressedSize += headerBytes.length + compressedBytes.length;
                     totalUncompressedSize += headerBytes.length + dictBytes.length;
                     addEncoding(convertEncoding(dictionaryPage.getEncoding()));
-                } else {
+                }
+
+                // Now flush buffered data pages
+                firstDataPageOffset = out.getFilePointer();
+                byte[] dataPageBytes = bufferedDataPages.toByteArray();
+                if (dataPageBytes.length > 0) {
+                    out.writeBytes(dataPageBytes, dataPageBytes.length);
+                }
+                bufferedDataPages = null; // release memory
+            } else {
+                // Legacy: dict page after data pages
+                if (dictionaryPage != null) {
+                    byte[] dictBytes = dictionaryPage.getBytes().toByteArray();
+                    byte[] compressedBytes = Zstd.compress(dictBytes);
                     out.writeInt(compressedBytes.length);
                     out.writeInt(dictBytes.length);
                     out.writeInt(dictionaryPage.getDictionarySize());

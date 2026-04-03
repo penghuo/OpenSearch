@@ -516,8 +516,26 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         long totalValueCount = 0;
         long totalRowCount = 0;
 
+        // Read dictionary page and data pages
+        // V7: dict page comes FIRST (standard Parquet order)
+        // V2-V6: data pages first, then dict page
+        DictionaryPage dictPage = null;
+
         if (version >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE) {
-            // V7: read standard Parquet PageHeader (Thrift)
+            // V7: read dict page first (standard Parquet page order: dict, then data)
+            if (meta.hasDictionary) {
+                PageHeader ph = readPageHeader(slice);
+                int compressedSize = ph.getCompressed_page_size();
+                int uncompressedSize = ph.getUncompressed_page_size();
+                int dictSize = ph.getDictionary_page_header().getNum_values();
+                String dictEncodingName = ph.getDictionary_page_header().getEncoding().name();
+                byte[] compressedBytes = new byte[compressedSize];
+                slice.readBytes(compressedBytes, 0, compressedSize);
+                byte[] dictBytes = Zstd.decompress(compressedBytes, uncompressedSize);
+                dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
+            }
+
+            // Then read data pages
             for (int i = 0; i < meta.pageCount; i++) {
                 PageHeader ph = readPageHeader(slice);
                 int compressedSize = ph.getCompressed_page_size();
@@ -543,7 +561,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 totalRowCount += valueCount;
             }
         } else {
-            // V2-V6: legacy custom page format
+            // V2-V6: data pages first, then dict page
             for (int i = 0; i < meta.pageCount; i++) {
                 int compressedSize = slice.readInt();
                 int uncompressedSize = slice.readInt();
@@ -569,24 +587,8 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 totalValueCount += valueCount;
                 totalRowCount += rowCount;
             }
-        }
 
-        // Read dictionary page (after data pages, before doc IDs)
-        DictionaryPage dictPage = null;
-        if (meta.hasDictionary) {
-            if (version >= ParquetDocValuesWriter.VERSION_PARQUET_NATIVE) {
-                // V7: read Thrift PageHeader for dictionary page
-                PageHeader ph = readPageHeader(slice);
-                int compressedSize = ph.getCompressed_page_size();
-                int uncompressedSize = ph.getUncompressed_page_size();
-                int dictSize = ph.getDictionary_page_header().getNum_values();
-                String dictEncodingName = ph.getDictionary_page_header().getEncoding().name();
-                byte[] compressedBytes = new byte[compressedSize];
-                slice.readBytes(compressedBytes, 0, compressedSize);
-                byte[] dictBytes = Zstd.decompress(compressedBytes, uncompressedSize);
-                dictPage = new DictionaryPage(BytesInput.from(dictBytes), dictSize, Encoding.valueOf(dictEncodingName));
-            } else {
-                // V2-V6: legacy custom dict page format
+            if (meta.hasDictionary) {
                 int compressedSize = slice.readInt();
                 int uncompressedSize = slice.readInt();
                 int dictSize = slice.readInt();
