@@ -40,20 +40,15 @@ public class ParquetFooterReader {
         this.input = input;
     }
 
-    /** CodecUtil footer is 16 bytes: magic(4) + algorithmID(4) + checksum(8). */
-    static final int CODEC_UTIL_FOOTER_LENGTH = 16;
-
     /**
-     * Reads the Parquet footer from the end of the file.
-     * <p>
-     * File layout: {@code [CodecUtil header][PAR1][data...][Parquet footer][footer_len(4 LE)][PAR1][CodecUtil footer(16)]}.
-     * The CodecUtil footer at the very end is skipped to find the Parquet trailing PAR1.
+     * Reads the Parquet footer from the end of the file assuming standard Parquet layout
+     * (no trailing bytes after the PAR1 magic).
      *
      * @return the deserialized {@link FileMetaData}
      * @throws IOException if an I/O error occurs or the file is corrupt
      */
     public FileMetaData readFooter() throws IOException {
-        return readFooter(CODEC_UTIL_FOOTER_LENGTH);
+        return readFooter(0);
     }
 
     /**

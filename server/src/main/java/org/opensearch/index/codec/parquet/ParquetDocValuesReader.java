@@ -15,7 +15,6 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
-import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.FieldInfo;
@@ -62,7 +61,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -88,7 +86,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
     private static final Logger logger = LogManager.getLogger(ParquetDocValuesReader.class);
     private final IndexInput dataIn;
     private final int version;
-    private final boolean parquetNative;
     private final Map<String, FieldMeta> fields = new HashMap<>();
 
     // Segment-level caches for decoded field data, keyed by field name.
@@ -286,15 +283,14 @@ public class ParquetDocValuesReader extends DocValuesProducer {
                 // Skip the PAR1 magic (4 bytes) — it's for external Parquet readers
                 dataInput.seek(dataInput.getFilePointer() + 4);
 
-                // Read Parquet footer from EOF (before CodecUtil footer)
+                // Read Parquet footer from EOF, skipping trailing CodecUtil footer
                 ParquetFooterReader footerReader = new ParquetFooterReader(dataInput);
-                FileMetaData fileMetaData = footerReader.readFooter();
+                FileMetaData fileMetaData = footerReader.readFooter(CodecUtil.footerLength());
                 Map<String, String> kv = ParquetFooterReader.extractKvMetadata(fileMetaData);
 
                 this.version = dataVersion;
                 buildFieldsFromFooter(fileMetaData, kv, dataInput);
                 this.dataIn = dataInput;
-                this.parquetNative = true;
                 success = true;
             } else {
                 // V2-V6: legacy format with separate .pdvm file
@@ -314,7 +310,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
 
                 this.dataIn = dataInput;
                 this.version = dataVersion;
-                this.parquetNative = false;
                 success = true;
             }
             // Eagerly warm up all field caches during reader construction.
@@ -372,13 +367,14 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         List<ColumnChunk> columns = rowGroup.getColumns();
 
         // Compute footer start position for determining the last field's boundary
-        // File layout: ... | footer bytes | 4-byte footer length LE | PAR1
+        // File layout: ... | footer bytes | 4-byte footer length LE | PAR1 | CodecUtil footer (16B)
         long fileLen = input.length();
-        input.seek(fileLen - 8);
+        long parquetEnd = fileLen - CodecUtil.footerLength(); // skip CodecUtil footer
+        input.seek(parquetEnd - 8); // seek to footer length position (before trailing PAR1)
         byte[] footerLenBytes = new byte[4];
         input.readBytes(footerLenBytes, 0, 4);
         int footerLen = java.nio.ByteBuffer.wrap(footerLenBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt();
-        long footerStart = fileLen - 8 - footerLen;
+        long footerStart = parquetEnd - 8 - footerLen;
 
         for (int i = 0; i < columns.size(); i++) {
             ColumnChunk cc = columns.get(i);
@@ -429,17 +425,6 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         // Advance input to actual position after the header
         input.seek(startPos + (bufSize - bais.available()));
         return ph;
-    }
-
-    /**
-     * Converts a byte array to a hex string.
-     */
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(String.format("%02x", b & 0xFF));
-        }
-        return sb.toString();
     }
 
     /**
@@ -868,7 +853,7 @@ public class ParquetDocValuesReader extends DocValuesProducer {
         in.seek(packedValuesOffset);
         int numBlocks = in.readInt();
 
-        // V6: flat packed values with separate block skip index
+        // V6+: flat packed values with separate block skip index
         if (version >= ParquetDocValuesWriter.VERSION_FLAT_PACKED) {
             long[] blockMinValues = new long[numBlocks];
             long[] blockMaxValues = new long[numBlocks];
