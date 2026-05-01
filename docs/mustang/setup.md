@@ -291,7 +291,7 @@ If instead you see `SearchPhaseExecutionException: all shards failed` on a parqu
 
 ## 7. Running ClickBench via shell (no JUnit)
 
-The os-sql repo ships mapping + data + 43 PPL queries under `integ-test/src/test/resources/clickbench/`. A shell harness is at `docs/mustang/scripts/clickbench.sh`:
+The harness is self-contained: mapping + data + 43 PPL queries are vendored at `docs/mustang/clickbench/`. The harness is at `docs/mustang/scripts/clickbench.sh`.
 
 ```bash
 cd docs/mustang/scripts
@@ -301,7 +301,9 @@ PARQUET=1 FORCE_ROUTING=1 ./clickbench.sh setup
 FORCE_ROUTING=1 ./clickbench.sh run
 ```
 
-See the script header for full flag reference. On the 1-row sample dataset, expect ~20/43 to pass; failures map to real analytics-engine compatibility gaps (`UnsupportedOperationException`, `IllegalStateException`, `IllegalArgumentException`).
+Env vars: `ENDPOINT`, `INDEX`, `PARQUET`, `FORCE_ROUTING`, `RESOURCES_DIR` (override vendored path), `OS_SQL_DIR` (override with a live os-sql checkout). See the script header for full reference.
+
+On the 1-row sample dataset, expect ~20/43 to pass; failures map to real analytics-engine compatibility gaps (`UnsupportedOperationException`, `IllegalStateException`, `IllegalArgumentException`).
 
 ---
 

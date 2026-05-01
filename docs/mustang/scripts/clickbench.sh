@@ -15,11 +15,13 @@
 #   ./clickbench.sh all         # setup + run (leaves index in place)
 #
 # Env vars:
-#   ENDPOINT   cluster REST endpoint (default: http://localhost:9200)
-#   INDEX      index name (default: hits)
-#   PARQUET    1=create index with pluggable.dataformat=parquet settings (default: 1)
-#   FORCE_ROUTING   1=set plugins.calcite.analytics.force_routing=true before running queries (default: 0)
-#   OS_SQL_DIR path to os-sql repo (default: /home/penghuo/oss/os-sql)
+#   ENDPOINT       cluster REST endpoint (default: http://localhost:9200)
+#   INDEX          index name (default: hits)
+#   PARQUET        1=create index with pluggable.dataformat=parquet settings (default: 1)
+#   FORCE_ROUTING  1=set plugins.calcite.analytics.force_routing=true before running (default: 0)
+#   RESOURCES_DIR  path to clickbench resources (default: <script_dir>/../clickbench)
+#   OS_SQL_DIR     optional: if set, override RESOURCES_DIR with
+#                  $OS_SQL_DIR/integ-test/src/test/resources/clickbench (for live os-sql checkouts)
 #
 # Exit codes:
 #   0  all queries passed
@@ -28,15 +30,25 @@
 
 set -uo pipefail
 
+# Resolve script directory so default resource path works from any CWD
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
 ENDPOINT="${ENDPOINT:-http://localhost:9200}"
 INDEX="${INDEX:-hits}"
 PARQUET="${PARQUET:-1}"
 FORCE_ROUTING="${FORCE_ROUTING:-0}"
-OS_SQL_DIR="${OS_SQL_DIR:-/home/penghuo/oss/os-sql}"
 
-MAPPING_FILE="${OS_SQL_DIR}/integ-test/src/test/resources/clickbench/mappings/clickbench_index_mapping.json"
-DATA_FILE="${OS_SQL_DIR}/integ-test/src/test/resources/clickbench/data/clickbench.json"
-QUERIES_DIR="${OS_SQL_DIR}/integ-test/src/test/resources/clickbench/queries"
+# Resource location — vendored alongside the script by default, overridable
+# for developers using a live os-sql checkout.
+if [ -n "${OS_SQL_DIR:-}" ]; then
+    RESOURCES_DIR="${OS_SQL_DIR}/integ-test/src/test/resources/clickbench"
+else
+    RESOURCES_DIR="${RESOURCES_DIR:-${SCRIPT_DIR}/../clickbench}"
+fi
+
+MAPPING_FILE="${RESOURCES_DIR}/mappings/clickbench_index_mapping.json"
+DATA_FILE="${RESOURCES_DIR}/data/clickbench.json"
+QUERIES_DIR="${RESOURCES_DIR}/queries"
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 log()   { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -298,6 +310,6 @@ case "${1:-}" in
     *)
         echo "Usage: $0 {setup|run|one <N>|teardown|all}" >&2
         echo ""
-        echo "Env vars: ENDPOINT INDEX PARQUET FORCE_ROUTING OS_SQL_DIR" >&2
+        echo "Env vars: ENDPOINT INDEX PARQUET FORCE_ROUTING RESOURCES_DIR OS_SQL_DIR" >&2
         exit 2 ;;
 esac
