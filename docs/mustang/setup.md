@@ -291,10 +291,10 @@ If instead you see `SearchPhaseExecutionException: all shards failed` on a parqu
 
 ## 7. Running ClickBench via shell (no JUnit)
 
-The repo ships mapping + data + 43 PPL queries under `integ-test/src/test/resources/clickbench/`. A shell harness is at `.sisyphus/clickbench/clickbench.sh`:
+The os-sql repo ships mapping + data + 43 PPL queries under `integ-test/src/test/resources/clickbench/`. A shell harness is at `docs/mustang/scripts/clickbench.sh`:
 
 ```bash
-cd .sisyphus/clickbench
+cd docs/mustang/scripts
 
 # parquet-backed index + force routing → all queries through analytics-engine
 PARQUET=1 FORCE_ROUTING=1 ./clickbench.sh setup
