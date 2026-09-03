@@ -177,6 +177,21 @@ strings.
 It does **not** convey numeric width: `ValueType.LONG` and `ValueType.DOUBLE` both map to `CoreValuesSourceType.NUMERIC`.
 (`numeric_type` on a sort also accepts `unsigned_long`, despite its error message listing four.)
 
+**The sharp edge, found by the REST test rather than by reading.** The field reports itself as numeric, so `terms` on a
+path holding *words* buckets through a numeric values source, coerces none of them, and returns **zero buckets with no
+error**. It needs `value_type: string`:
+
+```json
+{"terms": {"field": "attributes.k8s.namespace", "value_type": "string"}}
+```
+
+A schemaless column cannot infer this, and one default cannot serve both. Numeric is the right default because it is
+what makes `sum`/`avg`/`min`/`max` and a numeric sort work with no hint at all — the headline case — and because the
+alternative default would make *those* fail. The empty result is the same thing a `terms` aggregation on a declared
+numeric field does when handed words, so it is at least not a new behaviour. Both spellings are pinned in
+`93_flat_object_columnar_aggregation.yml` so this is a contract rather than a surprise; a path with a declared type
+(Phase 2) stops needing the hint.
+
 ### 4.2 Width
 
 `DOUBLE`, with the limit documented: integers above 2^53 lose precision through an aggregation. `sum` and `avg` return
@@ -379,6 +394,12 @@ column. That is a bug fix, but it is not advertised.
 including unsorted keys, prefix-overlapping keys, non-ASCII and empty; fielddata agrees with `_source` on every path and
 type in `RICH_DOC`; arrays expand ascending and recursively, skipping an object element; a key absent from a segment
 serves nothing.
+
+**Done, at the REST layer** — `93_flat_object_columnar_aggregation.yml`, nine cases over **three shards** so the
+coordinator reduce and `DocValueFormat` serialisation are exercised (a single-shard test passes while the feature is
+broken for every real cluster): metrics with no script, `terms` with and without `value_type`, a nested path, the
+mixed-type partial answer with `value_count` as the signal, array expansion including `min`/`max` to catch ordering, a
+descending sort with `numeric_type: long`, an absent path, and `docvalue_fields`.
 
 **Open**
 

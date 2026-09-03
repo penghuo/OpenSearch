@@ -1,0 +1,260 @@
+---
+# Aggregating and sorting a flat_object subfield directly, with no derived field and no script.
+#
+# Deliberately THREE SHARDS. Every aggregation asks the field type for a DocValueFormat and ships it to the coordinator
+# for the reduce; a format that is not a registered NamedWriteable fails there and nowhere else, so a single-shard test
+# would pass while the feature was broken for every real cluster.
+
+setup:
+  - skip:
+      version: " - 3.5.99"
+      reason: "flat_object values became readable from a doc-values column in 3.6.0"
+
+  - do:
+      indices.create:
+        index: flat_object_columnar
+        body:
+          settings:
+            number_of_shards: 3
+            number_of_replicas: 0
+          mappings:
+            properties:
+              attributes:
+                type: "flat_object"
+
+  # status is numeric everywhere. code is numeric in three documents and a word in two, which is the mixed-type case a
+  # schemaless field has to survive. ports holds arrays, including a nested one.
+  - do:
+      bulk:
+        refresh: true
+        index: flat_object_columnar
+        body: |
+          {"index":{"_id":"1"}}
+          {"attributes":{"status":200,"code":200,"ports":[443,80],"k8s.namespace":"ns-a","nested":{"deep":{"value":11}}}}
+          {"index":{"_id":"2"}}
+          {"attributes":{"status":300,"code":404,"ports":[[8080,22],1],"k8s.namespace":"ns-b","nested":{"deep":{"value":22}}}}
+          {"index":{"_id":"3"}}
+          {"attributes":{"status":400,"code":"OK","k8s.namespace":"ns-a"}}
+          {"index":{"_id":"4"}}
+          {"attributes":{"status":500,"code":"FAIL","k8s.namespace":"ns-b"}}
+          {"index":{"_id":"5"}}
+          {"attributes":{"status":600,"code":"500","k8s.namespace":"ns-a"}}
+
+---
+"Aggregate a subfield with no script":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.status
+            mean:
+              avg:
+                field: attributes.status
+            lowest:
+              min:
+                field: attributes.status
+            highest:
+              max:
+                field: attributes.status
+            counted:
+              value_count:
+                field: attributes.status
+
+  # 200 + 300 + 400 + 500 + 600
+  - match: { aggregations.total.value: 2000.0 }
+  - match: { aggregations.mean.value: 400.0 }
+  - match: { aggregations.lowest.value: 200.0 }
+  - match: { aggregations.highest.value: 600.0 }
+  - match: { aggregations.counted.value: 5 }
+
+---
+"Group by a string subfield":
+  # value_type is required here, and its absence is pinned in the next test.
+  #
+  # The column is schemaless, so nothing declares whether a path holds numbers or words. The field reports itself as
+  # numeric, because that is what makes sum/avg/min/max and a numeric sort work with no hint at all -- the common case.
+  # A path holding words therefore has to say so, exactly as it would for an unmapped or runtime field.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            by_namespace:
+              terms:
+                field: attributes.k8s.namespace
+                value_type: string
+                size: 10
+              aggs:
+                total:
+                  sum:
+                    field: attributes.status
+
+  - length: { aggregations.by_namespace.buckets: 2 }
+  # A dotted key resolves as the literal key it is, and the bucket key is the bare value -- not the
+  # "<field>.<field>.<path>=<value>" form the column used to hand back.
+  - match: { aggregations.by_namespace.buckets.0.key: "ns-a" }
+  - match: { aggregations.by_namespace.buckets.0.doc_count: 3 }
+  - match: { aggregations.by_namespace.buckets.0.total.value: 1200.0 }
+  - match: { aggregations.by_namespace.buckets.1.key: "ns-b" }
+  - match: { aggregations.by_namespace.buckets.1.doc_count: 2 }
+  - match: { aggregations.by_namespace.buckets.1.total.value: 800.0 }
+
+---
+"Grouping a string subfield without value_type finds nothing":
+  # A known sharp edge, pinned so it is a contract rather than a surprise. Asking to bucket words through a numeric
+  # values source cannot coerce any of them, so the result is empty rather than an error -- the same thing a terms
+  # aggregation on a declared numeric field does when handed words.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            by_namespace:
+              terms:
+                field: attributes.k8s.namespace
+                size: 10
+
+  - length: { aggregations.by_namespace.buckets: 0 }
+
+---
+"Aggregate a nested path":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.nested.deep.value
+
+  - match: { aggregations.total.value: 33.0 }
+
+---
+"A mixed-type path returns a partial answer rather than failing":
+  # This is the behaviour a lenient reader owes the user, and it is pinned deliberately:
+  #  - the request SUCCEEDS; one unreadable value must not fail an aggregation over the whole index
+  #  - the sum covers only the values that could be read as numbers
+  #  - value_count reports how many contributed, so the gap against hits.total is visible
+  #
+  # There is no warning header saying values were skipped. Emitting one is not reliable: concurrent segment search is on
+  # by default for aggregations and a slice worker's response headers are never merged back into the request, so the
+  # header would appear or not depending on which slice ran where. value_count against hits.total is the signal.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          query:
+            exists:
+              field: attributes
+          aggs:
+            total:
+              sum:
+                field: attributes.code
+            counted:
+              value_count:
+                field: attributes.code
+
+  - match: { hits.total: 5 }
+  # 200 + 404 + 500 ("500" is a numeric string, and coerces exactly as it would into a numeric field).
+  # "OK" and "FAIL" are dropped.
+  - match: { aggregations.total.value: 1104.0 }
+  # Three of five documents contributed. The two-document gap against hits.total is the report.
+  - match: { aggregations.counted.value: 3 }
+
+---
+"An array contributes every element":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.ports
+            counted:
+              value_count:
+                field: attributes.ports
+            highest:
+              max:
+                field: attributes.ports
+            lowest:
+              min:
+                field: attributes.ports
+
+  # [443, 80] and [[8080, 22], 1]: nested arrays flatten, as they do for a declared numeric field.
+  - match: { aggregations.total.value: 8626.0 }
+  - match: { aggregations.counted.value: 5 }
+  # min and max are the interesting pair: MultiValueMode takes the first and last value of each document, so these are
+  # only right if the expanded values are emitted in ascending order rather than document order.
+  - match: { aggregations.highest.value: 8080.0 }
+  - match: { aggregations.lowest.value: 1.0 }
+
+---
+"Sort by a subfield":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 5
+          _source: false
+          sort:
+            - attributes.status:
+                order: desc
+                numeric_type: long
+
+  - match: { hits.total: 5 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "2" }
+  - match: { hits.hits.4._id: "1" }
+
+---
+"A path no document has yields nothing rather than failing":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.no_such_key
+            counted:
+              value_count:
+                field: attributes.no_such_key
+
+  - match: { aggregations.total.value: 0.0 }
+  - match: { aggregations.counted.value: 0 }
+
+---
+"docvalue_fields returns the bare value":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 1
+          query:
+            term:
+              _id: "1"
+          docvalue_fields: ["attributes.status"]
+
+  - match: { hits.hits.0.fields.attributes\.status: ["200"] }
