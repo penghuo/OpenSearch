@@ -16,10 +16,14 @@ import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.variant.VariantFormatException;
+import org.opensearch.index.fielddata.SortedBinaryDocValues;
+import org.opensearch.index.fielddata.SortedNumericDoubleValues;
+import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.MapperServiceTestCase;
 import org.opensearch.index.mapper.ParsedDocument;
@@ -90,13 +94,10 @@ public class AccessorEquivalenceTests extends MapperServiceTestCase {
      * and no longer match the documents below.
      */
     private MapperService mapperService(boolean variantBlob) throws IOException {
-        return createMapperService(mapping(b -> {
-            b.startObject(FIELD).field("type", "flat_object");
-            if (variantBlob) {
-                b.field("variant_blob", true);
-            }
-            b.endObject();
-        }));
+        // The parameter is gone: every flat_object writes the blob columns now. The boolean is kept so the A/B harness below
+        // still reads as two arms, but both indices are byte-identical -- which is itself the point, since the _source reader
+        // must be unaffected by the column's presence.
+        return createMapperService(mapping(b -> b.startObject(FIELD).field("type", "flat_object").endObject()));
     }
 
     /**
@@ -144,6 +145,156 @@ public class AccessorEquivalenceTests extends MapperServiceTestCase {
 
     private interface CheckedBiConsumer {
         void accept(FlatObjectValueAccessor a, FlatObjectValueAccessor b) throws IOException;
+    }
+
+    // ------------------------------------------------- the columnar read path
+
+    /**
+     * Drives the fielddata reader as a third arm: every value it yields for a path must be what the {@code _source} reader
+     * yields for the same path, without a script anywhere.
+     *
+     * <p>This is the whole point of the phase. The two accessors agree by construction because they share path resolution
+     * and coercion; the fielddata reader shares neither -- it resolves by field id and never sees a key name -- so agreement
+     * here is real evidence rather than a tautology.
+     */
+    public void testFielddataAgreesWithSourceOnEveryPath() throws IOException {
+        MapperService service = mapperService(true);
+        try (Directory dir = index(service, List.of(RICH_DOC)); DirectoryReader reader = DirectoryReader.open(dir)) {
+            LeafReaderContext leaf = reader.leaves().get(0);
+            SourceValueAccessor source = new SourceValueAccessor(FIELD);
+            source.setNextReader(leaf);
+
+            for (String path : PATHS) {
+                // An array is where the two contracts legitimately part: the accessor's get() is single-valued and refuses a
+                // container, while fielddata expands it the way a declared field does. Asserted separately in
+                // testFielddataExpandsArraysAscending; here it only has to not be mistaken for a disagreement.
+                boolean multiValued = source.get(0, path, ValueType.RAW) instanceof List;
+                assertDoubleValues(service, leaf, source, path, multiValued);
+                assertLongValues(service, leaf, source, path, multiValued);
+                assertStringValues(service, leaf, source, path, multiValued);
+            }
+        }
+    }
+
+    /** An array at a path contributes every element, ascending, exactly as a declared numeric field would. */
+    public void testFielddataExpandsArraysAscending() throws IOException {
+        MapperService service = mapperService(true);
+        List<String> docs = List.of(
+            "{\"attributes\":{\"ports\":[443,80]}}",
+            "{\"attributes\":{\"ports\":[[8080,22],1]}}",
+            "{\"attributes\":{\"ports\":[80,{\"nested\":1},\"NaN\",8443]}}",
+            "{\"attributes\":{\"ports\":7}}"
+        );
+        try (Directory dir = index(service, docs); DirectoryReader reader = DirectoryReader.open(dir)) {
+            LeafReaderContext leaf = reader.leaves().get(0);
+            SortedNumericDocValues values = longValues(service, leaf, "ports");
+
+            assertEquals(List.of(80L, 443L), drainLongs(values, 0));
+            assertEquals("nested arrays flatten, as they do for a declared field", List.of(1L, 22L, 8080L), drainLongs(values, 1));
+            assertEquals("an object and a word are skipped, the numbers are kept", List.of(80L, 8443L), drainLongs(values, 2));
+            assertEquals("a single value needs no array", List.of(7L), drainLongs(values, 3));
+        }
+    }
+
+    /** A key absent from the whole segment must serve nothing, without decoding a document. */
+    public void testFielddataSkipsASegmentThatCannotMatch() throws IOException {
+        MapperService service = mapperService(true);
+        try (Directory dir = index(service, List.of(RICH_DOC)); DirectoryReader reader = DirectoryReader.open(dir)) {
+            LeafReaderContext leaf = reader.leaves().get(0);
+            SortedNumericDocValues values = longValues(service, leaf, "no_such_key_anywhere");
+            assertFalse("a key no document has must yield no value", values.advanceExact(0));
+        }
+    }
+
+    private List<Long> drainLongs(SortedNumericDocValues values, int docId) throws IOException {
+        if (values.advanceExact(docId) == false) {
+            return List.of();
+        }
+        List<Long> out = new ArrayList<>();
+        for (int i = 0; i < values.docValueCount(); i++) {
+            out.add(values.nextValue());
+        }
+        return out;
+    }
+
+    private SortedNumericDocValues longValues(MapperService service, LeafReaderContext leaf, String path) {
+        return fielddata(service, path).load(leaf).getLongValues();
+    }
+
+    private org.opensearch.index.fielddata.IndexNumericFieldData fielddata(MapperService service, String path) {
+        MappedFieldType keyed = service.fieldType(FIELD + "." + path);
+        assertNotNull("no field type for [" + path + "]", keyed);
+        assertTrue("a keyed flat_object path must be aggregatable", keyed.isAggregatable());
+        return (org.opensearch.index.fielddata.IndexNumericFieldData) keyed.fielddataBuilder("test", () -> null).build(null, null);
+    }
+
+    private void assertDoubleValues(
+        MapperService service,
+        LeafReaderContext leaf,
+        SourceValueAccessor source,
+        String path,
+        boolean multiValued
+    ) throws IOException {
+        Object expected = source.get(0, path, ValueType.DOUBLE);
+        SortedNumericDoubleValues values = fielddata(service, path).load(leaf).getDoubleValues();
+        if (values.advanceExact(0) == false) {
+            assertNull("fielddata has no double at [" + path + "] but _source does", expected);
+            return;
+        }
+        if (multiValued) {
+            // Every element readable as this type, and nothing to compare against a single-valued read.
+            assertTrue("an expanded array must yield at least one double at [" + path + "]", values.docValueCount() >= 1);
+            return;
+        }
+        assertNotNull("fielddata has a double at [" + path + "] but _source does not", expected);
+        assertEquals("double count at [" + path + "]", 1, values.docValueCount());
+        assertEquals("double at [" + path + "]", (Double) expected, values.nextValue(), 0.0);
+    }
+
+    private void assertLongValues(
+        MapperService service,
+        LeafReaderContext leaf,
+        SourceValueAccessor source,
+        String path,
+        boolean multiValued
+    ) throws IOException {
+        Object expected = source.get(0, path, ValueType.LONG);
+        SortedNumericDocValues values = fielddata(service, path).load(leaf).getLongValues();
+        if (values.advanceExact(0) == false) {
+            assertNull("fielddata has no long at [" + path + "] but _source does", expected);
+            return;
+        }
+        if (multiValued) {
+            // Every element readable as this type, and nothing to compare against a single-valued read.
+            assertTrue("an expanded array must yield at least one long at [" + path + "]", values.docValueCount() >= 1);
+            return;
+        }
+        assertNotNull("fielddata has a long at [" + path + "] but _source does not", expected);
+        assertEquals("long count at [" + path + "]", 1, values.docValueCount());
+        assertEquals("long at [" + path + "]", expected, values.nextValue());
+    }
+
+    private void assertStringValues(
+        MapperService service,
+        LeafReaderContext leaf,
+        SourceValueAccessor source,
+        String path,
+        boolean multiValued
+    ) throws IOException {
+        Object expected = source.get(0, path, ValueType.STRING);
+        SortedBinaryDocValues values = fielddata(service, path).load(leaf).getBytesValues();
+        if (values.advanceExact(0) == false) {
+            assertNull("fielddata has no string at [" + path + "] but _source does", expected);
+            return;
+        }
+        if (multiValued) {
+            // Every element readable as this type, and nothing to compare against a single-valued read.
+            assertTrue("an expanded array must yield at least one string at [" + path + "]", values.docValueCount() >= 1);
+            return;
+        }
+        assertNotNull("fielddata has a string at [" + path + "] but _source does not", expected);
+        assertEquals("string count at [" + path + "]", 1, values.docValueCount());
+        assertEquals("string at [" + path + "]", expected, values.nextValue().utf8ToString());
     }
 
     // ------------------------------------------------------------------- C1.1
@@ -392,7 +543,7 @@ public class AccessorEquivalenceTests extends MapperServiceTestCase {
         MapperService service = createMapperService(topMapping(b -> {
             b.startObject("_source").field("enabled", false).endObject();
             b.startObject("properties");
-            b.startObject(FIELD).field("type", "flat_object").field("variant_blob", true).endObject();
+            b.startObject(FIELD).field("type", "flat_object").endObject();
             b.endObject();
         }));
 

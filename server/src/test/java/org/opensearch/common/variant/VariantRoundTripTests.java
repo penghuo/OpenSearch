@@ -19,6 +19,8 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,6 +39,100 @@ public class VariantRoundTripTests extends OpenSearchTestCase {
             VariantBuilder builder = new VariantBuilder();
             VariantJson.encode(parser, builder);
             return builder.finish();
+        }
+    }
+
+    /**
+     * Relabels a Variant's field ids into key-name order and returns a reader over it, exactly as the mapper's write path
+     * and the doc-values reader do between them.
+     *
+     * <p>Relabelling leaves the Variant's own dictionary no longer describing its ids, so the value has to be re-read
+     * through the indirect metadata form -- sorted names, identity ordinals -- which is what a segment's name column
+     * supplies.
+     */
+    private static Variant relabelIntoNameOrder(Variant encoded) {
+        int n = encoded.dictionarySize();
+        byte[][] keyBytes = new byte[n][];
+        Integer[] byName = new Integer[n];
+        for (int i = 0; i < n; i++) {
+            keyBytes[i] = encoded.dictionaryKey(i).getBytes(StandardCharsets.UTF_8);
+            byName[i] = i;
+        }
+        Arrays.sort(byName, (a, b) -> Arrays.compareUnsigned(keyBytes[a], keyBytes[b]));
+
+        int[] idMap = new int[n];
+        byte[][] nameTable = new byte[n][];
+        int[] ordinals = new int[n];
+        for (int rank = 0; rank < n; rank++) {
+            idMap[byName[rank]] = rank;
+            nameTable[rank] = keyBytes[byName[rank]];
+            ordinals[rank] = rank;
+        }
+        encoded.relabelFieldIds(idMap);
+        return new Variant(new VariantMetadata(nameTable, ordinals, n), encoded.valueBytes(), 0);
+    }
+
+    /**
+     * Searching by field id must find exactly what searching by name finds, for every key at every depth.
+     *
+     * <p>This is the invariant the columnar read path rests on: it never resolves a name, so if the two searches could
+     * disagree it would silently return a value from the wrong key. The names are only present here in order to have
+     * something to check the id search against.
+     */
+    public void testFieldIdSearchAgreesWithNameSearch() throws Exception {
+        List<String> documents = List.of(
+            "{\"zebra\":1,\"apple\":2,\"mango\":3}",
+            "{\"a\":{\"c\":1,\"b\":2},\"z\":{\"y\":{\"x\":3}}}",
+            "{\"k8s.namespace\":\"ns\",\"k8s\":{\"namespace\":\"other\"}}",
+            "{\"status\":200,\"status_code\":404,\"stat\":1}",
+            "{\"\\uFFFFhigh\":1,\"emoji\":2,\"ascii\":3}",
+            "{\"outer\":{\"inner\":[1,2,{\"deep\":4}]},\"after\":5}",
+            "{\"only\":1}",
+            "{}"
+        );
+        for (String json : documents) {
+            Variant reader = relabelIntoNameOrder(encode(json));
+            Map<String, Integer> rankByName = new HashMap<>();
+            for (int rank = 0; rank < reader.dictionarySize(); rank++) {
+                rankByName.put(reader.dictionaryKey(rank), rank);
+            }
+            assertAgrees(json, reader, rankByName, 0);
+        }
+    }
+
+    /** Walks every object in the tree, asserting the two searches agree on each member and on absent ids. */
+    private static void assertAgrees(String json, Variant node, Map<String, Integer> rankByName, int depth) {
+        assertTrue("runaway recursion in " + json, depth < 10);
+        if (node.type() == VariantType.OBJECT) {
+            for (int i = 0; i < node.objectSize(); i++) {
+                String name = node.objectKeyAt(i);
+                Integer rank = rankByName.get(name);
+                assertNotNull(json + " key [" + name + "] is not in the dictionary", rank);
+
+                Variant byName = node.objectGet(name);
+                Variant byId = node.objectGetByFieldId(rank);
+                assertNotNull(json + " name search missed [" + name + "]", byName);
+                assertNotNull(json + " id search missed [" + name + "] at id " + rank, byId);
+                assertEquals(json + " [" + name + "] resolved to a different value", byName.offset(), byId.offset());
+                assertEquals(json + " [" + name + "]", byName.toJavaObject(), byId.toJavaObject());
+
+                assertAgrees(json, node.objectValueAt(i), rankByName, depth + 1);
+            }
+            // An id the document has but this object does not must miss in both searches.
+            for (Map.Entry<String, Integer> entry : rankByName.entrySet()) {
+                if (node.objectGet(entry.getKey()) == null) {
+                    assertNull(
+                        json + " id search found [" + entry.getKey() + "] where the name search did not",
+                        node.objectGetByFieldId(entry.getValue())
+                    );
+                }
+            }
+            // And an id beyond the dictionary must simply miss rather than throw.
+            assertNull(json + " out-of-range id", node.objectGetByFieldId(rankByName.size() + 7));
+        } else if (node.type() == VariantType.ARRAY) {
+            for (int i = 0; i < node.arraySize(); i++) {
+                assertAgrees(json, node.arrayGet(i), rankByName, depth + 1);
+            }
         }
     }
 

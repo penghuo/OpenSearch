@@ -26,21 +26,22 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.Automaton;
 import org.apache.lucene.util.automaton.Operations;
 import org.opensearch.OpenSearchException;
+import org.opensearch.Version;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.unit.Fuzziness;
 import org.opensearch.common.variant.Variant;
 import org.opensearch.common.variant.VariantBuilder;
-import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamOutput;
-import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
+import org.opensearch.index.mapper.flatobject.FlatObjectBlobIndexFieldData;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.support.CoreValuesSourceType;
@@ -58,6 +59,7 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
 
@@ -73,6 +75,8 @@ import static org.apache.lucene.search.MultiTermQuery.DOC_VALUES_REWRITE;
  */
 public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
 
+    private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(FlatObjectFieldMapper.class);
+
     public static final String CONTENT_TYPE = "flat_object";
     public static final Object DOC_VALUE_NO_MATCH = new Object();
 
@@ -82,13 +86,22 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     static final String EQUAL_SYMBOL = "=";
 
     /**
-     * Mapping parameter that additionally stores the field's value as a Variant blob in a {@code BinaryDocValues} column.
+     * Mapping parameter of an earlier prototype, now accepted and ignored.
      *
-     * <p>Off by default, so existing indices are unaffected. Enabling it changes nothing about the terms this mapper
-     * produces, and therefore nothing about filtering: it only adds a second, type-preserving copy of the value that can
-     * be read without touching {@code _source}.
+     * <p>The columns it used to switch on are written for every {@code flat_object}, so the parameter has no meaning. It is
+     * still consumed rather than rejected because this mapper's type parser refuses a mapping with any unrecognised key:
+     * an index whose stored mapping still names it would fail shard allocation and could never be edited, since a mapping
+     * cannot be changed on an index that will not open.
      */
     public static final String VARIANT_BLOB_PARAM = "variant_blob";
+
+    /**
+     * First version that writes the Variant blob columns, and therefore the first that can read a path out of them.
+     *
+     * <p>An index created before this has no columns. Answering an aggregation over one with no values would be worse than
+     * refusing: the values exist in {@code _source}, so an empty answer is a wrong number rather than an absent one.
+     */
+    static final Version BLOB_COLUMNS_VERSION = Version.V_3_6_0;
 
     /** Suffix of the doc-values column holding each document's Variant value tree. */
     public static final String BLOB_SUFFIX = "._blob";
@@ -113,9 +126,7 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     public static final String BLOB_NAMES_SUFFIX = "._blobnames";
 
     /** The blob columns' own suffixes, reserved so an attribute cannot collide with them. */
-    private static final String RESERVED_BLOB_KEY = "_blob";
-    private static final String RESERVED_BLOB_META_KEY = "_blobmeta";
-    private static final String RESERVED_BLOB_NAMES_KEY = "_blobnames";
+    private static final Set<String> RESERVED_BLOB_KEYS = Set.of("_blob", "_blobmeta", "_blobnames");
 
     /**
      * Most distinct keys in one document that can have their field ids relabelled into name order.
@@ -127,6 +138,14 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
      * is re-encoded with its dictionary supplied in name order instead, which reaches the same layout by a longer route.
      */
     static final int MAX_RELABELLED_KEYS = 256;
+
+    /**
+     * Most distinct keys one document may put in the blob.
+     *
+     * <p>Not a limit of the encoding, which allows far more: a guard, so one pathological document cannot make a segment's
+     * per-document name lists arbitrarily long.
+     */
+    static final int MAX_KEYS_PER_DOCUMENT = 0xFFFF;
 
     /**
      * In flat_object field mapper, field type is similar to keyword field type
@@ -150,7 +169,8 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             Strings.isNullOrEmpty(key) ? this.name() : (this.name() + DOT_SYMBOL + key),
             this.name(),
             valueFieldType,
-            valueAndPathFieldType
+            valueAndPathFieldType,
+            fieldType().indexCreatedVersion()
         );
     }
 
@@ -160,15 +180,15 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
      */
     public static class Builder extends FieldMapper.Builder<Builder> {
 
-        private boolean variantBlob = false;
+        private Version indexCreatedVersion = Version.CURRENT;
 
         public Builder(String name) {
             super(name, Defaults.FIELD_TYPE);
             builder = this;
         }
 
-        public Builder variantBlob(boolean variantBlob) {
-            this.variantBlob = variantBlob;
+        public Builder indexCreatedVersion(Version indexCreatedVersion) {
+            this.indexCreatedVersion = indexCreatedVersion;
             return this;
         }
 
@@ -183,9 +203,15 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
                 isSearchable,
                 hasDocValue
             );
-            FlatObjectFieldType fft = new FlatObjectFieldType(buildFullName(context), null, valueFieldType, valueAndPathFieldType);
+            FlatObjectFieldType fft = new FlatObjectFieldType(
+                buildFullName(context),
+                null,
+                valueFieldType,
+                valueAndPathFieldType,
+                indexCreatedVersion
+            );
 
-            return new FlatObjectFieldMapper(name, Defaults.FIELD_TYPE, fft, variantBlob);
+            return new FlatObjectFieldMapper(name, Defaults.FIELD_TYPE, fft);
         }
     }
 
@@ -204,11 +230,17 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         @Override
         public Mapper.Builder<?> parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
             Builder builder = builderFunction.apply(name, parserContext);
-            // The entry must be removed, not merely read: ObjectMapper.TypeParser rejects the mapping if anything is left
-            // behind in the node.
-            Object variantBlob = node.remove(VARIANT_BLOB_PARAM);
-            if (variantBlob != null) {
-                builder.variantBlob(XContentMapValues.nodeBooleanValue(variantBlob, name + "." + VARIANT_BLOB_PARAM));
+            builder.indexCreatedVersion(parserContext.indexVersionCreated());
+            // Removed, not merely read: this type parser rejects a mapping with anything left in the node, so accepting the
+            // dead parameter is what keeps an index that still names it openable.
+            if (node.remove(VARIANT_BLOB_PARAM) != null) {
+                deprecationLogger.deprecate(
+                    "flat_object_variant_blob",
+                    "Parameter [{}] on field [{}] is ignored: [{}] always stores its values in a doc-values column.",
+                    VARIANT_BLOB_PARAM,
+                    name,
+                    CONTENT_TYPE
+                );
             }
             return builder;
         }
@@ -225,13 +257,32 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         private final String rootFieldName;
         private final KeywordFieldType valueFieldType;
         private final KeywordFieldType valueAndPathFieldType;
+        /**
+         * When the index was created, which decides whether the Variant blob column exists to read.
+         *
+         * <p>Held on the field type rather than only on the mapper because {@code FieldMapper.merge} replaces the field type
+         * from the incoming mapper while leaving mapper-owned fields at their cloned values -- so anything a query needs to
+         * consult has to live here.
+         */
+        private final Version indexCreatedVersion;
 
         public FlatObjectFieldType(String name, String rootFieldName, boolean isSearchable, boolean hasDocValues) {
+            this(name, rootFieldName, isSearchable, hasDocValues, Version.CURRENT);
+        }
+
+        public FlatObjectFieldType(
+            String name,
+            String rootFieldName,
+            boolean isSearchable,
+            boolean hasDocValues,
+            Version indexCreatedVersion
+        ) {
             this(
                 name,
                 rootFieldName,
                 getKeywordFieldType(rootFieldName == null ? name : rootFieldName, VALUE_SUFFIX, isSearchable, hasDocValues),
-                getKeywordFieldType(rootFieldName == null ? name : rootFieldName, VALUE_AND_PATH_SUFFIX, isSearchable, hasDocValues)
+                getKeywordFieldType(rootFieldName == null ? name : rootFieldName, VALUE_AND_PATH_SUFFIX, isSearchable, hasDocValues),
+                indexCreatedVersion
             );
         }
 
@@ -240,6 +291,16 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             String rootFieldName,
             KeywordFieldType valueFieldType,
             KeywordFieldType valueAndPathFieldType
+        ) {
+            this(name, rootFieldName, valueFieldType, valueAndPathFieldType, Version.CURRENT);
+        }
+
+        public FlatObjectFieldType(
+            String name,
+            String rootFieldName,
+            KeywordFieldType valueFieldType,
+            KeywordFieldType valueAndPathFieldType,
+            Version indexCreatedVersion
         ) {
             super(
                 name,
@@ -255,6 +316,29 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             this.rootFieldName = rootFieldName;
             this.valueFieldType = valueFieldType;
             this.valueAndPathFieldType = valueAndPathFieldType;
+            this.indexCreatedVersion = indexCreatedVersion;
+        }
+
+        Version indexCreatedVersion() {
+            return indexCreatedVersion;
+        }
+
+        /** Whether this index writes the Variant blob columns, and therefore whether a path can be read from them. */
+        boolean hasBlobColumns() {
+            return indexCreatedVersion.onOrAfter(BLOB_COLUMNS_VERSION);
+        }
+
+        /**
+         * The path within the parent object that this keyed field type names, or {@code null} for the parent itself.
+         *
+         * <p>Empty rather than null for {@code keyedFieldType("")}, which {@code _field_caps} reaches: the name equals the
+         * root, so there is no path below it.
+         */
+        String blobPath() {
+            if (rootFieldName == null || name().length() <= rootFieldName.length()) {
+                return null;
+            }
+            return name().substring(rootFieldName.length() + 1);
         }
 
         static KeywordFieldType getKeywordFieldType(String rootField, String suffix, boolean isSearchable, boolean hasDocValue) {
@@ -294,7 +378,30 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         @Override
         public IndexFieldData.Builder fielddataBuilder(String fullyQualifiedIndexName, Supplier<SearchLookup> searchLookup) {
             failIfNoDocValues();
-            return new SortedSetOrdinalsIndexFieldData.Builder(valueFieldType().name(), CoreValuesSourceType.BYTES);
+            String path = blobPath();
+            if (path == null) {
+                // The parent field itself. Left as it was: ordinals over the value column, which is what a script reading
+                // doc['attributes'] gets. Deliberately not numeric -- declaring NUMERIC here would make `sum` on the bare
+                // parent resolve and return nonsense.
+                return new SortedSetOrdinalsIndexFieldData.Builder(valueFieldType().name(), CoreValuesSourceType.BYTES);
+            }
+            // A keyed path reads the Variant blob. This is also the gate: an index created before the columns existed has
+            // nothing to read, and returning empty values would answer an aggregation with a plausible wrong number. The
+            // aggregation framework never consults isAggregatable(), so throwing here is what actually stops it.
+            if (hasBlobColumns() == false) {
+                throw new IllegalArgumentException(
+                    "Cannot aggregate or sort on ["
+                        + name()
+                        + "]: index ["
+                        + fullyQualifiedIndexName
+                        + "] was created in version "
+                        + indexCreatedVersion
+                        + ", before ["
+                        + CONTENT_TYPE
+                        + "] stored its values in a doc-values column. Reindex to enable it."
+                );
+            }
+            return new FlatObjectBlobIndexFieldData.Builder(name(), blobFieldName(rootFieldName), blobNamesFieldName(rootFieldName), path);
         }
 
         @Override
@@ -337,6 +444,13 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
                 );
             }
             if (rootFieldName != null) {
+                if (blobPath() != null && hasBlobColumns()) {
+                    // A blob-backed path returns real typed values, so it needs a real format. FlatObjectDocValueFormat
+                    // implements only format(BytesRef) -- a numeric aggregation would throw from format(double) while
+                    // rendering value_as_string, `missing` would throw from parseDouble before reading a document, and the
+                    // format is not a registered NamedWriteable so a multi-shard reduce cannot deserialise it at all.
+                    return DocValueFormat.RAW;
+                }
                 return new FlatObjectDocValueFormat(getDVPrefix(rootFieldName) + getPathPrefix(name()));
             } else {
                 throw new IllegalArgumentException(
@@ -345,9 +459,18 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             }
         }
 
+        /**
+         * True only for a keyed path on an index that has the blob columns.
+         *
+         * <p>Kept as an override rather than left to {@code MappedFieldType}'s derivation from {@code fielddataBuilder},
+         * because the parent field's builder now succeeds (a script needs it) and the base derivation would therefore report
+         * the parent as aggregatable. Beyond being wrong, that would stop
+         * {@code AggregatorTestCase.testSupportedFieldTypes} skipping {@code flat_object} and start exercising it in every
+         * aggregation test in the repo against a document this mapper never wrote.
+         */
         @Override
         public boolean isAggregatable() {
-            return false;
+            return blobPath() != null && hasBlobColumns();
         }
 
         @Override
@@ -605,23 +728,21 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
 
     private final KeywordFieldType valueFieldType;
     private final KeywordFieldType valueAndPathFieldType;
-    private final boolean variantBlob;
+    /**
+     * Whether to write the Variant blob columns.
+     *
+     * <p>Not a mapping choice. It follows the index's creation version, so a new index always writes them and an older one
+     * keeps behaving exactly as it did -- including accepting documents the encoder would reject, which is why the write is
+     * gated and not merely the read.
+     */
+    private final boolean writeBlobColumns;
 
     FlatObjectFieldMapper(String simpleName, FieldType fieldType, FlatObjectFieldType mappedFieldType) {
-        this(simpleName, fieldType, mappedFieldType, false);
-    }
-
-    FlatObjectFieldMapper(String simpleName, FieldType fieldType, FlatObjectFieldType mappedFieldType, boolean variantBlob) {
         super(simpleName, fieldType, mappedFieldType, CopyTo.empty());
         assert fieldType.indexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) <= 0;
         valueFieldType = mappedFieldType.valueFieldType;
         valueAndPathFieldType = mappedFieldType.valueAndPathFieldType;
-        this.variantBlob = variantBlob;
-    }
-
-    /** Whether this field additionally stores its value as a Variant blob doc-values column. */
-    public boolean isVariantBlob() {
-        return variantBlob;
+        this.writeBlobColumns = mappedFieldType.hasBlobColumns();
     }
 
     /** The name of the column holding a field's Variant value trees. */
@@ -637,14 +758,6 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     /** The name of the column holding a field's key names, when they are stored separately. */
     public static String blobNamesFieldName(String fieldName) {
         return fieldName + BLOB_NAMES_SUFFIX;
-    }
-
-    @Override
-    protected void doXContentBody(XContentBuilder builder, boolean includeDefaults, Params params) throws IOException {
-        super.doXContentBody(builder, includeDefaults, params);
-        if (includeDefaults || variantBlob) {
-            builder.field(VARIANT_BLOB_PARAM, variantBlob);
-        }
     }
 
     @Override
@@ -686,9 +799,8 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         parser.nextToken(); // Skip the outer START_OBJECT. Need to return on END_OBJECT.
 
         // Encoded during the walk the mapper already performs, rather than from a separately materialised tree. Reading
-        // the subtree into a map first would be simpler but would charge this option for work the design does not call
-        // for, biasing the write-cost measurement against it.
-        VariantBuilder variantBuilder = variantBlob ? new VariantBuilder() : null;
+        // the subtree into a map first would be simpler, at the cost of walking every document twice.
+        VariantBuilder variantBuilder = writeBlobColumns ? new VariantBuilder() : null;
         if (variantBuilder != null) {
             variantBuilder.startObject();
         }
@@ -702,7 +814,6 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         createPathFields(context, pathParts);
 
         if (variantBuilder != null) {
-            variantBuilder.endObject();
             writeVariantBlob(context, variantBuilder);
         }
     }
@@ -710,6 +821,9 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     private void writeVariantBlob(ParseContext context, VariantBuilder variantBuilder) {
         final Variant variant;
         try {
+            // endObject is inside the try because that is where a duplicate key is detected. Left outside, a document that
+            // JSON permits but the Variant format does not would surface as an internal error rather than a bad request.
+            variantBuilder.endObject();
             variant = variantBuilder.finish();
         } catch (IllegalStateException e) {
             // The Variant format forbids duplicate keys within an object, which plain JSON permits.
@@ -756,20 +870,17 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     private void writeBlobColumns(ParseContext context, List<String> keys, Variant variant) {
         int count = keys.size();
         String namesField = blobNamesFieldName(name());
-        String metaField = blobMetaFieldName(name());
         String blobField = blobFieldName(name());
         if (context.doc().getByKey(blobField) != null) {
             throw new MapperParsingException(
                 "["
                     + name()
-                    + "] received more than one object for a single document, which ["
-                    + VARIANT_BLOB_PARAM
-                    + "] does not support because the blob doc-values column holds one value per document"
+                    + "] received more than one object for a single document, and its doc-values column holds one value per document"
             );
         }
-        if (count > 0xFFFF) {
+        if (count > MAX_KEYS_PER_DOCUMENT) {
             throw new MapperParsingException(
-                "[" + name() + "] has " + count + " distinct keys in one document, over the 65535 the blob layout supports"
+                "[" + name() + "] has " + count + " distinct keys in one document, over the " + MAX_KEYS_PER_DOCUMENT + " allowed"
             );
         }
 
@@ -825,16 +936,15 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         if (parser.currentToken() == XContentParser.Token.FIELD_NAME) {
             final String currentFieldName = parser.currentName();
             if (variantBuilder != null) {
-                if (path.size() == 1 && (RESERVED_BLOB_KEY.equals(currentFieldName) || RESERVED_BLOB_META_KEY.equals(currentFieldName))) {
-                    // The columns are named <field>._blob and <field>._blobmeta, so top-level keys of those names collide.
+                if (path.size() == 1 && RESERVED_BLOB_KEYS.contains(currentFieldName)) {
+                    // The columns are named <field>._blob, <field>._blobnames and <field>._blobmeta, so a top-level key of
+                    // any of those names would collide with one.
                     throw new MapperParsingException(
                         "["
                             + name()
                             + "] cannot contain a top-level key named ["
                             + currentFieldName
-                            + "] when ["
-                            + VARIANT_BLOB_PARAM
-                            + "] is enabled, because it collides with a blob doc-values column"
+                            + "], which collides with one of its doc-values columns"
                     );
                 }
                 variantBuilder.appendKey(currentFieldName);

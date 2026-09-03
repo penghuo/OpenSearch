@@ -170,6 +170,49 @@ public final class Variant {
         return null;
     }
 
+    /**
+     * Finds a member by its field id, comparing ids rather than the names they resolve to.
+     *
+     * <p>This is the read path that makes a segment's names unnecessary. {@link #objectGet(String)} has to turn every
+     * candidate id into a name to compare it, which is only possible if every name in the segment is available; searching
+     * on the id itself needs nothing outside these bytes.
+     *
+     * <p><b>Precondition:</b> the object's field ids are numerically ascending. The format only requires them ordered by
+     * their key <em>strings</em>, so this holds exactly when the writer assigned ids in name order -- which is what
+     * {@link #relabelFieldIds} and {@link #reencodeWithDictionary} guarantee for every blob the mapper writes. A Variant
+     * built straight from {@link VariantBuilder} without that step keeps insertion-order ids and must be read by name.
+     *
+     * @return the member's value, or {@code null} if this object has no such field id
+     */
+    public Variant objectGetByFieldId(int fieldId) {
+        int[] layout = objectLayout();
+        int numElements = layout[0];
+        int fieldIdSize = layout[1];
+        int fieldOffsetSize = layout[2];
+        int fieldIdsStart = layout[3];
+        int fieldOffsetsStart = layout[4];
+        int valuesStart = layout[5];
+
+        int low = 0;
+        int high = numElements - 1;
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            int candidate = VariantEncoding.readUnsigned(value, fieldIdsStart + mid * fieldIdSize, fieldIdSize);
+            // Unsigned: readUnsigned returns a plain int, so a four-byte field id at or above 2^31 arrives negative and
+            // would otherwise sort below every other id.
+            int comparison = Integer.compareUnsigned(candidate, fieldId);
+            if (comparison < 0) {
+                low = mid + 1;
+            } else if (comparison > 0) {
+                high = mid - 1;
+            } else {
+                int offset = VariantEncoding.readUnsigned(value, fieldOffsetsStart + mid * fieldOffsetSize, fieldOffsetSize);
+                return at(valuesStart + offset);
+            }
+        }
+        return null;
+    }
+
     public String objectKeyAt(int index) {
         int[] layout = objectLayout();
         require(index >= 0 && index < layout[0], "object index " + index + " out of range");

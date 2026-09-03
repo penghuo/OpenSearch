@@ -68,7 +68,6 @@ public class FlatObjectVariantBlobIT extends OpenSearchIntegTestCase {
         String mapping = "{"
             + (sourceEnabled ? "" : "\"_source\":{\"enabled\":false},")
             + "\"properties\":{\"attributes\":{\"type\":\"flat_object\""
-            + (variantBlob ? ",\"variant_blob\":true" : "")
             + "}},"
             + "\"derived\":{"
             + "\"attr_status\":{\"type\":\"long\",\"script\":{\"source\":\""

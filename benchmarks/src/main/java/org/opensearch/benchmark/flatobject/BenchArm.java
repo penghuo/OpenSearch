@@ -107,9 +107,6 @@ enum BenchArm {
             .append("\"")
             .append(OtelDocGenerator.ATTRIBUTES_FIELD)
             .append("\":{\"type\":\"flat_object\"");
-        if (variantBlob) {
-            json.append(",\"variant_blob\":true");
-        }
         json.append("}}");
 
         json.append(",\"derived\":").append(derivedFields(probes));

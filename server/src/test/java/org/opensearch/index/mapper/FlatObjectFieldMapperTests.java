@@ -384,13 +384,16 @@ public class FlatObjectFieldMapperTests extends MapperTestCase {
     public void testFetchDocValues() throws IOException {
         MapperService mapperService = createMapperService(fieldMapping(b -> b.field("type", "flat_object")));
         {
-            // test valueWithPathField
+            // A keyed path reads the Variant blob, which yields the bare value, so the format has nothing to strip and is
+            // RAW. It has to be a registered format for a real reason: a prefix-stripping one implements only
+            // format(BytesRef), so a numeric aggregation would fail rendering value_as_string, `missing` would fail parsing
+            // its substitute, and it is not a NamedWriteable so a multi-shard reduce could not deserialise it at all.
             MappedFieldType ft = mapperService.fieldType("field.name");
             DocValueFormat format = ft.docValueFormat(null, null);
-            String storedValue = "field.field.name=1234";
-
-            Object object = format.format(new BytesRef(storedValue));
-            assertEquals("1234", object);
+            assertSame(DocValueFormat.RAW, format);
+            assertEquals("1234", format.format(new BytesRef("1234")));
+            assertEquals(1234L, format.format(1234L));
+            assertEquals(1234.5, format.format(1234.5));
         }
 
         {
