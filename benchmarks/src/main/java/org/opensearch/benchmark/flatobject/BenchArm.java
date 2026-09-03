@@ -158,7 +158,11 @@ enum BenchArm {
      */
     private String longScript(String path) {
         if (variantBlob) {
-            return "def v = variant('attributes'); if (v != null) { def x = v.getLong('" + path + "'); if (x != null) { emit(x); } }";
+            // Native fielddata would need no script at all; this stays a script so the arms differ only in which store the
+            // script reads, which is what makes the end-to-end numbers a comparison of stores.
+            return "def a = doc['attributes'].value; if (a != null) { def x = a['"
+                + path
+                + "']; if (x != null && x instanceof Number) { emit(((Number)x).longValue()); } }";
         }
         if (this == DOC_VALUES) {
             // break on the first match, which is the most favourable reading of this route: the scan stops halfway on
@@ -193,7 +197,9 @@ enum BenchArm {
 
     private String stringScript(String path) {
         if (variantBlob) {
-            return "def v = variant('attributes'); if (v != null) { def x = v.getString('" + path + "'); if (x != null) { emit(x); } }";
+            return "def a = doc['attributes'].value; if (a != null) { def x = a['"
+                + path
+                + "']; if (x != null) { emit(String.valueOf(x)); } }";
         }
         if (this == DOC_VALUES) {
             return "def vs = doc['"

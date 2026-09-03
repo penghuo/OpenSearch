@@ -36,8 +36,8 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * the same in both; only the script body differs, and it differs exactly in which store it reads. Anything that diverges
  * here is a property of the value store.
  *
- * <p>Lives in the painless module because the {@code variant()} accessor is reached through a painless script, and the
- * server's own integration tests do not load the scripting module.
+ * <p>Lives in the painless module because one arm reads the column through a painless script, and the server's own
+ * integration tests do not load the scripting module.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.SUITE, numDataNodes = 1)
 public class FlatObjectVariantBlobIT extends OpenSearchIntegTestCase {
@@ -57,10 +57,11 @@ public class FlatObjectVariantBlobIT extends OpenSearchIntegTestCase {
         + "if (a != null && a.status != null) { emit(((Number)a.status).longValue()); }";
     private static final String SOURCE_NAMESPACE_SCRIPT = "def a = params._source.attributes; "
         + "if (a != null && a['k8s.namespace'] != null) { emit(a['k8s.namespace']); }";
-    private static final String BLOB_STATUS_SCRIPT = "def v = variant('attributes'); "
-        + "if (v != null) { def s = v.getLong('status'); if (s != null) { emit(s); } }";
-    private static final String BLOB_NAMESPACE_SCRIPT = "def v = variant('attributes'); "
-        + "if (v != null) { def n = v.getString('k8s.namespace'); if (n != null) { emit(n); } }";
+    // doc['attributes'].value is a lazy view over the blob: reaching one key reads one value and no key names.
+    private static final String BLOB_STATUS_SCRIPT = "def a = doc['attributes'].value; "
+        + "if (a != null) { def s = a['status']; if (s != null && s instanceof Number) { emit(((Number)s).longValue()); } }";
+    private static final String BLOB_NAMESPACE_SCRIPT = "def a = doc['attributes'].value; "
+        + "if (a != null) { def n = a['k8s.namespace']; if (n != null) { emit(String.valueOf(n)); } }";
 
     private void createArm(String index, boolean variantBlob, boolean sourceEnabled) {
         String statusScript = variantBlob ? BLOB_STATUS_SCRIPT : SOURCE_STATUS_SCRIPT;

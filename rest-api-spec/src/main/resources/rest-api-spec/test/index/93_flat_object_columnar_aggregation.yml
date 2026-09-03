@@ -258,3 +258,99 @@ setup:
           docvalue_fields: ["attributes.status"]
 
   - match: { hits.hits.0.fields.attributes\.status: ["200"] }
+
+---
+"A script reads one key without reconstructing the object":
+  # doc['attributes'].value is a lazy view over the blob, not a copy. Reaching one key resolves it by field id and reads no
+  # key names at all, which is what keeps the script route ahead of _source rather than behind it.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          derived:
+            status_from_script:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { def s = a['status']; if (s != null) { emit(((Number)s).longValue()); } }"
+          aggs:
+            total:
+              sum:
+                field: status_from_script
+
+  # The same 2000 the native aggregation produces, by a different route.
+  - match: { aggregations.total.value: 2000.0 }
+
+---
+"A script reads a nested path and a dotted key":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          derived:
+            deep_from_script:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { def n = a['nested']; if (n != null) { def d = n['deep']; if (d != null) { def v = d['value']; if (v != null) { emit(((Number)v).longValue()); } } } }"
+            ns_from_script:
+              type: keyword
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { def n = a['k8s.namespace']; if (n != null) { emit(String.valueOf(n)); } }"
+          aggs:
+            deep_total:
+              sum:
+                field: deep_from_script
+            by_ns:
+              terms:
+                field: ns_from_script
+                size: 10
+
+  # A nested object comes back as a lazy view too, so descending it never reconstructs its siblings.
+  - match: { aggregations.deep_total.value: 33.0 }
+  # A literal dotted key resolves as itself, not as a nesting.
+  - length: { aggregations.by_ns.buckets: 2 }
+  - match: { aggregations.by_ns.buckets.0.key: "ns-a" }
+  - match: { aggregations.by_ns.buckets.0.doc_count: 3 }
+
+---
+"Enumerating the object is what pays for key names":
+  # size() and get() never read a name; iteration does, and only for this document's keys. Counting them proves the names
+  # are actually resolvable, not merely that the fast path avoids them.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          derived:
+            key_count:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { emit(a.size()); }"
+            has_status:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null && a.containsKey('status')) { emit(1); }"
+            name_length_total:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { long t = 0; for (e in a.entrySet()) { t += e.getKey().length(); } emit(t); }"
+          aggs:
+            keys:
+              sum:
+                field: key_count
+            with_status:
+              sum:
+                field: has_status
+            name_lengths:
+              sum:
+                field: name_length_total
+
+  # Documents 1 and 2 have 5 top-level keys, documents 3, 4 and 5 have 3.
+  - match: { aggregations.keys.value: 19.0 }
+  - match: { aggregations.with_status.value: 5.0 }
+  # status(6) + code(4) + ports(5) + k8s.namespace(13) + nested(6) = 34, twice; status + code + k8s.namespace = 23, thrice.
+  - match: { aggregations.name_lengths.value: 137.0 }

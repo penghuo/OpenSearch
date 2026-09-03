@@ -106,6 +106,13 @@ class org.opensearch.index.fielddata.ScriptDocValues$GeoPoints {
   double geohashDistanceWithDefault(String,double)
 }
 
+#### A flat_object's whole value. getValue() is declared as Map, so doc['attributes'].value['status'] dispatches through
+#### java.util.Map and needs nothing else allowed here.
+class org.opensearch.index.mapper.flatobject.FlatObjectScriptDocValues {
+  Map get(int)
+  Map getValue()
+}
+
 class org.opensearch.index.fielddata.ScriptDocValues$Booleans {
   Boolean get(int)
   boolean getValue()

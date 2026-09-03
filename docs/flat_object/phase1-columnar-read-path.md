@@ -26,8 +26,10 @@ Phases 2–4 (shredding, `_source` reconstruction, defaults) live in `plan-colum
 doc['attributes'].value['status']
 ```
 
-Nothing is added to the mapping API. Nothing is added to the painless API — not even a whitelist entry, because
-`java.util.Map` already exposes `def get(def)`. `variant()` is deleted.
+Nothing is added to the mapping API, and no painless *function* is added — `variant()` is deleted. One whitelist stanza
+is needed after all, for the new `ScriptDocValues` subclass, because `.value` is not inherited: every subclass declares
+its own `getValue()`. Declaring that as `Map` is what keeps the subscript free, since `java.util.Map` already exposes
+`def get(def)`.
 
 ---
 
@@ -224,7 +226,7 @@ A sort escapes the limit; an aggregation does not. The fix is a declared type pe
 
 ---
 
-## 5. `doc['attributes']` — a lazy Map view **[open]**
+## 5. `doc['attributes']` — a lazy Map view **[done]**
 
 The first design said this returns what `getAll(docId)` produces. That is a materialised `Map`, which needs **every key
 name of every document visited**, because `toJavaObject()` on an object calls `objectKeyAt` → `metadata.key`. Two ways

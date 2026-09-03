@@ -37,14 +37,9 @@ import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
-import org.opensearch.script.VariantFieldAccess;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashSet;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -87,15 +82,6 @@ public class SearchLookup {
     private final BiFunction<MappedFieldType, Supplier<SearchLookup>, IndexFieldData<?>> fieldDataLookup;
     private final int shardId;
     private final ConcurrentHashMap<Long, SourceLookup> sourceLookupMap = new ConcurrentHashMap<>();
-    /**
-     * Variant blob accessors, scoped per thread then per field, mirroring {@link #sourceLookupMap}.
-     *
-     * <p>Why this lives here rather than on the script: every aggregation over a derived field gets its own script
-     * instance, so a per-script cache decodes the blob once per aggregation per document. {@code SourceLookup} is already
-     * shared this way, which is why reading {@code _source} costs one parse per document however many aggregations use
-     * it; the blob reader needs the same treatment to get the same amortisation.
-     */
-    private final ConcurrentHashMap<Long, Map<String, VariantFieldAccess>> variantAccessMap = new ConcurrentHashMap<>();
 
     /**
      * Constructor for backwards compatibility. Use the one with explicit shardId argument.
@@ -185,29 +171,6 @@ public class SearchLookup {
             sourceLookupMap.computeIfAbsent(Thread.currentThread().threadId(), K -> new SourceLookup()),
             fieldsLookup.getLeafFieldsLookup(context)
         );
-    }
-
-    /**
-     * Returns a Variant blob accessor for a field on a segment, shared with every other script on this thread.
-     *
-     * @return the accessor, or {@code null} if the field has no blob column in this segment
-     */
-    public VariantFieldAccess variantFieldAccess(String field, LeafReaderContext context) {
-        Map<String, VariantFieldAccess> perThread = variantAccessMap.computeIfAbsent(
-            Thread.currentThread().threadId(),
-            k -> new HashMap<>()
-        );
-        VariantFieldAccess access = perThread.get(field);
-        if (access != null && access.isBoundTo(context)) {
-            return access.available() ? access : null;
-        }
-        try {
-            VariantFieldAccess opened = new VariantFieldAccess(field, context);
-            perThread.put(field, opened);
-            return opened.available() ? opened : null;
-        } catch (IOException e) {
-            throw new UncheckedIOException("failed to open the Variant blob column for [" + field + "]", e);
-        }
     }
 
     public DocLookup doc() {

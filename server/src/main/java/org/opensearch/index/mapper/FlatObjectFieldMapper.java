@@ -42,6 +42,7 @@ import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
 import org.opensearch.index.mapper.flatobject.FlatObjectBlobIndexFieldData;
+import org.opensearch.index.mapper.flatobject.FlatObjectBlobObjectIndexFieldData;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.support.CoreValuesSourceType;
@@ -380,10 +381,14 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             failIfNoDocValues();
             String path = blobPath();
             if (path == null) {
-                // The parent field itself. Left as it was: ordinals over the value column, which is what a script reading
-                // doc['attributes'] gets. Deliberately not numeric -- declaring NUMERIC here would make `sum` on the bare
-                // parent resolve and return nonsense.
-                return new SortedSetOrdinalsIndexFieldData.Builder(valueFieldType().name(), CoreValuesSourceType.BYTES);
+                // The parent field itself, which only a script reaches: doc['attributes'] hands back the whole value as a
+                // lazy map. Bytes rather than numeric on purpose -- ValuesSourceConfig reads the values-source type straight
+                // off the fielddata, so declaring numeric here would let `sum` on the bare parent resolve and return
+                // nonsense.
+                if (hasBlobColumns() == false) {
+                    return new SortedSetOrdinalsIndexFieldData.Builder(valueFieldType().name(), CoreValuesSourceType.BYTES);
+                }
+                return new FlatObjectBlobObjectIndexFieldData.Builder(name(), blobFieldName(name()), blobNamesFieldName(name()));
             }
             // A keyed path reads the Variant blob. This is also the gate: an index created before the columns existed has
             // nothing to read, and returning empty values would answer an aggregation with a plausible wrong number. The
