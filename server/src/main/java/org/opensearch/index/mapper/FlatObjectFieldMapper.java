@@ -8,6 +8,7 @@
 
 package org.opensearch.index.mapper;
 
+import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.SortedSetDocValuesField;
@@ -28,9 +29,13 @@ import org.opensearch.OpenSearchException;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.unit.Fuzziness;
+import org.opensearch.common.variant.Variant;
+import org.opensearch.common.variant.VariantBuilder;
+import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.fielddata.IndexFieldData;
@@ -43,6 +48,7 @@ import org.opensearch.search.lookup.SearchLookup;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -76,6 +82,53 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     static final String EQUAL_SYMBOL = "=";
 
     /**
+     * Mapping parameter that additionally stores the field's value as a Variant blob in a {@code BinaryDocValues} column.
+     *
+     * <p>Off by default, so existing indices are unaffected. Enabling it changes nothing about the terms this mapper
+     * produces, and therefore nothing about filtering: it only adds a second, type-preserving copy of the value that can
+     * be read without touching {@code _source}.
+     */
+    public static final String VARIANT_BLOB_PARAM = "variant_blob";
+
+    /** Suffix of the doc-values column holding each document's Variant value tree. */
+    public static final String BLOB_SUFFIX = "._blob";
+
+    /**
+     * Suffix used by two superseded prototype layouts, retained only so that a segment carrying one can be recognised and
+     * refused rather than misread, and so an attribute cannot take the name.
+     *
+     * <p>One held the Variant metadata half as {@code SortedDocValues}, deduplicating identical key <em>sets</em>; the other
+     * a per-document rank list connecting field ids to the name column. Neither is written now: field ids are ordered at
+     * index time instead, which is what makes the connection free.
+     */
+    public static final String BLOB_META_SUFFIX = "._blobmeta";
+
+    /**
+     * Suffix of the column holding key <em>names</em>, one entry per name in the document.
+     *
+     * <p>Written as {@code SortedSetDocValues}, so Lucene keeps one copy of each distinct name per segment and gives every
+     * document a list of ordinals into it. Deduplicating individual names rather than whole key <em>sets</em> is what bounds
+     * the dictionary by how many names the field uses, which does not grow with the corpus.
+     */
+    public static final String BLOB_NAMES_SUFFIX = "._blobnames";
+
+    /** The blob columns' own suffixes, reserved so an attribute cannot collide with them. */
+    private static final String RESERVED_BLOB_KEY = "_blob";
+    private static final String RESERVED_BLOB_META_KEY = "_blobmeta";
+    private static final String RESERVED_BLOB_NAMES_KEY = "_blobnames";
+
+    /**
+     * Most distinct keys in one document that can have their field ids relabelled into name order.
+     *
+     * <p>The bound is exactly the point where relabelling stops being free. Ids run {@code 0..count-1}, so with 256 or
+     * fewer keys every id fits one byte, every object's field-id width is therefore one byte, and any permutation of those
+     * ids still fits the bytes already written. One key more and an object holding only low ids gets a one-byte width while
+     * a permutation could hand it an id of 256, which would need the value re-laid-out rather than patched. Such a document
+     * is re-encoded with its dictionary supplied in name order instead, which reaches the same layout by a longer route.
+     */
+    static final int MAX_RELABELLED_KEYS = 256;
+
+    /**
      * In flat_object field mapper, field type is similar to keyword field type
      * Cannot be tokenized, can OmitNorms, and can setIndexOption.
      * @opensearch.internal
@@ -107,9 +160,16 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
      */
     public static class Builder extends FieldMapper.Builder<Builder> {
 
+        private boolean variantBlob = false;
+
         public Builder(String name) {
             super(name, Defaults.FIELD_TYPE);
             builder = this;
+        }
+
+        public Builder variantBlob(boolean variantBlob) {
+            this.variantBlob = variantBlob;
+            return this;
         }
 
         @Override
@@ -125,7 +185,7 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             );
             FlatObjectFieldType fft = new FlatObjectFieldType(buildFullName(context), null, valueFieldType, valueAndPathFieldType);
 
-            return new FlatObjectFieldMapper(name, Defaults.FIELD_TYPE, fft);
+            return new FlatObjectFieldMapper(name, Defaults.FIELD_TYPE, fft, variantBlob);
         }
     }
 
@@ -143,7 +203,14 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
 
         @Override
         public Mapper.Builder<?> parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
-            return builderFunction.apply(name, parserContext);
+            Builder builder = builderFunction.apply(name, parserContext);
+            // The entry must be removed, not merely read: ObjectMapper.TypeParser rejects the mapping if anything is left
+            // behind in the node.
+            Object variantBlob = node.remove(VARIANT_BLOB_PARAM);
+            if (variantBlob != null) {
+                builder.variantBlob(XContentMapValues.nodeBooleanValue(variantBlob, name + "." + VARIANT_BLOB_PARAM));
+            }
+            return builder;
         }
     }
 
@@ -538,12 +605,46 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
 
     private final KeywordFieldType valueFieldType;
     private final KeywordFieldType valueAndPathFieldType;
+    private final boolean variantBlob;
 
     FlatObjectFieldMapper(String simpleName, FieldType fieldType, FlatObjectFieldType mappedFieldType) {
+        this(simpleName, fieldType, mappedFieldType, false);
+    }
+
+    FlatObjectFieldMapper(String simpleName, FieldType fieldType, FlatObjectFieldType mappedFieldType, boolean variantBlob) {
         super(simpleName, fieldType, mappedFieldType, CopyTo.empty());
         assert fieldType.indexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) <= 0;
         valueFieldType = mappedFieldType.valueFieldType;
         valueAndPathFieldType = mappedFieldType.valueAndPathFieldType;
+        this.variantBlob = variantBlob;
+    }
+
+    /** Whether this field additionally stores its value as a Variant blob doc-values column. */
+    public boolean isVariantBlob() {
+        return variantBlob;
+    }
+
+    /** The name of the column holding a field's Variant value trees. */
+    public static String blobFieldName(String fieldName) {
+        return fieldName + BLOB_SUFFIX;
+    }
+
+    /** The name of the column holding a field's Variant key metadata. */
+    public static String blobMetaFieldName(String fieldName) {
+        return fieldName + BLOB_META_SUFFIX;
+    }
+
+    /** The name of the column holding a field's key names, when they are stored separately. */
+    public static String blobNamesFieldName(String fieldName) {
+        return fieldName + BLOB_NAMES_SUFFIX;
+    }
+
+    @Override
+    protected void doXContentBody(XContentBuilder builder, boolean includeDefaults, Params params) throws IOException {
+        super.doXContentBody(builder, includeDefaults, params);
+        if (includeDefaults || variantBlob) {
+            builder.field(VARIANT_BLOB_PARAM, variantBlob);
+        }
     }
 
     @Override
@@ -584,13 +685,43 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         assert parser.currentToken() == XContentParser.Token.START_OBJECT;
         parser.nextToken(); // Skip the outer START_OBJECT. Need to return on END_OBJECT.
 
+        // Encoded during the walk the mapper already performs, rather than from a separately materialised tree. Reading
+        // the subtree into a map first would be simpler but would charge this option for work the design does not call
+        // for, biasing the write-cost measurement against it.
+        VariantBuilder variantBuilder = variantBlob ? new VariantBuilder() : null;
+        if (variantBuilder != null) {
+            variantBuilder.startObject();
+        }
+
         LinkedList<String> path = new LinkedList<>(Collections.singleton(fieldType().name()));
         HashSet<String> pathParts = new HashSet<>();
         while (parser.currentToken() != XContentParser.Token.END_OBJECT) {
-            parseToken(parser, context, path, pathParts);
+            parseToken(parser, context, path, pathParts, variantBuilder);
         }
 
         createPathFields(context, pathParts);
+
+        if (variantBuilder != null) {
+            variantBuilder.endObject();
+            writeVariantBlob(context, variantBuilder);
+        }
+    }
+
+    private void writeVariantBlob(ParseContext context, VariantBuilder variantBuilder) {
+        final Variant variant;
+        try {
+            variant = variantBuilder.finish();
+        } catch (IllegalStateException e) {
+            // The Variant format forbids duplicate keys within an object, which plain JSON permits.
+            throw new MapperParsingException("failed to encode [" + name() + "] as a Variant blob: " + e.getMessage(), e);
+        }
+        // The two halves go to separate columns, which is how Parquet represents a Variant and the reason it does not pay
+        // for the key names once per row. Here the metadata half is split further: the names go to a sorted column that
+        // Lucene deduplicates across the whole segment, and the value half stays BinaryDocValues, distinct per document.
+        //
+        // Nothing written is positional across documents -- names are matched by their own bytes and field ids index only
+        // the document's own name list -- so Lucene's own doc-values merge is correct without further work.
+        writeBlobColumns(context, variantBuilder.dictionaryKeys(), variant);
     }
 
     private void createPathFields(ParseContext context, HashSet<String> pathParts) {
@@ -607,6 +738,75 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         }
     }
 
+    /**
+     * Writes the key names to their own sorted column and the value tree to a binary one.
+     *
+     * <p>Two columns rather than three, because of how the two sides meet. A mapper cannot know ordinals: Lucene assigns
+     * them when the segment is flushed, long after this runs. What it can know is the order the names sort in
+     * <em>within this document</em> -- and the name column hands a reader that document's ordinals ascending, which is name
+     * order. So if field id {@code i} is made to mean the document's {@code i}-th smallest name, the reader's {@code i}-th
+     * ordinal <em>is</em> the name that field id {@code i} refers to, and nothing has to be stored to connect them.
+     *
+     * <p>The encoder cannot assign ids that way as it goes, since a smaller name may still arrive, so it assigns them in
+     * insertion order and {@link Variant#relabelFieldIds} permutes them here. That is a patch of the field-id bytes at the
+     * width already written, which holds for any document with at most {@link #MAX_RELABELLED_KEYS} distinct keys. A wider
+     * one keeps its insertion-order ids and gets an explicit rank list in {@link #BLOB_META_SUFFIX} instead -- the layout
+     * every document used before relabelling existed, which is why readers still handle it.
+     */
+    private void writeBlobColumns(ParseContext context, List<String> keys, Variant variant) {
+        int count = keys.size();
+        String namesField = blobNamesFieldName(name());
+        String metaField = blobMetaFieldName(name());
+        String blobField = blobFieldName(name());
+        if (context.doc().getByKey(blobField) != null) {
+            throw new MapperParsingException(
+                "["
+                    + name()
+                    + "] received more than one object for a single document, which ["
+                    + VARIANT_BLOB_PARAM
+                    + "] does not support because the blob doc-values column holds one value per document"
+            );
+        }
+        if (count > 0xFFFF) {
+            throw new MapperParsingException(
+                "[" + name() + "] has " + count + " distinct keys in one document, over the 65535 the blob layout supports"
+            );
+        }
+
+        byte[][] keyBytes = new byte[count][];
+        Integer[] byName = new Integer[count];
+        for (int i = 0; i < count; i++) {
+            keyBytes[i] = keys.get(i).getBytes(StandardCharsets.UTF_8);
+            byName[i] = i;
+        }
+        Arrays.sort(byName, (a, b) -> Arrays.compareUnsigned(keyBytes[a], keyBytes[b]));
+
+        byte[] value;
+        if (count <= MAX_RELABELLED_KEYS) {
+            int[] idMap = new int[count];
+            for (int rank = 0; rank < count; rank++) {
+                idMap[byName[rank]] = rank;
+            }
+            // Mutates the value bytes read below. The Variant's own dictionary no longer describes them afterwards, which is
+            // why nothing here reads a key back through it.
+            variant.relabelFieldIds(idMap);
+            value = variant.valueBytes();
+        } else {
+            // Too wide to patch in place, so re-encode with the dictionary supplied in name order -- the way a Parquet writer
+            // produces sorted ids. Same result, and no key-count limit; it just costs a second pass over the tree.
+            List<String> sorted = new ArrayList<>(count);
+            for (int rank = 0; rank < count; rank++) {
+                sorted.add(keys.get(byName[rank]));
+            }
+            value = variant.reencodeWithDictionary(sorted);
+        }
+
+        for (int i = 0; i < count; i++) {
+            context.doc().add(new SortedSetDocValuesField(namesField, new BytesRef(keyBytes[i])));
+        }
+        context.doc().addWithKey(blobField, new BinaryDocValuesField(blobField, new BytesRef(value)));
+    }
+
     private static String getDVPrefix(String rootFieldName) {
         return rootFieldName + DOT_SYMBOL;
     }
@@ -615,29 +815,68 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         return path + EQUAL_SYMBOL;
     }
 
-    private void parseToken(XContentParser parser, ParseContext context, Deque<String> path, HashSet<String> pathParts) throws IOException {
+    private void parseToken(
+        XContentParser parser,
+        ParseContext context,
+        Deque<String> path,
+        HashSet<String> pathParts,
+        VariantBuilder variantBuilder
+    ) throws IOException {
         if (parser.currentToken() == XContentParser.Token.FIELD_NAME) {
             final String currentFieldName = parser.currentName();
+            if (variantBuilder != null) {
+                if (path.size() == 1 && (RESERVED_BLOB_KEY.equals(currentFieldName) || RESERVED_BLOB_META_KEY.equals(currentFieldName))) {
+                    // The columns are named <field>._blob and <field>._blobmeta, so top-level keys of those names collide.
+                    throw new MapperParsingException(
+                        "["
+                            + name()
+                            + "] cannot contain a top-level key named ["
+                            + currentFieldName
+                            + "] when ["
+                            + VARIANT_BLOB_PARAM
+                            + "] is enabled, because it collides with a blob doc-values column"
+                    );
+                }
+                variantBuilder.appendKey(currentFieldName);
+            }
             path.addLast(currentFieldName); // Pushing onto the stack *must* be matched by pop
             parser.nextToken(); // advance to the value of fieldName
-            parseToken(parser, context, path, pathParts); // parse the value for fieldName (which will be an array, an object,
-            // or a primitive value)
+            parseToken(parser, context, path, pathParts, variantBuilder); // parse the value for fieldName (which will be an array,
+            // an object, or a primitive value)
             path.removeLast(); // Here is where we pop fieldName from the stack (since we're done with the value of fieldName)
             // Note that whichever other branch we just passed through has already ended with nextToken(), so we
             // don't need to call it.
         } else if (parser.currentToken() == XContentParser.Token.START_ARRAY) {
+            if (variantBuilder != null) {
+                variantBuilder.startArray();
+            }
             parser.nextToken();
             while (parser.currentToken() != XContentParser.Token.END_ARRAY) {
-                parseToken(parser, context, path, pathParts);
+                parseToken(parser, context, path, pathParts, variantBuilder);
+            }
+            if (variantBuilder != null) {
+                variantBuilder.endArray();
             }
             parser.nextToken();
         } else if (parser.currentToken() == XContentParser.Token.START_OBJECT) {
+            if (variantBuilder != null) {
+                variantBuilder.startObject();
+            }
             parser.nextToken();
             while (parser.currentToken() != XContentParser.Token.END_OBJECT) {
-                parseToken(parser, context, path, pathParts);
+                parseToken(parser, context, path, pathParts, variantBuilder);
+            }
+            if (variantBuilder != null) {
+                variantBuilder.endObject();
             }
             parser.nextToken();
         } else {
+            // Appended before the term-building logic below, which skips nulls and over-long values. The blob is a
+            // faithful copy of the value, so it must record what the terms drop; otherwise the two stores would disagree
+            // for reasons unrelated to where the value lives.
+            if (variantBuilder != null) {
+                appendScalar(parser, variantBuilder);
+            }
             String value = parseValue(parser);
             if (value == null || value.length() > fieldType().ignoreAbove) {
                 parser.nextToken();
@@ -673,6 +912,46 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             case VALUE_NULL:
                 return parser.textOrNull();
             // Handle other token types as needed
+            default:
+                throw new ParsingException(parser.getTokenLocation(), "Unexpected value token type [" + parser.currentToken() + "]");
+        }
+    }
+
+    /**
+     * Appends the current scalar token to the Variant, keeping its type rather than the string form the terms use.
+     *
+     * <p>The type comes from the same parser the terms come from, so both stores derive their type information from one
+     * source. What Variant adds is that the decision is recorded, instead of being made again by whoever reads
+     * {@code _source} later.
+     */
+    private static void appendScalar(XContentParser parser, VariantBuilder variantBuilder) throws IOException {
+        switch (parser.currentToken()) {
+            case VALUE_NULL:
+                variantBuilder.appendNull();
+                break;
+            case VALUE_BOOLEAN:
+                variantBuilder.appendBoolean(parser.booleanValue());
+                break;
+            case VALUE_STRING:
+                variantBuilder.appendString(parser.text());
+                break;
+            case VALUE_NUMBER:
+                switch (parser.numberType()) {
+                    case INT:
+                    case LONG:
+                        variantBuilder.appendLong(parser.longValue());
+                        break;
+                    case FLOAT:
+                        variantBuilder.appendFloat(parser.floatValue());
+                        break;
+                    case BIG_INTEGER:
+                        variantBuilder.appendBigInteger(new java.math.BigInteger(parser.text()));
+                        break;
+                    default:
+                        variantBuilder.appendDouble(parser.doubleValue());
+                        break;
+                }
+                break;
             default:
                 throw new ParsingException(parser.getTokenLocation(), "Unexpected value token type [" + parser.currentToken() + "]");
         }

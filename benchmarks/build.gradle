@@ -51,6 +51,11 @@ dependencies {
     // us to invoke the JMH uberjar as usual.
     exclude group: 'net.sf.jopt-simple', module: 'jopt-simple'
   }
+  // Corpus generator for the flat_object value-store benchmarks. It lives in the test framework so the JMH benchmarks,
+  // the REST driver, and the correctness tests all generate byte-identical documents from one implementation.
+  api( project(":test:framework")) {
+    exclude group: 'net.sf.jopt-simple', module: 'jopt-simple'
+  }
   api "org.openjdk.jmh:jmh-core:$versions.jmh"
   annotationProcessor "org.openjdk.jmh:jmh-generator-annprocess:$versions.jmh"
   // Dependencies of JMH
@@ -87,3 +92,16 @@ spotless {
 
 // Add support for incubator modules on supported Java versions.
 run.jvmArgs += ['--add-modules=jdk.incubator.vector']
+
+// The `run` task is wired to JMH's Main, so the flat_object REST driver needs its own entry point.
+// Usage: ./gradlew :benchmarks:flatObjectBench --args="index --index bench-a --preset SMOKE"
+tasks.register('flatObjectBench', JavaExec) {
+  group = 'benchmark'
+  description = 'Drives indexing, sizing and querying for the flat_object value-store comparison'
+  classpath = sourceSets.main.runtimeClasspath
+  mainClass = 'org.opensearch.benchmark.flatobject.FlatObjectBenchTool'
+  executable = "${BuildParams.runtimeJavaHome}/bin/java"
+  // Without this the working directory is the subproject, so a --results path of
+  // `benchmarks/results/...` lands in `benchmarks/benchmarks/results/...`.
+  workingDir = rootProject.projectDir
+}

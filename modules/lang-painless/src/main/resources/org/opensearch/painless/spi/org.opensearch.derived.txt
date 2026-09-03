@@ -11,7 +11,18 @@
 class org.opensearch.script.DerivedFieldScript @no_import {
 }
 
+# Typed reads of a flat_object field's Variant blob column. Every getter is nullable, so a script must guard, the same way
+# it has to guard a lookup into params._source.
+class org.opensearch.script.VariantFieldAccess @no_import {
+    Object get(String)
+    Long getLong(String)
+    Double getDouble(String)
+    String getString(String)
+    Boolean getBoolean(String)
+}
+
 static_import {
     void emit(org.opensearch.script.DerivedFieldScript, Object) bound_to org.opensearch.script.ScriptEmitValues$EmitSingle
     void emit(org.opensearch.script.DerivedFieldScript, double, double) bound_to org.opensearch.script.ScriptEmitValues$GeoPoint
+    org.opensearch.script.VariantFieldAccess variant(org.opensearch.script.DerivedFieldScript, String) bound_to org.opensearch.script.ScriptVariantAccess
 }

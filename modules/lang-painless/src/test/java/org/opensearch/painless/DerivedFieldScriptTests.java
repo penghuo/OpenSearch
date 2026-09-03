@@ -102,6 +102,50 @@ public class DerivedFieldScriptTests extends ScriptTestCase {
         assertEquals(3.14f, result.get(0));
     }
 
+    /**
+     * Proves the {@code variant} binding is on the allowlist by compiling and running a script that uses it.
+     *
+     * <p>The index here has no blob column, which is the case the null guard exists for. A script must be able to survive
+     * that rather than failing the whole aggregation, so the accessor is null and nothing is emitted. The functional path
+     * over a real blob column is covered end to end by FlatObjectVariantBlobIT.
+     */
+    public void testVariantAccessorIsAllowlistedAndNullWhenColumnAbsent() throws IOException {
+        SearchLookup lookup = mock(SearchLookup.class);
+        MemoryIndex index = new MemoryIndex();
+        LeafReaderContext leafReaderContext = index.createSearcher().getIndexReader().leaves().get(0);
+        LeafSearchLookup leafSearchLookup = mock(LeafSearchLookup.class);
+        when(lookup.getLeafSearchLookup(leafReaderContext)).thenReturn(leafSearchLookup);
+
+        DerivedFieldScript script = compile(
+            "def v = variant('attributes'); if (v != null) { def s = v.getLong('status'); if (s != null) { emit(s); } }",
+            lookup
+        ).newInstance(leafReaderContext);
+        script.setDocument(0);
+        script.execute();
+
+        assertEquals("no blob column, so nothing to emit", List.of(), script.getEmittedValues());
+    }
+
+    /**
+     * Each typed getter must be reachable from a script, or the allowlist entry is incomplete in a way that only shows up
+     * at query time.
+     */
+    public void testEveryVariantGetterCompiles() throws IOException {
+        SearchLookup lookup = mock(SearchLookup.class);
+        MemoryIndex index = new MemoryIndex();
+        LeafReaderContext leafReaderContext = index.createSearcher().getIndexReader().leaves().get(0);
+        LeafSearchLookup leafSearchLookup = mock(LeafSearchLookup.class);
+        when(lookup.getLeafSearchLookup(leafReaderContext)).thenReturn(leafSearchLookup);
+
+        for (String getter : List.of("get('p')", "getLong('p')", "getDouble('p')", "getString('p')", "getBoolean('p')")) {
+            DerivedFieldScript script = compile("def v = variant('attributes'); if (v != null) { emit(v." + getter + "); }", lookup)
+                .newInstance(leafReaderContext);
+            script.setDocument(0);
+            script.execute();
+            assertEquals(getter + " should emit nothing without a blob column", List.of(), script.getEmittedValues());
+        }
+    }
+
     public void testEmittingDoubleField() throws IOException {
         // Mocking field value to be returned
         NumberFieldType fieldType = new NumberFieldType("test_double_field", NumberType.DOUBLE);
