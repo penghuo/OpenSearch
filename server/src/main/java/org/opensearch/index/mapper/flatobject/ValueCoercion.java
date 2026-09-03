@@ -88,7 +88,9 @@ public final class ValueCoercion {
             if (Double.isNaN(value) || Double.isInfinite(value)) {
                 return FAILED;
             }
-            if (value < Long.MIN_VALUE || value > Long.MAX_VALUE) {
+            // >= rather than >: (double) Long.MAX_VALUE rounds up to exactly 2^63, so the strict comparison lets 2^63
+            // through and the cast below saturates it to Long.MAX_VALUE -- reporting a value the document does not hold.
+            if (value < Long.MIN_VALUE || value >= 0x1p63) {
                 return FAILED;
             }
             // Truncation toward zero, matching a narrowing cast.
@@ -112,7 +114,8 @@ public final class ValueCoercion {
             // Fall back to a floating-point reading so "200.7" behaves like the double 200.7 would.
             try {
                 double value = Double.parseDouble(trimmed);
-                if (Double.isNaN(value) || Double.isInfinite(value) || value < Long.MIN_VALUE || value > Long.MAX_VALUE) {
+                // See toLong: the strict comparison against Long.MAX_VALUE lets exactly 2^63 through.
+                if (Double.isNaN(value) || Double.isInfinite(value) || value < Long.MIN_VALUE || value >= 0x1p63) {
                     return FAILED;
                 }
                 return (long) value;

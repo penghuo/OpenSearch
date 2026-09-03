@@ -682,7 +682,9 @@ public final class Variant {
     }
 
     private void checkValueBounds(int offset, int length) {
-        if (offset < valueBase || length < 0 || offset + length > valueEnd) {
+        // Widened to long before adding: a corrupt four-byte length can make offset + length overflow to a negative int,
+        // which would pass this check and then be trusted as an allocation size.
+        if (offset < valueBase || length < 0 || (long) offset + length > valueEnd) {
             throw new VariantFormatException(
                 "read of " + length + " bytes at " + offset + " exceeds value region [" + valueBase + ", " + valueEnd + ")"
             );

@@ -162,6 +162,22 @@ public class ValueCoercionTests extends OpenSearchTestCase {
      * The point of the mixed-type case in C1.6: the same path holding a number in one document and a word in another must
      * produce one value and one counted exclusion, identically in both arms.
      */
+    /**
+     * A double at or above 2^63 has no long to become, so it must fail rather than saturate.
+     *
+     * <p>The obvious guard reads {@code value > Long.MAX_VALUE}, which never fires at the boundary: casting
+     * {@code Long.MAX_VALUE} to a double rounds it up to exactly 2^63, so the comparison is false and the narrowing cast
+     * then clamps to {@code Long.MAX_VALUE} -- reporting a number the document does not contain.
+     */
+    public void testADoubleAtTwoToTheSixtyThreeCannotBecomeALong() {
+        assertSame(ValueCoercion.FAILED, coerce(0x1p63, ValueType.LONG));
+        assertSame(ValueCoercion.FAILED, coerce("9223372036854775808", ValueType.LONG));
+        assertSame(ValueCoercion.FAILED, coerce(-0x1p64, ValueType.LONG));
+        // Just inside the range still works, and is exact.
+        assertEquals(Long.MAX_VALUE, coerce(Long.MAX_VALUE, ValueType.LONG));
+        assertEquals(9223372036854774784L, coerce(9.223372036854774784E18, ValueType.LONG));
+    }
+
     public void testMixedTypePathBehaviour() {
         assertEquals(200L, coerce(200L, ValueType.LONG));
         assertSame(ValueCoercion.FAILED, coerce("OK", ValueType.LONG));

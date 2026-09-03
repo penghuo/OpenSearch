@@ -903,6 +903,26 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         }
         Arrays.sort(byName, (a, b) -> Arrays.compareUnsigned(keyBytes[a], keyBytes[b]));
 
+        // Two keys the encoder holds apart can arrive here as the same bytes, and that would silently misalign every field
+        // id above them. The encoder's dictionary is keyed by String; the name column stores UTF-8 and Lucene deduplicates a
+        // document's entries by those bytes. So a document with keys that differ as Strings but not as UTF-8 -- an unpaired
+        // surrogate, which encodes to the same '?' as a literal question mark -- writes fewer ordinals than it has field
+        // ids, and field id i stops meaning ordinal i. Cheap to catch: the ids are already sorted by those same bytes, so a
+        // collision is an adjacent pair.
+        for (int rank = 1; rank < count; rank++) {
+            if (Arrays.equals(keyBytes[byName[rank - 1]], keyBytes[byName[rank]])) {
+                throw new MapperParsingException(
+                    "["
+                        + name()
+                        + "] has two keys that differ as text but not as UTF-8 -- ["
+                        + keys.get(byName[rank - 1])
+                        + "] and ["
+                        + keys.get(byName[rank])
+                        + "] -- which cannot both be stored in a doc-values column"
+                );
+            }
+        }
+
         byte[] value;
         if (count <= MAX_RELABELLED_KEYS) {
             int[] idMap = new int[count];
@@ -1066,7 +1086,15 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
                         variantBuilder.appendFloat(parser.floatValue());
                         break;
                     case BIG_INTEGER:
-                        variantBuilder.appendBigInteger(new java.math.BigInteger(parser.text()));
+                        java.math.BigInteger big = new java.math.BigInteger(parser.text());
+                        if (big.bitLength() > 127) {
+                            // Variant's widest integer is decimal16. Rather than refuse a document flat_object accepts
+                            // today, keep the number as its text -- which is exactly what this field's terms already hold,
+                            // so the two stores agree instead of one of them rejecting.
+                            variantBuilder.appendString(parser.text());
+                        } else {
+                            variantBuilder.appendBigInteger(big);
+                        }
                         break;
                     default:
                         variantBuilder.appendDouble(parser.doubleValue());

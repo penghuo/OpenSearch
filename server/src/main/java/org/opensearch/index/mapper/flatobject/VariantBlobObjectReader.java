@@ -31,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.opensearch.index.mapper.FlatObjectFieldMapper.BLOB_META_SUFFIX;
+
 /**
  * Reads a whole {@code flat_object} value out of its Variant blob as a {@link Map}, for {@code doc['attributes']}.
  *
@@ -76,6 +78,15 @@ final class VariantBlobObjectReader {
 
     private int[] documentOrdinals = new int[16];
     private int ordinalCount;
+    /**
+     * Bumped on every advance, and stamped into each view.
+     *
+     * <p>A view reads the reader's live cursor state -- this document's ordinals, and bytes owned by the doc-values
+     * iterator -- so it is only meaningful while the reader sits on its document. That is how {@code ScriptDocValues} is
+     * used, but if a caller ever holds one across a document boundary it would silently read a different document's value.
+     * The stamp turns that into an error.
+     */
+    private int generation;
 
     private VariantBlobObjectReader(BinaryDocValues blob, SortedSetDocValues names, SortedSetDocValues seeker) {
         this.blob = blob;
@@ -93,7 +104,27 @@ final class VariantBlobObjectReader {
         };
     }
 
-    static VariantBlobObjectReader open(LeafReader reader, String blobField, String namesField) throws IOException {
+    static VariantBlobObjectReader open(LeafReader reader, String blobField, String namesField, String parentField) throws IOException {
+        // The same two refusals the per-path reader makes, for the same reasons: a superseded layout would return values
+        // under the wrong keys, and a missing column where the field's terms exist is a broken index rather than an absent
+        // value.
+        if (reader.getFieldInfos().fieldInfo(parentField + BLOB_META_SUFFIX) != null) {
+            throw new IllegalStateException(
+                "segment carries ["
+                    + parentField
+                    + BLOB_META_SUFFIX
+                    + "], which belongs to a layout this reader no longer supports. Reindex the field."
+            );
+        }
+        if (reader.getFieldInfos().fieldInfo(blobField) == null && reader.getFieldInfos().fieldInfo(parentField) != null) {
+            throw new IllegalStateException(
+                "["
+                    + parentField
+                    + "] has documents in this segment but no ["
+                    + blobField
+                    + "] column to read them from, so a value cannot be returned. Reindex the field."
+            );
+        }
         return new VariantBlobObjectReader(
             DocValues.getBinary(reader, blobField),
             DocValues.getSortedSet(reader, namesField),
@@ -105,6 +136,7 @@ final class VariantBlobObjectReader {
      * @return this document's value as a lazy map, or {@code null} if it has none
      */
     Map<String, Object> advance(int docId) throws IOException {
+        generation++;
         if (blob.advanceExact(docId) == false) {
             return null;
         }
@@ -175,18 +207,30 @@ final class VariantBlobObjectReader {
     private final class ObjectView extends AbstractMap<String, Object> {
 
         private final Variant node;
+        private final int bornAt;
 
         ObjectView(Variant node) {
             this.node = node;
+            this.bornAt = generation;
+        }
+
+        private void requireCurrent() {
+            if (bornAt != generation) {
+                throw new IllegalStateException(
+                    "this value belongs to a document the reader has already moved past, so it can no longer be read"
+                );
+            }
         }
 
         @Override
         public int size() {
+            requireCurrent();
             return node.objectSize();
         }
 
         @Override
         public boolean containsKey(Object key) {
+            requireCurrent();
             if (key instanceof String name) {
                 int fieldId = fieldIdOf(name);
                 return fieldId >= 0 && node.objectGetByFieldId(fieldId) != null;
@@ -196,6 +240,7 @@ final class VariantBlobObjectReader {
 
         @Override
         public Object get(Object key) {
+            requireCurrent();
             if (key instanceof String name) {
                 int fieldId = fieldIdOf(name);
                 if (fieldId >= 0) {
@@ -214,6 +259,7 @@ final class VariantBlobObjectReader {
          */
         @Override
         public Set<Entry<String, Object>> entrySet() {
+            requireCurrent();
             return new AbstractSet<>() {
                 @Override
                 public int size() {

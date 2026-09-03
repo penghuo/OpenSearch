@@ -8,6 +8,7 @@
 
 package org.opensearch.index.mapper.flatobject;
 
+import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.IndexWriter;
@@ -22,9 +23,12 @@ import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.util.BytesRef;
 import org.opensearch.Version;
 import org.opensearch.index.fielddata.IndexNumericFieldData;
+import org.opensearch.index.fielddata.SortedBinaryDocValues;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.MapperServiceTestCase;
 import org.opensearch.index.mapper.ParsedDocument;
@@ -33,6 +37,7 @@ import org.opensearch.search.MultiValueMode;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The properties the columnar read path rests on, each of which fails silently rather than loudly if it breaks.
@@ -262,6 +267,108 @@ public class FlatObjectColumnarReadTests extends MapperServiceTestCase {
             assertTrue(refused.getMessage(), refused.getMessage().contains("no [" + FIELD + "._blob] column"));
             assertTrue("the message should say what to do", refused.getMessage().contains("Reindex"));
         }
+    }
+
+    /**
+     * Two keys that differ as text but not as UTF-8 must be refused, not silently misread.
+     *
+     * <p>The encoder's dictionary is keyed by String while the name column stores UTF-8 and Lucene deduplicates a
+     * document's entries by those bytes. An unpaired surrogate encodes to the same byte as a literal question mark, so such
+     * a document would write fewer ordinals than it has field ids -- and field id i would stop meaning ordinal i, returning
+     * another key's value for every key above the collision.
+     */
+    public void testKeysThatCollideInUtf8AreRefused() throws IOException {
+        MapperService mapperService = service(Version.CURRENT);
+        // Separate objects, so the per-object duplicate-key check does not catch it first.
+        String json = "{\"attributes\":{\"a\":1,\"o1\":{\"\\ud800\":1},\"o2\":{\"?\":2}}}";
+        MapperParsingException refused = expectThrows(
+            MapperParsingException.class,
+            () -> mapperService.documentMapper().parse(source(json))
+        );
+        assertTrue(stackTraceOf(refused), stackTraceOf(refused).contains("differ as text but not as UTF-8"));
+    }
+
+    /**
+     * An integer too wide for the Variant encoding must not cost the document.
+     *
+     * <p>Variant's widest integer is decimal16, so past 128 bits there is nothing to store it in. Refusing the document
+     * would be a regression: {@code flat_object} accepts it today and keeps it as a term. So the blob keeps the text, which
+     * is what the terms hold anyway, and the two stores agree.
+     */
+    public void testAnIntegerTooWideForTheEncodingIsKeptAsText() throws IOException {
+        MapperService mapperService = service(Version.CURRENT);
+        String wide = "9".repeat(60);
+        String json = "{\"attributes\":{\"huge\":" + wide + ",\"status\":1}}";
+        // Indexes rather than failing.
+        try (Directory dir = indexBatches(mapperService, List.of(List.of(json))); DirectoryReader reader = DirectoryReader.open(dir)) {
+            LeafReaderContext leaf = reader.leaves().get(0);
+            SortedBinaryDocValues values = fielddata(mapperService, "huge").load(leaf).getBytesValues();
+            assertTrue("the value must be readable", values.advanceExact(0));
+            assertEquals(1, values.docValueCount());
+            assertEquals(wide, values.nextValue().utf8ToString());
+
+            // And the rest of the document is unaffected.
+            SortedNumericDocValues status = fielddata(mapperService, "status").load(leaf).getLongValues();
+            assertTrue(status.advanceExact(0));
+            assertEquals(1L, status.nextValue());
+        }
+    }
+
+    /**
+     * A value read from doc[] must not outlive the document it came from.
+     *
+     * <p>The map is a view over the reader's live cursor, which is how {@code ScriptDocValues} is meant to be used. If a
+     * caller ever holds one across a document boundary it would read a different document's value, so the view says so
+     * instead.
+     */
+    public void testAValueCannotBeReadAfterItsDocumentIsPastanother() throws IOException {
+        MapperService mapperService = service(Version.CURRENT);
+        List<List<String>> batches = List.of(List.of(doc(11, ""), doc(22, "")));
+        try (Directory dir = indexBatches(mapperService, batches); DirectoryReader reader = DirectoryReader.open(dir)) {
+            LeafReaderContext leaf = reader.leaves().get(0);
+            var parent = mapperService.fieldType(FIELD).fielddataBuilder("test", () -> null).build(null, null);
+            var scriptValues = parent.load(leaf).getScriptValues();
+
+            scriptValues.setNextDocId(0);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> first = (Map<String, Object>) scriptValues.get(0);
+            assertEquals(11L, first.get("status"));
+
+            scriptValues.setNextDocId(1);
+            IllegalStateException stale = expectThrows(IllegalStateException.class, () -> first.get("status"));
+            assertTrue(stale.getMessage(), stale.getMessage().contains("already moved past"));
+        }
+    }
+
+    /** A segment carrying the superseded metadata column must be refused by both readers, not read as if ordered. */
+    public void testASegmentWithTheSupersededMetaColumnIsRefused() throws IOException {
+        MapperService mapperService = service(Version.CURRENT);
+        try (Directory dir = newDirectory()) {
+            try (IndexWriter writer = new IndexWriter(dir, new IndexWriterConfig(mapperService.indexAnalyzer()))) {
+                ParsedDocument parsed = mapperService.documentMapper().parse(source(doc(1, "")));
+                parsed.rootDoc().add(new BinaryDocValuesField(FIELD + "._blobmeta", new BytesRef(new byte[] { 1, 1, 0 })));
+                writer.addDocument(parsed.rootDoc());
+            }
+            try (DirectoryReader reader = DirectoryReader.open(dir)) {
+                LeafReaderContext leaf = reader.leaves().get(0);
+
+                var keyed = fielddata(mapperService, "status").load(leaf);
+                IllegalStateException perPath = expectThrows(IllegalStateException.class, keyed::getLongValues);
+                assertTrue(perPath.getMessage(), perPath.getMessage().contains("_blobmeta"));
+
+                var parent = mapperService.fieldType(FIELD).fielddataBuilder("test", () -> null).build(null, null);
+                IllegalStateException wholeObject = expectThrows(IllegalStateException.class, () -> parent.load(leaf).getScriptValues());
+                assertTrue(wholeObject.getMessage(), wholeObject.getMessage().contains("_blobmeta"));
+            }
+        }
+    }
+
+    private static String stackTraceOf(Throwable throwable) {
+        StringBuilder text = new StringBuilder();
+        for (Throwable at = throwable; at != null && at != at.getCause(); at = at.getCause()) {
+            text.append(at).append('\n');
+        }
+        return text.toString();
     }
 
     /** The parent field stays un-aggregatable, whatever the version, because there is no single value to aggregate. */

@@ -163,20 +163,34 @@ public final class VariantMetadata {
     }
 
     public byte[] bytes() {
+        requireInline("bytes");
         // Callers that persist the metadata need exactly this region, not the whole shared buffer.
         return base == 0 && limit == bytes.length ? bytes : Arrays.copyOfRange(bytes, base, limit);
     }
 
+    /**
+     * The indirect form has no metadata bytes of its own -- its names live in a separate column -- so the accessors that
+     * hand out that region have nothing to return. Saying so beats a {@code NullPointerException} from inside a getter.
+     */
+    private void requireInline(String what) {
+        if (names != null) {
+            throw new VariantFormatException("this metadata's names live in a separate column, so it has no " + what);
+        }
+    }
+
     /** Length of this metadata region, for callers writing it out without a copy. */
     public int length() {
+        requireInline("length");
         return limit - base;
     }
 
     public byte[] array() {
+        requireInline("backing array");
         return bytes;
     }
 
     public int offset() {
+        requireInline("offset");
         return base;
     }
 
@@ -217,7 +231,9 @@ public final class VariantMetadata {
         }
         long start = bytesStart + (VariantEncoding.readUnsigned(bytes, offsetsStart + fieldId * offsetSize, offsetSize) & 0xFFFFFFFFL);
         long end = bytesStart + (VariantEncoding.readUnsigned(bytes, offsetsStart + (fieldId + 1) * offsetSize, offsetSize) & 0xFFFFFFFFL);
-        if (start < bytesStart || end < start || end > bytes.length) {
+        // Against `limit`, not the buffer length: the metadata is a region of a shared doc-values buffer, so a corrupt
+        // offset could otherwise point at another document's bytes and be read as a key name.
+        if (start < bytesStart || end < start || end > limit) {
             throw new VariantFormatException(
                 "dictionary entry " + fieldId + " has an invalid range [" + start + ", " + end + ") in a region ending at " + limit
             );

@@ -8,6 +8,7 @@
 
 package org.opensearch.index.mapper.flatobject;
 
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.util.BytesRef;
@@ -67,16 +68,12 @@ public final class FlatObjectBlobObjectIndexFieldData implements IndexFieldData<
 
     @Override
     public Leaf load(LeafReaderContext context) {
-        try {
-            return loadDirect(context);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return new Leaf(context.reader(), blobFieldName, blobNamesFieldName, fieldName);
     }
 
     @Override
-    public Leaf loadDirect(LeafReaderContext context) throws IOException {
-        return new Leaf(VariantBlobObjectReader.open(context.reader(), blobFieldName, blobNamesFieldName));
+    public Leaf loadDirect(LeafReaderContext context) {
+        return load(context);
     }
 
     @Override
@@ -99,20 +96,37 @@ public final class FlatObjectBlobObjectIndexFieldData implements IndexFieldData<
     }
 
     /**
-     * One segment's view. Holds no cursor: the reader it wraps owns them, and a fresh one is opened per load so that a
-     * shared leaf never hands two callers the same forward-only iterator.
+     * One segment's view, holding no cursor of its own.
+     *
+     * <p>A {@code LeafFieldData} may be shared, while the doc-values iterators underneath are forward-only and
+     * single-threaded, so each value view opens its own reader. Holding one reader on the leaf and handing it to every
+     * caller would have them share a cursor and a read-mutated name cache.
      */
     public static final class Leaf implements LeafFieldData {
 
-        private final VariantBlobObjectReader reader;
+        private final LeafReader reader;
+        private final String blobFieldName;
+        private final String blobNamesFieldName;
+        private final String parentFieldName;
 
-        Leaf(VariantBlobObjectReader reader) {
+        Leaf(LeafReader reader, String blobFieldName, String blobNamesFieldName, String parentFieldName) {
             this.reader = reader;
+            this.blobFieldName = blobFieldName;
+            this.blobNamesFieldName = blobNamesFieldName;
+            this.parentFieldName = parentFieldName;
+        }
+
+        private VariantBlobObjectReader open() {
+            try {
+                return VariantBlobObjectReader.open(reader, blobFieldName, blobNamesFieldName, parentFieldName);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
         }
 
         @Override
         public ScriptDocValues<?> getScriptValues() {
-            return new FlatObjectScriptDocValues(reader);
+            return new FlatObjectScriptDocValues(open());
         }
 
         /**
@@ -123,14 +137,15 @@ public final class FlatObjectBlobObjectIndexFieldData implements IndexFieldData<
          */
         @Override
         public SortedBinaryDocValues getBytesValues() {
+            final VariantBlobObjectReader objectReader = open();
             return new SortedBinaryDocValues() {
                 private List<BytesRef> values = List.of();
                 private int next;
 
                 @Override
                 public boolean advanceExact(int docId) throws IOException {
-                    Map<String, Object> view = reader.advance(docId);
-                    values = view == null ? List.of() : reader.valuesOf(view);
+                    Map<String, Object> view = objectReader.advance(docId);
+                    values = view == null ? List.of() : objectReader.valuesOf(view);
                     next = 0;
                     return values.isEmpty() == false;
                 }

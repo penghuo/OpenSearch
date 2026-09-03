@@ -27,6 +27,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.opensearch.index.mapper.FlatObjectFieldMapper.BLOB_META_SUFFIX;
+
 /**
  * Resolves one dotted path inside a document's Variant blob without ever reading a key name back.
  *
@@ -116,6 +118,16 @@ final class VariantBlobPathReader {
      * the field at all and empty is the right answer.
      */
     private static void requireColumn(LeafReader reader, String blobField, String parentField) {
+        // A segment carrying the superseded metadata column was written by a layout whose field ids are not in name order,
+        // so reading it here would return values under the wrong keys and raise nothing -- the worst failure available.
+        if (reader.getFieldInfos().fieldInfo(parentField + BLOB_META_SUFFIX) != null) {
+            throw new IllegalStateException(
+                "segment carries ["
+                    + parentField
+                    + BLOB_META_SUFFIX
+                    + "], which belongs to a layout this reader no longer supports. Reindex the field."
+            );
+        }
         if (reader.getFieldInfos().fieldInfo(blobField) != null) {
             return;
         }
