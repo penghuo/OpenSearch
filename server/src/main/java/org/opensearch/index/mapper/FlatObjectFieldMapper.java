@@ -406,7 +406,13 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
                         + "] stored its values in a doc-values column. Reindex to enable it."
                 );
             }
-            return new FlatObjectBlobIndexFieldData.Builder(name(), blobFieldName(rootFieldName), blobNamesFieldName(rootFieldName), path);
+            return new FlatObjectBlobIndexFieldData.Builder(
+                name(),
+                blobFieldName(rootFieldName),
+                blobNamesFieldName(rootFieldName),
+                rootFieldName,
+                path
+            );
         }
 
         @Override

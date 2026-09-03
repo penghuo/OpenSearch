@@ -90,7 +90,9 @@ final class VariantBlobPathReader {
      *
      * @return a reader, or {@code null} when no document in this segment can hold the path at all
      */
-    static VariantBlobPathReader open(LeafReader reader, String blobField, String namesField, String path) throws IOException {
+    static VariantBlobPathReader open(LeafReader reader, String blobField, String namesField, String parentField, String path)
+        throws IOException {
+        requireColumn(reader, blobField, parentField);
         Map<String, Integer> ords = resolveCandidates(reader, namesField, path);
         if (ords == null) {
             return null;
@@ -98,6 +100,34 @@ final class VariantBlobPathReader {
         BinaryDocValues blob = DocValues.getBinary(reader, blobField);
         SortedSetDocValues names = DocValues.getSortedSet(reader, namesField);
         return new VariantBlobPathReader(path, blob, names, ords);
+    }
+
+    /**
+     * Refuses a segment whose documents have the field but no column to read it from.
+     *
+     * <p>The index-creation version says whether the column <em>should</em> exist, which is enough for anything the shipped
+     * write path produces. It is only a proxy, though, and it fails for an index written by a build where the column was
+     * optional: the version passes, the column is absent, and Lucene answers an absent doc-values field with an empty
+     * iterator rather than an error -- so an aggregation returns a confident zero. That was not hypothetical; it is what a
+     * prototype-built index did.
+     *
+     * <p>The two cases are separable. If the field's own terms are in this segment then its documents do have the field, so
+     * a missing column is a broken index rather than an absent value. If neither is present, no document in the segment has
+     * the field at all and empty is the right answer.
+     */
+    private static void requireColumn(LeafReader reader, String blobField, String parentField) {
+        if (reader.getFieldInfos().fieldInfo(blobField) != null) {
+            return;
+        }
+        if (reader.getFieldInfos().fieldInfo(parentField) != null) {
+            throw new IllegalStateException(
+                "["
+                    + parentField
+                    + "] has documents in this segment but no ["
+                    + blobField
+                    + "] column to read them from, so a value cannot be returned. Reindex the field."
+            );
+        }
     }
 
     /**

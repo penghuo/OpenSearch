@@ -41,17 +41,19 @@ final class FlatObjectBlobLeafFieldData implements LeafNumericFieldData {
     private final LeafReader reader;
     private final String blobFieldName;
     private final String blobNamesFieldName;
+    private final String parentFieldName;
     private final String path;
 
-    FlatObjectBlobLeafFieldData(LeafReader reader, String blobFieldName, String blobNamesFieldName, String path) {
+    FlatObjectBlobLeafFieldData(LeafReader reader, String blobFieldName, String blobNamesFieldName, String parentFieldName, String path) {
         this.reader = reader;
         this.blobFieldName = blobFieldName;
         this.blobNamesFieldName = blobNamesFieldName;
+        this.parentFieldName = parentFieldName;
         this.path = path;
     }
 
     private VariantBlobPathReader open() throws IOException {
-        return VariantBlobPathReader.open(reader, blobFieldName, blobNamesFieldName, path);
+        return VariantBlobPathReader.open(reader, blobFieldName, blobNamesFieldName, parentFieldName, path);
     }
 
     /**

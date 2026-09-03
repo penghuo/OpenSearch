@@ -252,6 +252,18 @@ value. So `.value` returns a **lazy `Map` view over the document's blob**, not a
 The common script pays one field-id lookup and never touches a name. Enumeration still pays, but only when a script
 actually enumerates — which is rare, and is the same machinery Phase 3's `_source` reconstruction needs anyway.
 
+**Measured**, all three routes on one index over 100,000 documents of ~100 attributes each, agreeing on the same answer
+(`results.2026-09-03-2002.md`):
+
+| route | p50 | vs `_source` |
+|---|---|---|
+| native column, no script | 42 ms | **256×** |
+| `doc['attributes'].value['status']` | **86 ms** | **125×** |
+| `params._source.attributes['status']` | 10,767 ms | 1× |
+
+So the script route is 125× faster than what it replaces, not slower. The estimate this section used to carry — 2–5 s per
+million — was conservative by three to six times; the measurement is ~860 ms per million.
+
 `getValue()` is **declared** as returning `Map<String, Object>`, so painless dispatches `['status']` through
 `java.util.Map`'s already-whitelisted `def get(def)`. The concrete view class needs no whitelist entry, which removes an
 item the first design had in §8.
@@ -297,6 +309,34 @@ It was however a 500 rather than a 400, because `endObject()` throws outside the
 Deleting the parameter would permanently strand any index whose stored mapping names it: this type parser rejects a
 mapping with any unrecognised key, so the shard fails allocation, the index goes red, and a mapping cannot be edited on
 an index that will not open. That already happened on this branch (I11). It is accepted, ignored, and deprecation-logged.
+
+Confirmed against a real index: one whose stored mapping still says `variant_blob: true` and whose derived fields still
+call the deleted `variant()` function opens **green** on a node built from this branch.
+
+### 6.3 The version gate is only a proxy, so the segment is checked too **[done, found by measuring]**
+
+The version says whether the column *should* exist. That is enough for anything the shipped write path produces, and not
+enough in general: an index created at 3.6.0 by a build where the column was optional passes the gate, has no column, and
+Lucene answers an absent doc-values field with an empty iterator rather than an error. The aggregation then returns a
+confident **zero**.
+
+Not hypothetical. A prototype-built index of 1,000,000 documents did exactly that, and neither the code reading nor 1,400
+unit tests caught it — running the query did.
+
+The two things a missing column can mean are separable:
+
+| in this segment | means | answer |
+|---|---|---|
+| no column, and no terms for the field either | no document here has the field | empty, correct |
+| no column, but the field's terms are present | documents have the field, the column is missing | **refuse** |
+
+So the leaf refuses when the parent field's terms are in the segment but its blob column is not. Belt and braces: the
+version gate gives a good per-index error before any reading starts, and this catches what the version cannot see.
+
+One inconsistency this leaves, stated rather than hidden: `_field_caps` reports `aggregatable: true` for such an index,
+because `isAggregatable()` is a mapping-level question with no reader to consult, while the query then refuses. A
+genuinely pre-3.6 index reports `false` correctly. Only an index created at 3.6.0 by a build where the column was
+optional is affected, which is to say only prototype-built ones.
 
 ---
 
@@ -403,20 +443,25 @@ broken for every real cluster): metrics with no script, `terms` with and without
 mixed-type partial answer with `value_count` as the signal, array expansion including `min`/`max` to catch ordering, a
 descending sort with `numeric_type: long`, an absent path, and `docvalue_fields`.
 
-**Open**
+**Done, over several segments** — `FlatObjectColumnarReadTests`, which exists apart from the equivalence tests because it
+needs what those deliberately remove: more than one segment.
 
-- **Multi-segment sort asserting full ordering**, not just the top hit. This is the only thing that would catch
-  `sortRequiresCustomComparator()` regressing, and the Lucene reasoning behind it rests on a decompiled third-party
-  class rather than a test.
-- **Merge** — results identical before and after `forceMerge(1)`, since ordinals are reassigned by the merge and the
-  ordinal-to-field-id invariant has to survive it. Needs a non-merging index helper; the existing one force-merges to
-  one segment.
-- **That `nextOrd()` returns ascending, deduplicated ordinals** asserted directly. The whole design rests on it and
-  nothing currently pins it.
-- **`missing`** with an absent path and an unreadable value, pinned so a future framework change is deliberate.
-- **The version gate**, both ways. The version is baked into the field type at mapper build time, so the test must vary
-  the `MapperService`, not the `IndexSettings`.
-- **Native/script parity** through the rewritten IT.
+- **Multi-segment sort asserting the full ordering**, both directions. Verified to have teeth by mutation: flipping
+  `sortRequiresCustomComparator()` to `false` turns `[100, 200, 300, 400, 500]` into `[Infinity × 5]`, so the test fails
+  exactly when the guard is removed.
+- **Merge invariance** — identical values before and after `forceMerge(1)`, over segments with disjoint key sets so the
+  merged dictionary interleaves them and every ordinal shifts.
+- **`nextOrd()` ascending and deduplicated**, asserted directly, including a key used at two depths.
+- **The version gate both ways**, plus that an older index writes no columns and a current one writes exactly two.
+- **A segment with documents but no column is refused** (§6.3).
+- **A path present in only some segments**, with the segment that lacks it serving nothing.
+
+**Done, at the REST layer** — see above, plus `90_flat_object.yml`'s "Unsupported" section, where the assertion that a
+subfield aggregation *fails* moved to a positive test asserting it now returns 9.2. `geo_distance` on a subfield and a
+mapping analyzer remain unsupported and still assert as such.
+
+**Done, end to end** — `FlatObjectVariantBlobIT`, rewritten so its blob arm reads `doc['attributes'].value` rather than
+the deleted `variant()`, keeping native/script parity.
 
 ---
 
@@ -427,7 +472,10 @@ descending sort with `numeric_type: long`, an absent path, and `docvalue_fields`
 - Strict coercion mode (§4.3).
 - An exact, surfaced count of skipped values (§9.1) — the profile channel.
 - Excluding unreadable values from `missing` substitution (§9.3) — needs framework support.
-- Whether the lazy Map view's enumeration path is fast enough for Phase 3's `_source` reconstruction — unmeasured.
+- Whether the lazy Map view's **enumeration** path is fast enough for Phase 3's `_source` reconstruction. The `get` path
+  is now measured (§5); enumeration is the one that pays for names and is not.
+- The multi-path case (§2.3). Two paths open two leaves with two cursors, so it should cost about twice — reasoning, not
+  a measurement.
 
 ---
 

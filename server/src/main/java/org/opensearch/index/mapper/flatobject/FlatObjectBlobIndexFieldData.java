@@ -44,13 +44,22 @@ public final class FlatObjectBlobIndexFieldData extends IndexNumericFieldData {
     /** The Lucene doc-values columns, both named after the parent field. */
     private final String blobFieldName;
     private final String blobNamesFieldName;
+    /** The parent field's own name, used only to tell a broken index from a segment with no such field. */
+    private final String parentFieldName;
     /** The path within the blob, e.g. {@code status}. */
     private final String path;
 
-    public FlatObjectBlobIndexFieldData(String fieldName, String blobFieldName, String blobNamesFieldName, String path) {
+    public FlatObjectBlobIndexFieldData(
+        String fieldName,
+        String blobFieldName,
+        String blobNamesFieldName,
+        String parentFieldName,
+        String path
+    ) {
         this.fieldName = fieldName;
         this.blobFieldName = blobFieldName;
         this.blobNamesFieldName = blobNamesFieldName;
+        this.parentFieldName = parentFieldName;
         this.path = path;
     }
 
@@ -91,7 +100,7 @@ public final class FlatObjectBlobIndexFieldData extends IndexNumericFieldData {
 
     @Override
     public LeafNumericFieldData load(LeafReaderContext context) {
-        return new FlatObjectBlobLeafFieldData(context.reader(), blobFieldName, blobNamesFieldName, path);
+        return new FlatObjectBlobLeafFieldData(context.reader(), blobFieldName, blobNamesFieldName, parentFieldName, path);
     }
 
     @Override
@@ -109,18 +118,20 @@ public final class FlatObjectBlobIndexFieldData extends IndexNumericFieldData {
         private final String fieldName;
         private final String blobFieldName;
         private final String blobNamesFieldName;
+        private final String parentFieldName;
         private final String path;
 
-        public Builder(String fieldName, String blobFieldName, String blobNamesFieldName, String path) {
+        public Builder(String fieldName, String blobFieldName, String blobNamesFieldName, String parentFieldName, String path) {
             this.fieldName = fieldName;
             this.blobFieldName = blobFieldName;
             this.blobNamesFieldName = blobNamesFieldName;
+            this.parentFieldName = parentFieldName;
             this.path = path;
         }
 
         @Override
         public IndexFieldData<?> build(IndexFieldDataCache cache, CircuitBreakerService breakerService) {
-            return new FlatObjectBlobIndexFieldData(fieldName, blobFieldName, blobNamesFieldName, path);
+            return new FlatObjectBlobIndexFieldData(fieldName, blobFieldName, blobNamesFieldName, parentFieldName, path);
         }
     }
 }

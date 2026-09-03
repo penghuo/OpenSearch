@@ -691,10 +691,44 @@ teardown:
   - match: { hits.hits.0._source.catalog.author.surname: "Doe" }
 
 ---
+"Aggregate a subfield":
+  - skip:
+      version: " - 3.5.99"
+      reason: "a flat_object subfield became aggregatable in 3.6.0, reading its value from a doc-values column"
+
+  # This used to be asserted as unsupported, with
+  #   "Field [catalog.rating] of type [flat_object] is not supported for aggregation [avg]"
+  # It is supported now: the value is read from the field's Variant column, with no derived field and no script.
+  - do:
+      search:
+        body: {
+          _source: true,
+          size: 0,
+          query: {
+            "match": {
+              "ISBN13": "V9781933988177"
+            }
+          },
+          aggs: {
+            "avg_rating": {
+              "avg": {
+                "field": "catalog.rating"
+              }
+            }
+          }
+        }
+
+  - match: { aggregations.avg_rating.value: 9.2 }
+
+---
 "Unsupported":
   - skip:
       version: " - 2.6.99"
       reason: "flat_object is introduced in 2.7"
+
+  # What remains genuinely unsupported. Numeric and string aggregations on a subfield moved to the section above when the
+  # field's values became readable from a column; these did not, because a mapping analyzer is still rejected and a
+  # flat_object path presents no geo_point values source to aggregate over.
 
   # Mapping parameters (such as index/search analyzers) are currently not supported
   # The plan is to support them in the next version
@@ -711,54 +745,6 @@ teardown:
 
   - match: { error.root_cause.0.type: "mapper_parsing_exception" }
   - match: { error.root_cause.0.reason: "Mapping definition for [data] has unsupported parameters:  [analyzer : standard]"}
-  - match: { status: 400 }
-
-  # Aggregation and Match Query with dot path.
-  - do:
-      catch: bad_request
-      search:
-        body: {
-          _source: true,
-          size: 0,
-          query: {
-            "match": {
-              "ISBN13": "V9781933988177"
-            }
-          },
-          aggs: {
-            "avg_rating": {
-              "avg": {
-                "field": "catalog.rating"
-              }
-            }
-          }
-        }
-  - match: { error.root_cause.0.type: "illegal_argument_exception" }
-  - match: { error.root_cause.0.reason: "Field [catalog.rating] of type [flat_object] is not supported for aggregation [avg]" }
-  - match: { status: 400 }
-
-  # Aggregation using average and Match Query with dot path.
-  - do:
-      catch: bad_request
-      search:
-        body: {
-          _source: true,
-          size: 0,
-          query: {
-            "match": {
-              "ISBN13": "V9781933988177"
-            }
-          },
-          aggs: {
-            "avg_rating": {
-              "avg": {
-                "field": "catalog.rating"
-              }
-            }
-          }
-        }
-  - match: { error.root_cause.0.type: "illegal_argument_exception" }
-  - match: { error.root_cause.0.reason: "Field [catalog.rating] of type [flat_object] is not supported for aggregation [avg]" }
   - match: { status: 400 }
 
   # Aggregation using geolocation and Match Query with dot path.
