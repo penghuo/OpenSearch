@@ -1,14 +1,17 @@
 # Phase 1 — reading a flat_object path as a column
 
-Design for the first shippable slice: make `attributes.status` aggregatable, sortable and script-readable straight
-from the Variant column, with no derived field, no mapping parameter and no new painless function.
+Make `attributes.status` aggregatable, sortable and script-readable straight from the Variant column, with no derived
+field, no mapping parameter and no new painless function.
 
-Phases 2–4 (shredding, `_source` reconstruction, defaults) are out of scope here and live in
-`plan-columnar-flat-object.md`.
+Phases 2–4 (shredding, `_source` reconstruction, defaults) live in `plan-columnar-flat-object.md`.
+
+> **Revision.** This is the second version. The first was written from the design outward and got several load-bearing
+> facts about the code wrong — two of which would have shipped silently wrong query results. §12 lists what changed and
+> why, so the corrections are auditable rather than quietly folded in. Sections are marked **[done]** or **[open]**.
 
 ---
 
-## 1. User-facing surface after this phase
+## 1. User-facing surface
 
 ```json
 {"mappings": {"properties": {"attributes": {"type": "flat_object"}}}}
@@ -20,395 +23,407 @@ Phases 2–4 (shredding, `_source` reconstruction, defaults) are out of scope he
 ```
 
 ```painless
-def attrs = doc['attributes'].value;          // the whole object as a Map
-if (attrs.status != null) { emit(attrs.status); }
+doc['attributes'].value['status']
 ```
 
-Nothing is added to the mapping API and nothing is added to the painless API. `variant()` is deleted.
+Nothing is added to the mapping API. Nothing is added to the painless API — not even a whitelist entry, because
+`java.util.Map` already exposes `def get(def)`. `variant()` is deleted.
 
 ---
 
-## 2. The key idea: no name table
+## 2. The key idea: resolve by field id, not by name **[done]**
 
-The prototype's reader resolves a key by binary-searching an object's `field_ids` and, at each step, turning the
-candidate id into a **name**:
-
-```java
-int fieldId = readUnsigned(value, fieldIdsStart + mid * fieldIdSize, fieldIdSize);
-int comparison = metadata.compareKey(fieldId, probe);   // <- needs every name in the segment
-```
-
-That is the sole reason a segment's whole name table has to be materialised — measured at **27.4 MB and 21.62 ms
-at 761,007 distinct names**, paid per accessor, unaccounted by any circuit breaker, and the cause of the one
-regression this design has (a fifty-document query pays it in full). Issue I13.
-
-It is avoidable. The write path already guarantees that **field id `i` is the document's `i`-th smallest key
-name**, and the name column hands a reader that document's ordinals **ascending** — the same order. So a name can
-be turned into a field id without ever reading a name back:
-
-```
-once per segment      targetOrd = names.lookupTerm("status")        one term-dictionary seek
-                      targetOrd < 0  ->  no document in this segment has this key; serve empty
-
-once per document     drain the document's ordinals (ascending) into a reused int[]
-                      fieldId = binarySearch(ordinals, targetOrd)
-                      not found  ->  the document has no such key
-
-once per path         binary-search the object's field_ids for fieldId  (integer compares, no names)
-                      decode exactly that one value
-```
-
-Consequences:
-
-- **No name table, no fixed per-segment memory, and I13 disappears** rather than being relocated into the
-  fielddata cache. Nothing to account against the breaker because there is nothing held.
-- **Integer comparisons replace byte-string comparisons** in the hot binary search.
-- **A whole segment can be skipped** when `lookupTerm` misses — a rare key now costs one seek per segment instead
-  of a decode per document. The prototype had no such short-circuit.
-- The per-segment state that remains is one `long` per path, so caching it **per path** — which is exactly what
-  `IndexFieldDataService` does, keying caches by `fieldType.name()` — is now the correct granularity rather than a
-  problem to work around.
-
-### 2.1 What this needs from the codec
-
-One addition to `Variant`:
+Resolving a key used to compare the *name* each candidate field id stands for:
 
 ```java
-/** Binary-searches this object's field ids for {@code fieldId}, comparing ids rather than resolved names. */
+int fieldId = VariantEncoding.readUnsigned(value, fieldIdsStart + mid * fieldIdSize, fieldIdSize);
+int comparison = metadata.compareKey(fieldId, probe);   // needs every name in the segment
+```
+
+That single call is why a segment's whole name table had to be materialised — 27.4 MB at 761,007 names, per reader,
+accounted by nothing, and paid in full by a fifty-document query. Issue I13.
+
+The write path guarantees field id `i` is the document's `i`-th smallest key name, and the name column returns a
+document's ordinals ascending — the same order. So a name becomes a field id without reading any name back:
+
+```
+once per segment    ord = names.lookupTerm(candidate)          one term-dictionary seek per candidate
+once per document   fieldId = binarySearch(ordinals, 0, count, ord)
+per container       objectGetByFieldId(fieldId)                unsigned integer compares
+```
+
+Consequences: no name table on this path, nothing to account against a breaker, integer compares instead of byte-string
+compares, and **a key absent from a segment skips the segment entirely** rather than decoding every document in it.
+
+Three things that are easy to get wrong, all of which cost real debugging:
+
+- **A name in the document's ordinals does not mean it is a key of the container being probed.** The Variant dictionary
+  is one per document, shared across every nesting level, so a key used only at depth 2 still appears in the ordinal
+  list. The per-container probe is mandatory; only the two negative cases short-circuit.
+- **The bounded `binarySearch(ordinals, 0, count, ord)` is required.** The ordinal buffer is deliberately oversized, so
+  the 3-arg form would search stale entries from a previous document — and an unsorted tail makes the result undefined
+  rather than merely wrong.
+- **`Integer.compareUnsigned`, not `Integer.compare`.** `readUnsigned` returns a plain `int`, so a four-byte field id at
+  or above 2^31 arrives negative and would sort below every other id.
+
+### 2.1 The codec addition **[done]**
+
+```java
+/** Binary-searches this object's field ids, comparing ids rather than the names they resolve to. */
 public Variant objectGetByFieldId(int fieldId);
 ```
 
-Same loop as `objectGet`, with `metadata.compareKey(...)` replaced by `Integer.compare(candidate, fieldId)`. The
-existing `objectGet(String)` stays for `getAll` and `_source` reconstruction, which do need names.
+**Precondition, and it is not a format guarantee.** Ascending field ids within an object hold only because the writer
+relabels them into name order; the Variant spec orders members by key *string*. A value straight out of `VariantBuilder`
+with an insertion-order dictionary will make this method **silently miss present keys**. It is in the javadoc, and no
+test may build its fixture with the plain builder — `VariantRoundTripTests.relabelIntoNameOrder` exists for that.
 
-### 2.2 Nested paths
+### 2.2 Nested paths **[done]**
 
-Field ids are document-global and name-ordered, and every container's `field_ids` are sorted, so the same trick
-works at depth. `nested.deep.value` resolves three ords once per segment, then per document does one ordinal
-binary search per segment of the path and one `field_ids` binary search per level.
+The candidate set is every dot-delimited span starting at the path start or just after a dot: for `nested.deep.value`
+that is `{nested.deep.value, nested.deep, nested, deep.value, deep, value}` — **n(n+1)/2 spans, not n**. All of them are
+seeked once per segment because the set is purely *syntactic*.
 
-The dotted-key ambiguity is unchanged: `k8s.namespace` may be a literal key or a nested path, and `PathResolver`'s
-longest-matching-prefix-without-backtracking rule still decides. Each candidate prefix needs its own `targetOrd`,
-resolved once per segment.
+**The choice among them is per document, not per segment.** The longest-prefix rule probes live containers, so two
+documents in one segment can resolve the same path along different splits. Any implementation that caches "the split"
+per segment is wrong.
 
-### 2.3 Multi-path reads duplicate work, and this design makes that worse
+The segment-skip test uses **prefix spans only**. Resolution's first probe at the root is always a prefix, so if none
+exists no document can match. A suffix span such as `value` may be a key elsewhere in the corpus and proves nothing.
 
-Each path gets its own `IndexFieldData` and therefore its own `LeafFieldData` — the fielddata cache is keyed by
-`fieldType.name()`, so `attributes.status` and `attributes.level` are separate entries with no shared state. Each
-one independently advances the blob iterator, materialises the document's `BytesRef`, parses the Variant header,
-and drains the document's ordinals.
+### 2.3 Per-path duplication, and it is worse than first written **[open, accepted]**
 
-So a two-path aggregation does that work twice per document. The prototype avoided it by sharing one accessor per
-field per thread — which is exactly the `SearchLookup.variantFieldAccess` map this phase deletes. Removing the
-name table removes the reason that map held anything *large*, but not the reason it existed.
+The fielddata cache is keyed by `fieldType.name()`, so each path gets its own leaf with no shared state. Worse,
+`ValuesSource.Numeric.FieldData` calls `load(context)` separately for `longValues`, `doubleValues` and `bytesValues`, so
+the duplication is **within one path in one aggregation**, not only across paths: several leaves per segment, each with
+its own blob cursor and ordinal buffer.
 
-Scope of the problem:
-
-- **Single-path queries are unaffected**, and that is the common case and the benchmarked one.
-- A two- or three-path query pays 2–3× the per-document blob work, which still leaves it far ahead of `_source`.
-
-Deliberately not solved in Phase 1. If measurement says it matters, the fix is a per-segment shared cursor holding
-`{docId, blob BytesRef, drained ordinals}` for the parent field, hung off the segment's core cache key with a
-closed-listener — the `BitsetFilterCache` pattern. That is small, transient state, unlike the name table, so it
-does not reintroduce I13. Listed in §11.
+Single-path queries — the common and benchmarked case — are unaffected. Deliberately not solved; the fix if measurement
+demands it is a per-segment cursor on the segment's core cache key, which is small transient state and does not
+reintroduce I13.
 
 ---
 
-## 3. Fielddata
+## 3. Fielddata **[done]**
 
-`FlatObjectFieldType.keyedFieldType(path)` returns a `FlatObjectFieldType` carrying the parent's name as
-`rootFieldName`, whose `fielddataBuilder` currently produces `SortedSetOrdinalsIndexFieldData` over the
-`_valueAndPath` column. It gains a fielddata implementation over the blob instead:
+`FlatObjectFieldMapper.keyedFieldType(String)` (on the *mapper*, overriding `DynamicKeyFieldMapper` — not on the field
+type) is the single point where a subfield type is built, so it is where the version and path state are injected.
 
 ```
-FlatObjectBlobIndexFieldData   implements IndexNumericFieldData
-  - fieldName        the parent field, e.g. "attributes"   (the Lucene columns to read)
-  - path             the requested path, e.g. "status"
-  - numericType      see §4
+FlatObjectBlobIndexFieldData   extends IndexNumericFieldData
+  fieldName          the FULL keyed name, "attributes.status"
+  blobFieldName / blobNamesFieldName   derived from the parent
+  path               "status"
+  getNumericType()   DOUBLE
+  sortRequiresCustomComparator()  true
+  load == loadDirect, no caching
 
 FlatObjectBlobLeafFieldData    implements LeafNumericFieldData
-  - targetOrd        resolved once, at load time, from the name column
-  - getLongValues() / getDoubleValues() / getBytesValues() / getScriptValues()
-  - ramBytesUsed()   ~0; nothing is materialised
+  holds {reader, column names, path} and no cursor
+  every getXValues() opens its own VariantBlobPathReader
+  ramBytesUsed()     0
 ```
 
-`load(context)` resolves `targetOrd` and returns leaf data that reads the two columns directly. A missing
-`targetOrd` yields an empty leaf, which is both correct and the cheapest possible answer.
+Four decisions that are not free:
 
-`isAggregatable()` returns true — see §6 for which indices that is safe on.
+- **`getFieldName()` returns the full keyed name.** It labels the `SortField`, `LongValuesComparatorSource` asserts on
+  it, and it is the fielddata cache key. That it names no Lucene field is fine: with neither points nor a doc-values
+  skipper, Lucene finds nothing to build competitive iteration from.
+- **`sortRequiresCustomComparator()` must be `true`.** When false, `IndexNumericFieldData.sortField` short-circuits a
+  MIN/MAX sort to a raw `SortedNumericSortField(getFieldName(), ...)` — a direct read of a Lucene column that does not
+  exist. Lucene returns an empty iterator for an absent field rather than failing, so **every document would sort as
+  missing, silently.** This is the easiest way to ship a wrong sort and no test catches it unless it asserts real
+  ordering across segments.
+- **Implement `LeafNumericFieldData` directly, never extend `LeafLongFieldData`/`LeafDoubleFieldData`.** Both declare
+  `getScriptValues()` and `getBytesValues()` `final`, and derive bytes from the numeric view — so `terms` with
+  `value_type: string` over a path holding `"info"` would bucket a stringified double.
+- **Nothing is cached.** `load == loadDirect`. There is nothing to cache, and building fresh keeps every cursor confined
+  to one iteration, which is what makes a shared leaf safe.
 
-Two things this shape depends on, both checked rather than assumed:
+Both of §3's original claims verified correct: `CoreValuesSourceType.BYTES.getField` does fall through to
+`ValuesSource.Bytes.FieldData` for non-ordinals fielddata, and `FieldSortBuilder` does gate `numeric_type` purely on
+`instanceof IndexNumericFieldData`.
 
-- **One implementation can serve both numeric and string aggregations.** `CoreValuesSourceType.BYTES.getField`
-  falls back to `new ValuesSource.Bytes.FieldData(indexFieldData)` when the fielddata is not an
-  `IndexOrdinalsFieldData`, and that path needs only `getBytesValues()`. So declaring
-  `IndexNumericFieldData` does not preclude `terms` with `value_type: string`.
-- **`numeric_type` works despite the field not being a numeric field type.** `FieldSortBuilder` gates it on
-  `fieldData instanceof IndexNumericFieldData`, not on `fieldType.typeName()` — the type name appears only in the
-  error message — and passes the resolved `NumericType` into `numericFieldData.sortField(resolvedType, ...)`. So a
-  sort can request exact `long` ordering from a `flat_object` path.
+### 3.1 DocValueFormat — the blocker the first design never mentioned **[done]**
+
+`ValuesSourceConfig` asks the field type for a `DocValueFormat` on **every** aggregation with a field, before reading a
+document. The existing `FlatObjectDocValueFormat` implements only `format(BytesRef)` and `parseBytesRef`, so:
+
+| what breaks | where |
+|---|---|
+| `sum` rendering `value_as_string` | `format(double)` → `UnsupportedOperationException` |
+| `"missing": 0` | `parseDouble` → throws *before any document is read* |
+| any multi-shard aggregation | `"flat_object"` is not a registered `NamedWriteable`; coordinator reduce fails |
+| bucket keys | `format(BytesRef)` prefix-strips and returns a `DOC_VALUE_NO_MATCH` sentinel — I14's `java.lang.Object@...` |
+
+It also cannot be made round-trippable as it stands: a non-static inner class with an empty `writeTo` that drops its
+prefix.
+
+**A blob-backed keyed path returns `DocValueFormat.RAW`.** The values reaching it are already bare, so there is nothing
+to strip. This is a real change and it broke `FlatObjectFieldMapperTests.testFetchDocValues`, which asserted the
+prefix-stripping behaviour; end-to-end `docvalue_fields` output is unchanged, because what used to be
+`format("field.field.name=1234") → "1234"` is now `format("1234") → "1234"`.
 
 ---
 
-## 4. Types
+## 4. Types **[done]**
 
-### 4.1 What `value_type` conveys, and what it does not
+### 4.1 What `value_type` conveys
 
-`ValuesSourceConfig.internalResolve` honours the hint ahead of the field's own type:
+`ValuesSourceConfig.internalResolve` honours the hint ahead of the field's own type, so `value_type` selects the
+values-source **shape** — numeric, bytes, boolean, date, ip, geo_point — and decides whether `terms` buckets numbers or
+strings.
 
-```java
-if (userValueTypeHint != null) {
-    // If the user gave us a type hint, respect that.
-    valuesSourceType = userValueTypeHint.getValuesSourceType();
-}
-```
+It does **not** convey numeric width: `ValueType.LONG` and `ValueType.DOUBLE` both map to `CoreValuesSourceType.NUMERIC`.
+(`numeric_type` on a sort also accepts `unsigned_long`, despite its error message listing four.)
 
-So `value_type` selects the **values-source shape** — numeric, bytes, boolean, date, ip, geo_point. That is
-genuinely useful here: it decides whether `terms` buckets numbers or strings.
+### 4.2 Width
 
-It does **not** convey numeric width. `ValueType.LONG` and `ValueType.DOUBLE` both map to
-`CoreValuesSourceType.NUMERIC`, so `value_type: long` and `value_type: double` are indistinguishable by the time
-the config is built. Width comes from `IndexNumericFieldData.getNumericType()`, which is ours to choose.
+`DOUBLE`, with the limit documented: integers above 2^53 lose precision through an aggregation. `sum` and `avg` return
+doubles anyway, so the exposure is `max`/`min` over large integer identifiers.
 
-### 4.2 The width decision
+`NumericType.DOUBLE` makes `isFloatingPoint()` true, so `terms` buckets as `DoubleTerms` and every metric reads
+`doubleValues()`. `getLongValues()` is exercised only by a sort asking `numeric_type: long`, and it therefore reads the
+**stored value** rather than casting the double — otherwise the exactness that was asked for is lost on the way.
 
-`DOUBLE` for aggregations, with the limit documented: integers above 2^53 lose precision. `sum` and `avg` return
-doubles regardless, so the exposure is `max`/`min` over large integer identifiers.
+A sort escapes the limit; an aggregation does not. The fix is a declared type per path, which is Phase 2.
 
-Sorting is better served: `numeric_type` on the sort clause (`FieldSortBuilder.NUMERIC_TYPE`, accepting
-`long, double, date, date_nanos`) does carry width, so a sort can ask for `long` and get exact ordering.
-
-This is a real Phase 1 limitation, not a solved problem. The proper fix is a **declared type per path**, which is
-what Phase 2's shredding schema introduces — a path declared `long` gets exact long fielddata. Phase 1 ships the
-documented default; Phase 2 removes the limitation for declared paths.
-
-### 4.3 Coercion, and what happens to values that do not fit
-
-`ValueCoercion` already implements this and the behaviour is three-way, not two. For `value_type: long` over a
-path holding mixed data:
+### 4.3 Coercion **[done]**
 
 | stored | result |
 |---|---|
 | `200` | `200` |
-| `"200"` | `200` — coerced, matching a numeric field's `coerce: true` default |
+| `"200"` | `200` — coerced, as a numeric field's `coerce: true` default does |
 | `"200.7"` | `200` — parsed as a double, truncated toward zero |
-| `[80, 443]` | **both**, as two doc values — see §9.2 |
-| `"OK"` | **skipped**, `coercionFailures` increments |
+| `[443, 80]` | **both**, ascending — see §9.2 |
+| `[[80,443],8080]` | **three values**, flattened recursively |
+| `"OK"` | skipped |
 | `true`, object | skipped |
-| path absent | skipped, not counted as a failure |
+| path absent, or present and null | skipped, and not a failure |
 
-**Lenient by default**: an aggregation over a million documents must not fail because one document holds `"OK"`.
-Strict mode is deliberately deferred; if it is wanted later it is a request-level flag, not a change of default.
+`ValueCoercion` is unchanged: expansion happens in the caller. Changing `coerce()` to accept containers would break four
+`ValueCoercionTests` assertions and change what the single-valued `get()` means for the `tags`/`numbers` paths.
 
-But lenient must not be silent. When a path skips at least one value, the response carries a warning header, so a
-partial answer never looks like a complete one:
-
-```
-Warning: aggregation on [attributes.code] skipped values that could not be read as numeric
-```
-
-`HeaderWarning.addWarning` writes through the request-scoped `ThreadContext` and propagates from data nodes to the
-client, and identical header values are deduplicated, so this costs one header however many documents were
-affected. The **exact** count is deferred — see §9.1.
+**Lenient, and lenient by design**: an aggregation over a million documents must not fail because one document holds
+`"OK"`. Strict mode is a later request-level flag, not a change of default.
 
 ---
 
-## 5. `doc['attributes']`
+## 5. `doc['attributes']` — a lazy Map view **[open]**
 
-`LeafDocLookup implements Map<String, ScriptDocValues<?>>` and `ScriptDocValues<T> extends AbstractList<T>`, so
-whatever `doc[...]` returns must be a `ScriptDocValues`, and every `ScriptDocValues` is a `List`.
+The first design said this returns what `getAll(docId)` produces. That is a materialised `Map`, which needs **every key
+name of every document visited**, because `toJavaObject()` on an object calls `objectKeyAt` → `metadata.key`. Two ways
+to get those names, and both were bad:
 
-`doc['attributes']` returns `ScriptDocValues<Map<String, Object>>` — a list with exactly one element, since the
-mapper already rejects more than one object per document for this field. `.value` yields the `Map`:
+| approach | cost |
+|---|---|
+| eager per-segment table, built on first script use | reintroduces I13's 27.4 MB, just later, and rebuilt per script instance |
+| per-document `lookupOrd` over that document's ordinals | the *scattered* access pattern: ~14,000 ns per name against ~230 ns sequential. At 100 keys that is ~1.4 ms per document — **~1,400 s per million, against `_source`'s 40 s** |
 
-```painless
-doc['attributes'].value['status']
-doc['attributes'].value.status
-```
+So the doc's own "no user gets slower" claim fails under either.
 
-**Only `doc['attributes']` is supported.** `doc['attributes.status']` is not — see §7 for what it does today.
+**The way out is to notice that scripts do not want the whole object.** `doc['attributes'].value['status']` wants one
+value. So `.value` returns a **lazy `Map` view over the document's blob**, not a copy:
 
-Cost: this decodes every attribute in the document, so it is roughly an order of magnitude behind native per-path
-aggregation and an order of magnitude ahead of `_source`. Estimated 2–5 s per million documents against a
-measured 39,991 ms for `_source` — **an estimate**, to be measured once built. No user gets slower.
+| operation | cost | needs names? |
+|---|---|---|
+| `get(key)` | cached `lookupTerm(key)` per segment, then §2's field-id search | **no** |
+| `containsKey(key)` | same | **no** |
+| `size()` | `objectSize()` | **no** |
+| `entrySet()`, `keySet()`, `values()`, iteration | materialise this document's names via `lookupOrd` | yes, and only then |
 
-The object is what `VariantBlobValueAccessor.getAll(docId)` already produces.
+The common script pays one field-id lookup and never touches a name. Enumeration still pays, but only when a script
+actually enumerates — which is rare, and is the same machinery Phase 3's `_source` reconstruction needs anyway.
 
----
+`getValue()` is **declared** as returning `Map<String, Object>`, so painless dispatches `['status']` through
+`java.util.Map`'s already-whitelisted `def get(def)`. The concrete view class needs no whitelist entry, which removes an
+item the first design had in §8.
 
-## 6. Indices without the column
-
-The existing convention is to ignore a missing column. `AbstractIndexOrdinalsFieldData.load`:
-
-```java
-if (context.reader().getFieldInfos().fieldInfo(fieldName) == null) {
-    // If a field can't be found then it doesn't mean it isn't there,
-    // so if a field doesn't exist then we don't cache it and just return an empty field data instance.
-    return AbstractLeafOrdinalsFieldData.empty();
-}
-```
-
-Following it blindly is wrong here. For an ordinary field a missing column means those documents **have no
-value**; here the value exists in `_source` and is merely invisible to the column, so "ignore" returns a
-plausible **wrong number** rather than an empty one.
-
-Decide at the index level instead of the segment level, from the **index creation version**:
-
-- Phase 1 writes the column for every `flat_object`, unconditionally — there is no mapping parameter to consult
-  (§8). So "does this index have the column?" is answered by whether the index was created at or after the version
-  that introduced it, which is a check OpenSearch already makes routinely.
-- Created before → `isAggregatable()` is false → the user gets today's clear
-  `does not support doc_value in root field` error, never a silently short answer. Reindex to opt in.
-- Created after → every segment has the column, so per-segment absence cannot arise and no mixed-segment case
-  exists to handle.
-- Per-document absence — a document the encoder could not handle — is a Phase 3 concern needing a per-document
-  fallback. Phase 1 has no such documents because the write path still rejects them outright.
+`doc['attributes.status']` stays unsupported (§9.4).
 
 ---
 
-## 7. `doc['attributes.status']` today
+## 6. Indices without the column **[done]**
 
-Measured, and worth stating so the change is understood as a fix rather than a break. Asking for one path returns
-**every** attribute in the document, byte-identical to asking for the whole `_valueAndPath` column:
+The first design put this gate in `isAggregatable()`. **That gates nothing**: the aggregation framework never reads
+`isAggregatable()` — its only consumers are field-caps and star-tree validation — and `MappedFieldType`'s base
+implementation *derives* it from whether `fielddataBuilder` throws. A gate written as an override would have let a
+pre-3.6 index aggregate and return a **silently wrong number**, which is the exact failure this section exists to
+prevent. The quoted error message was also unreachable: it comes from `docValueFormat` and only for the bare parent
+field.
 
-```
-doc['attributes']         -> [attributes.200, attributes.info, attributes.ns-1]
-doc['attributes.status']  -> [attributes.attributes.k8s.namespace=ns-1,
-                              attributes.attributes.level=info,
-                              attributes.attributes.status=200]
-```
+So:
 
-Recorded as I14, together with a related defect: a `terms` aggregation directly on `attributes.status` returns
-buckets rendered as `java.lang.Object@...` because `FlatObjectDocValueFormat` formats only the entry matching the
-path prefix. Both pre-existing on `main`. Phase 1 gives the subscript meaning for aggregation and sort; whether
-`doc['attributes.status']` should also start working is left open (§9).
+- **The gate is an `IllegalArgumentException` from `fielddataBuilder`**, with a new message naming the index and version.
+  That is the first thing `ValuesSourceConfig` calls, so it is always what the user sees.
+- **The `isAggregatable()` override stays**, returning `blobPath() != null && hasBlobColumns()`. It must not be deleted:
+  the parent field's builder now succeeds because a script needs it, so the base derivation would report the parent as
+  aggregatable — which would stop `AggregatorTestCase.testSupportedFieldTypes` skipping `flat_object` and start
+  exercising it in **every** aggregation test in the repo against a document this mapper never wrote.
+- The version is `Version.V_3_6_0` — `CURRENT`, unreleased. No new constant. (`Version` lives in `libs/core`.)
+- It is carried on the **field type**, not only the mapper, because `FieldMapper.merge` replaces the field type from the
+  incoming mapper while leaving mapper-owned fields at their cloned values. Constructor overloads default to
+  `Version.CURRENT` so existing test call sites are untouched.
+
+### 6.1 The write is gated too **[done, a deviation]**
+
+The first design wrote the column unconditionally. That would newly reject, on **every existing** `flat_object` index,
+documents they accept today: a top-level key named `_blob`/`_blobnames`/`_blobmeta`, and more than 65,535 distinct keys
+in one document. Gating the write on the same version leaves pre-3.6 indices byte-identical and avoids writing a column
+no reader will consult.
+
+A duplicate JSON key is **not** in that set — plain `flat_object` already rejects it, verified against a running node.
+It was however a 500 rather than a 400, because `endObject()` throws outside the `try`; that is fixed.
+
+### 6.2 `variant_blob` is retired, not deleted **[done, a deviation]**
+
+Deleting the parameter would permanently strand any index whose stored mapping names it: this type parser rejects a
+mapping with any unrecognised key, so the shard fails allocation, the index goes red, and a mapping cannot be edited on
+an index that will not open. That already happened on this branch (I11). It is accepted, ignored, and deprecation-logged.
 
 ---
 
-## 8. What is added, reused and deleted
+## 7. What `doc['attributes.status']` does today
 
-**Added**
+Asking for one path returns **every** attribute in the document, byte-identical to asking for the whole `_valueAndPath`
+column. Recorded as I14 with a related defect: `terms` directly on a subfield renders buckets as `java.lang.Object@...`.
+Both pre-existing.
 
-- `Variant.objectGetByFieldId(int)` — §2.1
-- `FlatObjectBlobIndexFieldData` / `FlatObjectBlobLeafFieldData` — §3
-- `ScriptDocValues<Map<String,Object>>` for the parent field — §5
-- An index-creation-version gate on `isAggregatable()` — §6
+---
 
-**Changed**
+## 8. Added, reused, deleted
 
-- The column is written for **every** `flat_object`, unconditionally. There is no parameter, so nothing decides
-  per index except when the index was created. Phase 4 is therefore only about the `_source` default, not about
-  whether the column exists.
+**Added** — `Variant.objectGetByFieldId(int)`; `VariantMetadata.NameResolver` and the resolver-backed constructor;
+`VariantBlobPathReader`; `FlatObjectBlobIndexFieldData` / `FlatObjectBlobLeafFieldData`; the lazy Map view (§5); the
+`fielddataBuilder` version gate.
 
-**Reused unchanged** — already covered by 178 unit tests plus an integration suite
+**Changed** — the column is written for every `flat_object` created at or after 3.6.0; keyed paths return
+`DocValueFormat.RAW`; `isAggregatable()` is true for a blob-backed keyed path; **`ValueCoercion`'s caller expands
+arrays** (the first design wrongly listed `ValueCoercion` as reused unchanged while §9.2 required aligning it).
 
-- `common/variant/*` — the codec, builder, metadata, JSON bridge
-- `PathResolver` — dotted-path resolution and the longest-prefix rule
-- `ValueCoercion`, `ValueType` — §4.3 depends on them exactly as written
-- the two-column write path in `FlatObjectFieldMapper`
+**Reused unchanged** — the codec, `PathResolver`, `ValueCoercion` itself, the two-column write path.
 
-**Deleted**
+**Deleted** — `variant()`, `ScriptVariantAccess`, `VariantFieldAccess`, the painless whitelist entry,
+`SearchLookup.variantFieldAccess` and its thread-keyed map, `VariantMetadata`'s dead rank form, and three pieces of dead
+code already in the prototype (`metaField`, `RESERVED_BLOB_NAMES_KEY` never being checked, the 3-arg mapper constructor).
 
-- the `variant_blob` mapping parameter
-- `variant()`, `ScriptVariantAccess`, `VariantFieldAccess`, the painless whitelist entry
-- `SearchLookup.variantFieldAccess` and its thread-keyed map
-- `VariantBlobValueAccessor`'s name table, per-thread caching and `setNextReader` bind — the reader becomes
-  `LeafFieldData` and §2 removes the state it was caching
+**Kept, contrary to the first design** — `VariantBlobValueAccessor` and `FlatObjectValueAccessor.setNextReader`. Turning
+the accessor into the `LeafFieldData` would break 15 call sites and remove the only reader that can serve `RAW` reads and
+`getAll` for the equivalence comparison. The accessor stays as the oracle; fielddata is a third arm beside it. (The first
+design's "per-thread caching" also misdescribed it: the accessor has no thread-keyed state — that was all in
+`SearchLookup`.)
 
 ---
 
 ## 9. Decisions
 
-### 9.1 Skipped values are reported, but not counted, in Phase 1
+### 9.1 Reporting skipped values — the warning header does not work **[open, needs your call]**
 
-A `terms` or `sum` over a path where some documents hold an unreadable value returns a partial answer. That must
-be visible, so the response carries the warning header in §4.3 whenever a path skips anything.
+You chose "report the count" over silence. The mechanism the first design named cannot deliver it:
 
-The exact number is deferred, because there is nowhere request-scoped to accumulate it. `LeafFieldData` is cached
-per segment and shared across requests, so a counter there would accumulate across unrelated searches.
-`IndexFieldData` *is* built per request, so a per-request wrapper around the cached leaf could carry one — but
-nothing retains that object after the aggregation runs, so there is no one to read it back. Reporting a number
-means introducing a request-scoped accumulator into the fielddata path, which deserves its own design rather than
-being bolted onto this phase.
+**`HeaderWarning` is non-deterministic here.** Concurrent segment search is on by default for aggregations. Slice tasks
+run on the `index_searcher` pool, whose `ContextPreservingRunnable` restores the worker's own context on exit and never
+merges the worker's `responseHeaders` back. Lucene hands some slices to the executor and runs the rest on the caller, so
+the header survives only for whichever slice happens to land on the calling thread. A warning that appears sometimes is
+worse than no warning.
 
-So: the warning tells a user their numbers exclude something. Finding out how much is later work.
+There is also no fielddata-level emission point on the request thread: `load()` is reached from `getLeafCollector` on the
+slice worker.
 
-### 9.2 An array contributes every element
+Three channels that do work, in order of cost:
 
-A path holding `[80, 443]` contributes both values, exactly as a real `long` field does with the same JSON.
-`SortedNumericDocValues` supports several values per document natively via `docValueCount()`, so this needs no new
-machinery.
+1. **`value_count` against `hits.total`** — available today, exact, no code. It tells a user how many values contributed;
+   the gap is the skips. Not automatic, but it is a real answer to "why is my sum lower than I expected".
+2. **The aggregation profile** — `ConcurrentAggregationProfiler` already exists precisely to merge per-slice breakdowns,
+   so it is the one channel that survives the concurrency that defeats the header. An exact per-aggregation count under
+   `"profile": true`. The counter can live on the per-request `IndexFieldData` (built fresh per request, and retained by
+   `ValuesSourceConfig` → `FieldContext` for the life of the request), with `ProfilingAggregator` reading it.
+3. **A shard-level stat** — deterministic and operator-visible, but new stats API surface.
 
-This **changes the prototype's behaviour**, which treats any container as unreadable — `getLong('ports')` returns
-null today. Since §10 asserts the native and script routes agree, `ValueCoercion` has to be aligned so both expand
-arrays. That alignment is work this phase owns, not a free consequence.
+**Recommendation:** document (1) as the Phase 1 answer, implement the counter on the per-request `IndexFieldData` now
+because it is nearly free, and land (2) as a small follow-up. Drop the header entirely. Note this reverses your Q2(b)
+answer on the mechanism, not on the intent — hence flagging rather than deciding.
 
-### 9.3 `missing` cannot distinguish absent from unreadable
+Also worth knowing regardless: `HeaderWarning.addWarning` runs two regex `assert`s per call, so with assertions enabled
+it would dominate a benchmark if called per skipped value.
 
-Document A has no `code` key. Document B has `code: "OK"`, which a numeric aggregation cannot read. With
-`"missing": 0` both are treated as missing and both contribute `0`.
+### 9.2 An array contributes every element **[done]**
 
-Excluding B instead — on the grounds that B has a value and calling it `0` invents data — is the better semantics
-and is **not reachable in this phase**. `missing` substitution happens in `ValuesSourceType.replaceMissing`, so
-distinguishing the two cases means supplying our own `ValuesSourceType`. That is possible, since
-`getMappingFromRegistry` reads the type straight off our fielddata:
+Recursively, matching `DocumentParser` re-entering `parseArray`, and **ascending** — `MultiValueMode.MIN` takes the first
+value and `MAX` walks to the last, so `[443, 80]` left in document order would report a minimum of 443. A container
+element inside an array (`[80, {"a":1}]`) is one skipped value plus one kept, consistent with §4.3.
 
-```java
-return fieldContext.indexFieldData().getValuesSourceType();
-```
+This is a genuine divergence from the single-valued accessor, not a bug: `get()` refuses a container, fielddata expands
+it. The equivalence test asserts them separately rather than treating the difference as a disagreement.
 
-but it breaks everything downstream. Aggregations register implementations *against* a values-source type, and
-`ValuesSourceRegistry.getAggregator` throws `<field> is not supported for aggregation [sum]` when nothing is
-registered. `SumAggregationBuilder` registers against `CoreValuesSourceType.NUMERIC`; a new type would need every
-aggregation registered against it, including aggregations from plugins we cannot register. It would also be
-bypassed whenever a user passes `value_type`, since the hint overrides the field's type in `internalResolve`.
+### 9.3 `missing` cannot distinguish absent from unreadable **[done]**
 
-The divergence is narrow: the two behaviours differ **only** when `missing` is specified. Without it, absent and
-unreadable values are both excluded, which is already the preferred semantics. So Phase 1 treats both as missing
-and documents it in one sentence; the better behaviour needs a change to `MissingValues` and the aggregation
-framework, which is a separate proposal.
+Both take the substitution. Excluding the unreadable one needs our own `ValuesSourceType`, which would leave every
+aggregation unregistered against it — including plugin aggregations we cannot register — and would be bypassed whenever
+`value_type` is given. The two behaviours differ only when `missing` is specified.
 
-### 9.4 `doc['attributes.status']` stays unsupported
+Note this only works at all because §3.1 returns `RAW`: `CoreValuesSourceType.NUMERIC.replaceMissing` parses the
+substitute through `docValueFormat.parseDouble` before reading any document.
 
-It is broken today (§7) and fixing it would be nearly free once fielddata exists, but the interface rule is that
-`doc['attributes']` is the only supported subscript. Leaving it alone keeps one rule instead of two, and its
-current output is not something worth preserving either — so it is neither fixed nor relied upon.
+### 9.4 `doc['attributes.status']` stays unsupported **[done]**
+
+One subscript rule, not two. `getScriptValues()` on the keyed leaf is nonetheless implemented as `Doubles`, because the
+interface requires it and refusing is not expressible — so the subscript now returns numbers rather than the whole
+column. That is a bug fix, but it is not advertised.
 
 ---
 
 ## 10. Test plan
 
-- **Equivalence.** Every path and type read through fielddata must equal what `_source` returns, over the existing
-  `RICH_DOC`, `UNSORTED_KEY_DOCS` and the random generated corpus. This is `AccessorEquivalenceTests` extended to
-  a third reader rather than new tests.
-- **The ordinal-to-field-id invariant** is now load-bearing for correctness rather than for size. Existing tests
-  cover it (`testOrderedFieldIdsMatchSource`, `testRelabelledIdsAreAscendingWithinEachObject`,
-  `testWideDocumentsAreReencodedNotRanked`); add one asserting `objectGetByFieldId` and `objectGet(name)` agree
-  for every key of every document.
-- **Segment skip.** A key absent from a whole segment must serve empty without decoding any document — assert via
-  a counter, not by timing.
-- **Merge.** Aggregation results must be identical before and after `forceMerge(1)`, since ordinals are
-  reassigned by the merge and the invariant has to survive it.
-- **Mixed types.** `sum` over a path holding numbers, numeric strings and words, asserting the value and that the
-  warning header is present. A path with no skips must produce no warning.
-- **Arrays.** `sum` over a path holding `[80, 443]` must contribute both values, and must agree with the script
-  route once `ValueCoercion` is aligned (§9.2).
-- **`missing`.** A document with an absent path and a document with an unreadable value must both take the
-  `missing` substitution (§9.3), pinned so a future framework change is a deliberate one.
-- **Aggregation parity with the script route.** The same aggregation via native fielddata and via a derived field
-  reading `doc['attributes'].value` must agree.
-- **Empty and absent.** No column, empty object, path absent from every document, path absent from some segments.
+**Done** — `objectGetByFieldId` agrees with `objectGet(name)` for every key at every depth, over eight documents
+including unsorted keys, prefix-overlapping keys, non-ASCII and empty; fielddata agrees with `_source` on every path and
+type in `RICH_DOC`; arrays expand ascending and recursively, skipping an object element; a key absent from a segment
+serves nothing.
+
+**Open**
+
+- **Multi-segment sort asserting full ordering**, not just the top hit. This is the only thing that would catch
+  `sortRequiresCustomComparator()` regressing, and the Lucene reasoning behind it rests on a decompiled third-party
+  class rather than a test.
+- **Merge** — results identical before and after `forceMerge(1)`, since ordinals are reassigned by the merge and the
+  ordinal-to-field-id invariant has to survive it. Needs a non-merging index helper; the existing one force-merges to
+  one segment.
+- **That `nextOrd()` returns ascending, deduplicated ordinals** asserted directly. The whole design rests on it and
+  nothing currently pins it.
+- **`missing`** with an absent path and an unreadable value, pinned so a future framework change is deliberate.
+- **The version gate**, both ways. The version is baked into the field type at mapper build time, so the test must vary
+  the `MapperService`, not the `IndexSettings`.
+- **Native/script parity** through the rewritten IT.
 
 ---
 
 ## 11. Deferred, with the reason
 
-- **Per-path duplication of the per-document blob work** (§2.3). Measure a two- and three-path aggregation first;
-  the fix is a per-segment shared cursor if the numbers justify the machinery.
-- **Exact numeric width for aggregations** (§4.2). `DOUBLE` with a documented 2^53 limit until Phase 2 gives paths
-  a declared type.
-- **Strict coercion mode** (§4.3). Lenient is the only behaviour; a strict flag is additive if asked for.
-- **An exact count of skipped values** (§9.1). Needs a request-scoped accumulator in the fielddata path.
-- **Excluding unreadable values from `missing` substitution** (§9.3). Needs `MissingValues` and the aggregation
-  framework to support a three-state values source.
-- **`_source` reconstruction and the `_source` default** — Phases 3 and 4.
+- Per-path and per-view duplication of per-document blob work (§2.3) — measure first.
+- Exact numeric width for aggregations (§4.2) — Phase 2's declared types.
+- Strict coercion mode (§4.3).
+- An exact, surfaced count of skipped values (§9.1) — the profile channel.
+- Excluding unreadable values from `missing` substitution (§9.3) — needs framework support.
+- Whether the lazy Map view's enumeration path is fast enough for Phase 3's `_source` reconstruction — unmeasured.
+
+---
+
+## 12. What changed from the first version, and why
+
+| § | first version said | reality |
+|---|---|---|
+| 3.1 | *DocValueFormat unmentioned* | Asked for on every aggregation; the existing format fails four ways. Return `RAW`. |
+| 6 | gate via `isAggregatable()` | Never consulted by aggregations; would have returned silently wrong numbers. Gate in `fielddataBuilder`, keep the override for the parent. |
+| 3 | `sortRequiresCustomComparator` unmentioned | Must be `true`, or MIN/MAX sorts every document as missing, silently. |
+| 5 | Map is what `getAll` produces | Needs every key name; both ways of getting them are slower than `_source`. Replaced by a lazy Map view. |
+| 2, 8 | "no name table" / delete it | True only for per-path reads. Enumeration still needs names, so the table became a lazy `NameResolver`. |
+| 2.2 | three ords per segment | n(n+1)/2 spans; and the choice among them is per document. |
+| 2.1 | `Integer.compare` | `Integer.compareUnsigned`; and the ascending-id precondition is not a format guarantee. |
+| 8 | write unconditionally | Newly rejects documents existing indices accept. Write is version-gated. |
+| 8 | delete `variant_blob` | Would strand indices permanently (I11). Accepted and ignored. |
+| 8 | `ValueCoercion` reused unchanged | Contradicted §9.2; its caller expands arrays. |
+| 8, 10 | accessor becomes the `LeafFieldData` | Contradicted §10's third arm and breaks 15 call sites. Accessor stays as the oracle. |
+| 9.1 | header propagates from data nodes | Silently dropped under the default concurrency. Needs a different channel. |
+| 9.1 | leaf counters leak across requests | Only for ordinals fielddata; and the config *is* retained for the request. Right conclusion, wrong reasons. |
+| 3 | `keyedFieldType` on the field type | It is on the mapper. |
+| 8 | 178 existing tests | 148 under `server/src/test`. |
