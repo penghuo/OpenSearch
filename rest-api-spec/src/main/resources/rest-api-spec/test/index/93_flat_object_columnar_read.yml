@@ -1,0 +1,471 @@
+---
+# Reading a flat_object value out of its doc-values column from a script, with the spath path syntax PPL uses.
+#
+# Three shards deliberately: a script runs per shard, so a single-shard test would pass while per-segment name resolution
+# was broken for every real cluster.
+
+setup:
+  - skip:
+      version: " - 3.8.99"
+      reason: "flat_object values became readable from a doc-values column in 3.9.0"
+
+  - do:
+      indices.create:
+        index: flat_object_columnar
+        body:
+          settings:
+            number_of_shards: 3
+            number_of_replicas: 0
+            # Opt-in. Without it flat_object behaves exactly as it always has, which is what the other suites cover.
+            index.mapping.flat_object.variant_doc_values: true
+          mappings:
+            properties:
+              order:
+                type: "keyword"
+              attributes:
+                type: "flat_object"
+
+  - do:
+      bulk:
+        refresh: true
+        index: flat_object_columnar
+        body: |
+          {"index":{"_id":"1"}}
+          {"order":"a","attributes":{"region":"us-east-1","sub":{"center":1},"events":[{"status":1},{"status":2}],"cluster.name":"c1","matrix":[[{"value":1}],[{"value":2}]]}}
+          {"index":{"_id":"2"}}
+          {"order":"b","attributes":{"region":"eu-west-1","events":[],"flag":true,"ratio":0.25}}
+          {"index":{"_id":"3"}}
+          {"order":"c","attributes":{"events":[{"other":9},{"status":null},{"status":4}]}}
+          {"index":{"_id":"4"}}
+          {"order":"d","other":"no attributes here"}
+          {"index":{"_id":"5"}}
+          {"order":"e","attributes":{"cluster.name":"c1","cluster":{"name":"c2"}}}
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: flat_object_columnar
+
+---
+"A scalar path keeps its JSON type":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "1" } }
+          script_fields:
+            region:
+              script:
+                source: "doc['attributes.region'].value"
+            center:
+              script:
+                source: "doc['attributes.sub.center'].value"
+
+  - match: { hits.hits.0.fields.region.0: "us-east-1" }
+  - match: { hits.hits.0.fields.center.0: 1 }
+
+---
+"A wildcard reads every element of one array level":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "1" } }
+          script_fields:
+            statuses:
+              script:
+                source: "doc['attributes.events{}.status'].value"
+            first:
+              script:
+                source: "doc['attributes.events{0}.status'].value"
+            second:
+              script:
+                source: "doc['attributes.events{1}.status'].value"
+            nested:
+              script:
+                source: "doc['attributes.matrix{}{}.value'].value"
+
+  - match: { hits.hits.0.fields.statuses.0: 1 }
+  - match: { hits.hits.0.fields.statuses.1: 2 }
+  - match: { hits.hits.0.fields.first.0: 1 }
+  - match: { hits.hits.0.fields.second.0: 2 }
+  - match: { hits.hits.0.fields.nested.0: 1 }
+  - match: { hits.hits.0.fields.nested.1: 2 }
+
+---
+"Array selector values compare in Painless":
+  # An indexed selector yields one scalar, so ordinary numeric comparison applies.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query:
+            script:
+              script:
+                source: "doc['attributes.events{0}.status'].size() != 0 && doc['attributes.events{0}.status'].value == params.expected"
+                params:
+                  expected: 1
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  # A wildcard yields one List. PPL containment should lower to element-wise Painless equality so numeric types compare
+  # by value rather than relying on Java List.contains, whose boxed-number equality is type-sensitive.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query:
+            script:
+              script:
+                source: "if (doc['attributes.events{}.status'].size() == 0) return false; for (def value : doc['attributes.events{}.status'].value) { if (value == params.expected) return true; } return false;"
+                params:
+                  expected: 1
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+---
+"An array is never traversed without a selector":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "1" } }
+          script_fields:
+            implicit:
+              script:
+                source: "doc['attributes.events.status'].size()"
+            explicit:
+              script:
+                source: "doc['attributes.events{}.status'].size()"
+
+  # The path that crosses an array without saying so resolves to nothing; the one that says so resolves to one value.
+  - match: { hits.hits.0.fields.implicit.0: 0 }
+  - match: { hits.hits.0.fields.explicit.0: 1 }
+
+---
+"A bracket-quoted member names a key containing a dot":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "1" } }
+          script_fields:
+            quoted:
+              script:
+                source: "doc[\"attributes.['cluster.name']\"].value"
+            unquoted:
+              script:
+                source: "doc['attributes.cluster.name'].size()"
+
+  - match: { hits.hits.0.fields.quoted.0: "c1" }
+  # Unquoted, the same string means nesting, and there is no object called cluster.
+  - match: { hits.hits.0.fields.unquoted.0: 0 }
+
+---
+"Literal dotted and nested keys remain distinct in Variant":
+  # Legacy flat_object terms collapse both shapes onto one path, so either value matches the same document.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query:
+            bool:
+              filter:
+                - term: { attributes.cluster.name: "c1" }
+                - term: { attributes.cluster.name: "c2" }
+          docvalue_fields: [ "attributes.cluster.name" ]
+          script_fields:
+            literal:
+              script:
+                source: "doc[\"attributes.['cluster.name']\"].value"
+            nested:
+              script:
+                source: "doc['attributes.cluster.name'].value"
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.0.fields.literal.0: "c1" }
+  - match: { hits.hits.0.fields.nested.0: "c2" }
+  # docvalue_fields now follows the same structural path through the Variant column.
+  - match: { hits.hits.0.fields.attributes\.cluster\.name: [ "c2" ] }
+
+---
+"Size is presence, not array length":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          sort: [ { order: asc } ]
+          script_fields:
+            present:
+              script:
+                source: "doc['attributes.events{}.status'].size()"
+            empty:
+              script:
+                source: "doc['attributes.events{}.status'].size() == 0 ? 'missing' : (doc['attributes.events{}.status'].value.isEmpty() ? 'empty' : 'populated')"
+
+  # Doc 1 has two elements, doc 2 an empty array, doc 3 elements without the key, doc 4 no attributes at all.
+  - match: { hits.hits.0.fields.present.0: 1 }
+  - match: { hits.hits.0.fields.empty.0: "populated" }
+  - match: { hits.hits.1.fields.present.0: 1 }
+  - match: { hits.hits.1.fields.empty.0: "empty" }
+  - match: { hits.hits.2.fields.present.0: 1 }
+  - match: { hits.hits.2.fields.empty.0: "populated" }
+  - match: { hits.hits.3.fields.present.0: 0 }
+  - match: { hits.hits.3.fields.empty.0: "missing" }
+
+---
+"A missing member is skipped and an explicit null is kept":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "3" } }
+          script_fields:
+            statuses:
+              script:
+                source: "doc['attributes.events{}.status'].value.size()"
+            values:
+              script:
+                source: "def v = doc['attributes.events{}.status'].value; return v[0] == null ? 'null-first' : 'other'"
+
+  # Three elements: one without the key (skipped), one holding null (kept), one holding 4.
+  - match: { hits.hits.0.fields.statuses.0: 2 }
+  - match: { hits.hits.0.fields.values.0: "null-first" }
+
+---
+"The whole value is a stable map":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "1" } }
+          script_fields:
+            region:
+              script:
+                source: "doc['attributes'].value['region']"
+            keys:
+              script:
+                source: "doc['attributes'].value.size()"
+
+  - match: { hits.hits.0.fields.region.0: "us-east-1" }
+  - match: { hits.hits.0.fields.keys.0: 5 }
+
+---
+"A boolean and a double keep their types":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "2" } }
+          script_fields:
+            flag:
+              script:
+                source: "doc['attributes.flag'].value"
+            ratio:
+              script:
+                source: "doc['attributes.ratio'].value"
+
+  - match: { hits.hits.0.fields.flag.0: true }
+  - match: { hits.hits.0.fields.ratio.0: 0.25 }
+
+---
+"Painless contexts consume raw values before script_fields response shaping":
+  # script_fields turns a scalar into a one-element response array and spreads a returned collection across field values.
+  # Other Painless contexts consume the script's Boolean, Number, or List directly.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query:
+            script:
+              script:
+                source: "doc['attributes.flag'].size() != 0 && doc['attributes.flag'].value"
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "2" }
+
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          query: { term: { _id: "1" } }
+          aggs:
+            total:
+              sum:
+                script:
+                  source: "doc['attributes.sub.center'].value"
+            statuses:
+              terms:
+                script:
+                  source: "doc['attributes.events{}.status'].value"
+                value_type: long
+                size: 10
+                order: { _key: asc }
+
+  - match: { aggregations.total.value: 1.0 }
+  - length: { aggregations.statuses.buckets: 2 }
+  - match: { aggregations.statuses.buckets.0.key: 1 }
+  - match: { aggregations.statuses.buckets.0.doc_count: 1 }
+  - match: { aggregations.statuses.buckets.1.key: 2 }
+  - match: { aggregations.statuses.buckets.1.doc_count: 1 }
+
+---
+"Terms from every element stay searchable":
+  # Unchanged by the column: the field's terms are what a query reads, and they are written exactly as before.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query:
+            term:
+              attributes.events.status: 1
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+---
+"docvalue_fields reads typed values directly from Variant":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "1" } }
+          docvalue_fields:
+            - "attributes.region"
+            - "attributes.sub.center"
+            - "attributes.events{}.status"
+  - match: { hits.hits.0.fields.attributes\.region: [ "us-east-1" ] }
+  - match: { hits.hits.0.fields.attributes\.sub\.center: [ 1 ] }
+  - match:
+      "hits.hits.0.fields.attributes\\.events{}\\.status": [ [ 1, 2 ] ]
+
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          query: { term: { _id: "3" } }
+          docvalue_fields: [ "attributes.events{}.status" ]
+  - match:
+      "hits.hits.0.fields.attributes\\.events{}\\.status": [ [ null, 4 ] ]
+
+---
+"Aggregating or sorting a subfield is refused":
+  - do:
+      catch: bad_request
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.sub.center
+  - match: { status: 400 }
+
+  - do:
+      catch: bad_request
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          sort: [ { attributes.sub.center: asc } ]
+  - match: { status: 400 }
+
+---
+"field_caps does not advertise aggregation":
+  - do:
+      field_caps:
+        index: flat_object_columnar
+        fields: "attributes*"
+  - match: { fields.attributes.flat_object.searchable: true }
+  - match: { fields.attributes.flat_object.aggregatable: false }
+
+---
+"Without the opt-in the field is unchanged":
+  - skip:
+      version: " - 3.8.99"
+      reason: "flat_object values became readable from a doc-values column in 3.9.0"
+
+  - do:
+      indices.create:
+        index: flat_object_legacy
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              attributes:
+                type: "flat_object"
+
+  - do:
+      index:
+        index: flat_object_legacy
+        id: "1"
+        refresh: true
+        body: { "attributes": { "region": "us-east-1", "status": 200 } }
+
+  # The parent hands a script the field's own sorted, deduplicated, prefixed strings -- the pre-column behaviour, not a Map.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_legacy
+        body:
+          script_fields:
+            legacy:
+              script:
+                source: "doc['attributes'].get(0)"
+            count:
+              script:
+                source: "doc['attributes'].size()"
+
+  - match: { hits.hits.0.fields.legacy.0: "attributes.200" }
+  - match: { hits.hits.0.fields.count.0: 2 }
+
+  # And docvalue_fields on a keyed path is what it always was.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_legacy
+        body:
+          docvalue_fields: [ "attributes.region" ]
+  - match: { hits.hits.0.fields.attributes\.region: [ "us-east-1" ] }
+
+  - do:
+      indices.delete:
+        index: flat_object_legacy
+
+---
+"The opt-in cannot be changed on an existing index":
+  - skip:
+      version: " - 3.8.99"
+      reason: "flat_object values became readable from a doc-values column in 3.9.0"
+
+  - do:
+      catch: bad_request
+      indices.put_settings:
+        index: flat_object_columnar
+        body:
+          index.mapping.flat_object.variant_doc_values: false
+  - match: { status: 400 }

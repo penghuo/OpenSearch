@@ -8,10 +8,12 @@
 
 package org.opensearch.index.mapper;
 
+import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.AutomatonQuery;
 import org.apache.lucene.search.FieldExistsQuery;
@@ -25,9 +27,13 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.Automaton;
 import org.apache.lucene.util.automaton.Operations;
 import org.opensearch.OpenSearchException;
+import org.opensearch.Version;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.unit.Fuzziness;
+import org.opensearch.common.variant.DeferredVariantBuilder;
+import org.opensearch.common.variant.VariantBuilder;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -36,6 +42,9 @@ import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
+import org.opensearch.index.mapper.flatobject.FlatObjectBlobIndexFieldData;
+import org.opensearch.index.mapper.flatobject.FlatObjectBlobObjectIndexFieldData;
+import org.opensearch.index.mapper.flatobject.FlatObjectPath;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.support.CoreValuesSourceType;
@@ -43,6 +52,8 @@ import org.opensearch.search.lookup.SearchLookup;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -75,6 +86,37 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
     static final String DOT_SYMBOL = ".";
     static final String EQUAL_SYMBOL = "=";
 
+    /** First version that writes Variant columns. */
+    static final Version BLOB_COLUMNS_VERSION = Version.V_3_9_0;
+
+    /** Enables Variant doc-values columns for new indices. */
+    public static final Setting<Boolean> INDEX_FLAT_OBJECT_VARIANT_DOC_VALUES_SETTING = Setting.boolSetting(
+        "index.mapping.flat_object.variant_doc_values",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
+    /** Suffix of the doc-values column holding each document's Variant value tree. */
+    public static final String BLOB_SUFFIX = "._blob";
+
+    /**
+     * Suffix of the column holding key <em>names</em>, one entry per name in the document.
+     *
+     * <p>Written as {@code SortedSetDocValues}, so Lucene keeps one copy of each distinct name per segment and gives every
+     * document a list of ordinals into it. Deduplicating individual names rather than whole key <em>sets</em> is what bounds
+     * the dictionary by how many names the field uses, which does not grow with the corpus.
+     */
+    public static final String BLOB_NAMES_SUFFIX = "._blobnames";
+
+    /**
+     * Most distinct keys one document may put in the blob.
+     *
+     * <p>Not a limit of the encoding, which allows far more: a guard, so one pathological document cannot make a segment's
+     * per-document name lists arbitrarily long.
+     */
+    static final int MAX_KEYS_PER_DOCUMENT = 0xFFFF;
+
     /**
      * In flat_object field mapper, field type is similar to keyword field type
      * Cannot be tokenized, can OmitNorms, and can setIndexOption.
@@ -97,7 +139,9 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             Strings.isNullOrEmpty(key) ? this.name() : (this.name() + DOT_SYMBOL + key),
             this.name(),
             valueFieldType,
-            valueAndPathFieldType
+            valueAndPathFieldType,
+            fieldType().indexCreatedVersion(),
+            fieldType().variantDocValues()
         );
     }
 
@@ -107,9 +151,22 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
      */
     public static class Builder extends FieldMapper.Builder<Builder> {
 
+        private Version indexCreatedVersion = Version.CURRENT;
+        private boolean variantDocValues = false;
+
         public Builder(String name) {
             super(name, Defaults.FIELD_TYPE);
             builder = this;
+        }
+
+        public Builder indexCreatedVersion(Version indexCreatedVersion) {
+            this.indexCreatedVersion = indexCreatedVersion;
+            return this;
+        }
+
+        public Builder variantDocValues(boolean variantDocValues) {
+            this.variantDocValues = variantDocValues;
+            return this;
         }
 
         @Override
@@ -123,7 +180,14 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
                 isSearchable,
                 hasDocValue
             );
-            FlatObjectFieldType fft = new FlatObjectFieldType(buildFullName(context), null, valueFieldType, valueAndPathFieldType);
+            FlatObjectFieldType fft = new FlatObjectFieldType(
+                buildFullName(context),
+                null,
+                valueFieldType,
+                valueAndPathFieldType,
+                indexCreatedVersion,
+                variantDocValues
+            );
 
             return new FlatObjectFieldMapper(name, Defaults.FIELD_TYPE, fft);
         }
@@ -143,7 +207,10 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
 
         @Override
         public Mapper.Builder<?> parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException {
-            return builderFunction.apply(name, parserContext);
+            Builder builder = builderFunction.apply(name, parserContext);
+            builder.indexCreatedVersion(parserContext.indexVersionCreated());
+            builder.variantDocValues(INDEX_FLAT_OBJECT_VARIANT_DOC_VALUES_SETTING.get(parserContext.getSettings()));
+            return builder;
         }
     }
 
@@ -158,13 +225,38 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         private final String rootFieldName;
         private final KeywordFieldType valueFieldType;
         private final KeywordFieldType valueAndPathFieldType;
+        private final Version indexCreatedVersion;
+        private final boolean variantDocValues;
 
         public FlatObjectFieldType(String name, String rootFieldName, boolean isSearchable, boolean hasDocValues) {
+            this(name, rootFieldName, isSearchable, hasDocValues, Version.CURRENT);
+        }
+
+        public FlatObjectFieldType(
+            String name,
+            String rootFieldName,
+            boolean isSearchable,
+            boolean hasDocValues,
+            Version indexCreatedVersion
+        ) {
+            this(name, rootFieldName, isSearchable, hasDocValues, indexCreatedVersion, false);
+        }
+
+        public FlatObjectFieldType(
+            String name,
+            String rootFieldName,
+            boolean isSearchable,
+            boolean hasDocValues,
+            Version indexCreatedVersion,
+            boolean variantDocValues
+        ) {
             this(
                 name,
                 rootFieldName,
                 getKeywordFieldType(rootFieldName == null ? name : rootFieldName, VALUE_SUFFIX, isSearchable, hasDocValues),
-                getKeywordFieldType(rootFieldName == null ? name : rootFieldName, VALUE_AND_PATH_SUFFIX, isSearchable, hasDocValues)
+                getKeywordFieldType(rootFieldName == null ? name : rootFieldName, VALUE_AND_PATH_SUFFIX, isSearchable, hasDocValues),
+                indexCreatedVersion,
+                variantDocValues
             );
         }
 
@@ -173,6 +265,27 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             String rootFieldName,
             KeywordFieldType valueFieldType,
             KeywordFieldType valueAndPathFieldType
+        ) {
+            this(name, rootFieldName, valueFieldType, valueAndPathFieldType, Version.CURRENT);
+        }
+
+        public FlatObjectFieldType(
+            String name,
+            String rootFieldName,
+            KeywordFieldType valueFieldType,
+            KeywordFieldType valueAndPathFieldType,
+            Version indexCreatedVersion
+        ) {
+            this(name, rootFieldName, valueFieldType, valueAndPathFieldType, indexCreatedVersion, false);
+        }
+
+        public FlatObjectFieldType(
+            String name,
+            String rootFieldName,
+            KeywordFieldType valueFieldType,
+            KeywordFieldType valueAndPathFieldType,
+            Version indexCreatedVersion,
+            boolean variantDocValues
         ) {
             super(
                 name,
@@ -188,6 +301,27 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             this.rootFieldName = rootFieldName;
             this.valueFieldType = valueFieldType;
             this.valueAndPathFieldType = valueAndPathFieldType;
+            this.indexCreatedVersion = indexCreatedVersion;
+            this.variantDocValues = variantDocValues;
+        }
+
+        Version indexCreatedVersion() {
+            return indexCreatedVersion;
+        }
+
+        boolean variantDocValues() {
+            return variantDocValues;
+        }
+
+        boolean hasBlobColumns() {
+            return variantDocValues && indexCreatedVersion.onOrAfter(BLOB_COLUMNS_VERSION);
+        }
+
+        String blobPath() {
+            if (rootFieldName == null || name().length() <= rootFieldName.length()) {
+                return null;
+            }
+            return name().substring(rootFieldName.length() + 1);
         }
 
         static KeywordFieldType getKeywordFieldType(String rootField, String suffix, boolean isSearchable, boolean hasDocValue) {
@@ -217,17 +351,23 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             return indexAnalyzer();
         }
 
-        /**
-         *
-         * Fielddata is an in-memory data structure that is used for aggregations, sorting, and scripting.
-         * @param fullyQualifiedIndexName the name of the index this field-data is build for
-         * @param searchLookup a {@link SearchLookup} supplier to allow for accessing other fields values in the context of runtime fields
-         * @return IndexFieldData.Builder
-         */
         @Override
         public IndexFieldData.Builder fielddataBuilder(String fullyQualifiedIndexName, Supplier<SearchLookup> searchLookup) {
             failIfNoDocValues();
-            return new SortedSetOrdinalsIndexFieldData.Builder(valueFieldType().name(), CoreValuesSourceType.BYTES);
+            if (hasBlobColumns() == false) {
+                return new SortedSetOrdinalsIndexFieldData.Builder(valueFieldType().name(), CoreValuesSourceType.BYTES);
+            }
+            String path = blobPath();
+            if (path == null) {
+                return new FlatObjectBlobObjectIndexFieldData.Builder(name(), blobFieldName(name()), blobNamesFieldName(name()));
+            }
+            return new FlatObjectBlobIndexFieldData.Builder(
+                name(),
+                blobFieldName(rootFieldName),
+                blobNamesFieldName(rootFieldName),
+                rootFieldName,
+                FlatObjectPath.compile(path)
+            );
         }
 
         @Override
@@ -538,12 +678,22 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
 
     private final KeywordFieldType valueFieldType;
     private final KeywordFieldType valueAndPathFieldType;
+    private final boolean writeBlobColumns;
 
     FlatObjectFieldMapper(String simpleName, FieldType fieldType, FlatObjectFieldType mappedFieldType) {
         super(simpleName, fieldType, mappedFieldType, CopyTo.empty());
         assert fieldType.indexOptions().compareTo(IndexOptions.DOCS_AND_FREQS) <= 0;
         valueFieldType = mappedFieldType.valueFieldType;
         valueAndPathFieldType = mappedFieldType.valueAndPathFieldType;
+        this.writeBlobColumns = mappedFieldType.hasBlobColumns();
+    }
+
+    public static String blobFieldName(String fieldName) {
+        return fieldName + BLOB_SUFFIX;
+    }
+
+    public static String blobNamesFieldName(String fieldName) {
+        return fieldName + BLOB_NAMES_SUFFIX;
     }
 
     @Override
@@ -569,10 +719,11 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         }
     }
 
-    /**
-     * Parses the flat_object field value and returns the collected path parts,
-     * or {@code null} if the field should be skipped (null value or not searchable/stored/docvalues).
-     */
+    @Override
+    public boolean parsesArrayValue() {
+        return writeBlobColumns;
+    }
+
     private HashSet<String> parseObjectPathParts(ParseContext context) throws IOException {
         XContentParser ctxParser = context.parser();
         if (fieldType().isSearchable() == false && fieldType().isStored() == false && fieldType().hasDocValues() == false) {
@@ -583,6 +734,11 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         if (ctxParser.currentToken() == XContentParser.Token.VALUE_NULL) {
             return null;
         }
+        if (ctxParser.currentToken() == XContentParser.Token.START_ARRAY) {
+            throw new MapperParsingException(
+                "flat_object field [" + name() + "] does not support a top-level array when Variant doc values are enabled"
+            );
+        }
         if (ctxParser.currentToken() != XContentParser.Token.START_OBJECT) {
             throw new ParsingException(
                 ctxParser.getTokenLocation(),
@@ -590,15 +746,48 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             );
         }
 
-        assert ctxParser.currentToken() == XContentParser.Token.START_OBJECT;
-        ctxParser.nextToken();
+        DeferredVariantBuilder variantBuilder = writeBlobColumns ? new DeferredVariantBuilder() : null;
 
         LinkedList<String> path = new LinkedList<>(Collections.singleton(fieldType().name()));
         HashSet<String> pathParts = new HashSet<>();
+        if (variantBuilder != null) {
+            variantBuilder.startObject();
+        }
+        ctxParser.nextToken();
         while (ctxParser.currentToken() != XContentParser.Token.END_OBJECT) {
-            parseToken(ctxParser, context, path, pathParts);
+            parseToken(ctxParser, context, path, pathParts, variantBuilder);
+        }
+        if (variantBuilder != null) {
+            variantBuilder.endObject();
+        }
+
+        if (variantBuilder != null) {
+            writeVariantBlob(context, variantBuilder);
         }
         return pathParts;
+    }
+
+    private void writeVariantBlob(ParseContext context, DeferredVariantBuilder variantBuilder) {
+        if (variantBuilder.isUnencodable()) {
+            writeBlobColumns(context, null);
+            return;
+        }
+        if (variantBuilder.dictionarySize() > MAX_KEYS_PER_DOCUMENT) {
+            writeBlobColumns(context, null);
+            return;
+        }
+
+        final DeferredVariantBuilder.EncodedValue encoded;
+        try {
+            encoded = variantBuilder.finish();
+        } catch (IllegalStateException e) {
+            throw new MapperParsingException("failed to encode [" + name() + "] as a Variant blob: " + e.getMessage(), e);
+        }
+        if (encoded == null) {
+            writeBlobColumns(context, null);
+            return;
+        }
+        writeBlobColumns(context, encoded);
     }
 
     private void createPathFields(ParseContext context, HashSet<String> pathParts) {
@@ -622,6 +811,44 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         }
     }
 
+    private void writeBlobColumns(ParseContext context, DeferredVariantBuilder.EncodedValue encoded) {
+        String namesField = blobNamesFieldName(name());
+        String blobField = blobFieldName(name());
+        IndexableField existing = context.doc().getByKey(blobField);
+        if (existing != null) {
+            ((Field) existing).setBytesValue(new BytesRef(UNAVAILABLE_VALUE));
+            return;
+        }
+        if (encoded == null) {
+            context.doc().addWithKey(blobField, new BinaryDocValuesField(blobField, new BytesRef(UNAVAILABLE_VALUE)));
+            return;
+        }
+
+        for (byte[] keyBytes : encoded.sortedKeyBytes()) {
+            context.doc().add(new SortedSetDocValuesField(namesField, new BytesRef(keyBytes)));
+        }
+        context.doc().addWithKey(blobField, new BinaryDocValuesField(blobField, new BytesRef(encoded.valueBytes())));
+    }
+
+    /**
+     * The value bytes written for a document whose value could not be encoded: a Variant null.
+     *
+     * <p>Null rather than an empty object, because the two must not be confused. {@code {}} is a value a user can index and
+     * a script must see as a present, empty map; a document that landed here has a value that simply is not in the column.
+     * Writing an empty object for it would make {@code doc['attributes'].value} return {@code {}} for both, so a reader
+     * could not tell "this document's value is empty" from "this document's value is not here".
+     *
+     * <p>A root null is not otherwise reachable: {@code parseObjectPathParts} accepts only an object or an array at the top,
+     * so no document encodes one, which is what makes it usable as a sentinel. Every reader treats it as missing.
+     */
+    private static final byte[] UNAVAILABLE_VALUE = unavailableValue();
+
+    private static byte[] unavailableValue() {
+        VariantBuilder builder = new VariantBuilder(8);
+        builder.appendNull();
+        return builder.finish().valueBytes();
+    }
+
     private static String getDVPrefix(String rootFieldName) {
         return rootFieldName + DOT_SYMBOL;
     }
@@ -630,29 +857,56 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
         return path + EQUAL_SYMBOL;
     }
 
-    private void parseToken(XContentParser parser, ParseContext context, Deque<String> path, HashSet<String> pathParts) throws IOException {
+    private void parseToken(
+        XContentParser parser,
+        ParseContext context,
+        Deque<String> path,
+        HashSet<String> pathParts,
+        DeferredVariantBuilder variantBuilder
+    ) throws IOException {
         if (parser.currentToken() == XContentParser.Token.FIELD_NAME) {
             final String currentFieldName = parser.currentName();
+            if (variantBuilder != null) {
+                variantBuilder.appendKey(currentFieldName);
+            }
             path.addLast(currentFieldName); // Pushing onto the stack *must* be matched by pop
             parser.nextToken(); // advance to the value of fieldName
-            parseToken(parser, context, path, pathParts); // parse the value for fieldName (which will be an array, an object,
-            // or a primitive value)
+            parseToken(parser, context, path, pathParts, variantBuilder); // parse the value for fieldName (which will be an array,
+            // an object, or a primitive value)
             path.removeLast(); // Here is where we pop fieldName from the stack (since we're done with the value of fieldName)
             // Note that whichever other branch we just passed through has already ended with nextToken(), so we
             // don't need to call it.
         } else if (parser.currentToken() == XContentParser.Token.START_ARRAY) {
+            if (variantBuilder != null) {
+                variantBuilder.startArray();
+            }
             parser.nextToken();
             while (parser.currentToken() != XContentParser.Token.END_ARRAY) {
-                parseToken(parser, context, path, pathParts);
+                parseToken(parser, context, path, pathParts, variantBuilder);
+            }
+            if (variantBuilder != null) {
+                variantBuilder.endArray();
             }
             parser.nextToken();
         } else if (parser.currentToken() == XContentParser.Token.START_OBJECT) {
+            if (variantBuilder != null) {
+                variantBuilder.startObject();
+            }
             parser.nextToken();
             while (parser.currentToken() != XContentParser.Token.END_OBJECT) {
-                parseToken(parser, context, path, pathParts);
+                parseToken(parser, context, path, pathParts, variantBuilder);
+            }
+            if (variantBuilder != null) {
+                variantBuilder.endObject();
             }
             parser.nextToken();
         } else {
+            // Appended before the term-building logic below, which skips nulls and over-long values. The blob is a
+            // faithful copy of the value, so it must record what the terms drop; otherwise the two stores would disagree
+            // for reasons unrelated to where the value lives.
+            if (variantBuilder != null) {
+                appendScalar(parser, variantBuilder);
+            }
             String value = parseValue(parser);
             if (value == null || value.length() > fieldType().ignoreAbove) {
                 parser.nextToken();
@@ -687,10 +941,69 @@ public final class FlatObjectFieldMapper extends DynamicKeyFieldMapper {
             case VALUE_STRING:
             case VALUE_NULL:
                 return parser.textOrNull();
-            // Handle other token types as needed
             default:
                 throw new ParsingException(parser.getTokenLocation(), "Unexpected value token type [" + parser.currentToken() + "]");
         }
+    }
+
+    private static void appendScalar(XContentParser parser, DeferredVariantBuilder variantBuilder) throws IOException {
+        switch (parser.currentToken()) {
+            case VALUE_NULL:
+                variantBuilder.appendNull();
+                break;
+            case VALUE_BOOLEAN:
+                variantBuilder.appendBoolean(parser.booleanValue());
+                break;
+            case VALUE_STRING:
+                variantBuilder.appendString(parser.text());
+                break;
+            case VALUE_NUMBER:
+                switch (parser.numberType()) {
+                    case INT:
+                    case LONG:
+                        variantBuilder.appendLong(parser.longValue());
+                        break;
+                    case FLOAT:
+                        variantBuilder.appendFloat(parser.floatValue());
+                        break;
+                    case BIG_INTEGER:
+                        BigInteger big = new BigInteger(parser.text());
+                        if (VariantBuilder.canRepresentExactly(big)) {
+                            variantBuilder.appendBigInteger(big);
+                        } else {
+                            markUnencodable(variantBuilder);
+                        }
+                        break;
+                    case BIG_DECIMAL:
+                        BigDecimal decimal = new BigDecimal(parser.text());
+                        if (VariantBuilder.canRepresentExactly(decimal)) {
+                            variantBuilder.appendBigDecimal(decimal);
+                        } else {
+                            markUnencodable(variantBuilder);
+                        }
+                        break;
+                    case DOUBLE:
+                        variantBuilder.appendDouble(parser.doubleValue());
+                        break;
+                    default:
+                        variantBuilder.appendDouble(parser.doubleValue());
+                        break;
+                }
+                break;
+            default:
+                throw new ParsingException(parser.getTokenLocation(), "Unexpected value token type [" + parser.currentToken() + "]");
+        }
+    }
+
+    /**
+     * Flags the value as unencodable and appends a null in its place.
+     *
+     * <p>The null keeps the tree well-formed so the walk can finish -- the terms still have to be written -- while the flag
+     * is what stops those bytes ever being stored as the document's value.
+     */
+    private static void markUnencodable(DeferredVariantBuilder variantBuilder) {
+        variantBuilder.markUnencodable();
+        variantBuilder.appendNull();
     }
 
     @Override
