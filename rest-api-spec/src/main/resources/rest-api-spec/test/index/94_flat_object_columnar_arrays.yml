@@ -1,0 +1,244 @@
+---
+# A flat_object whose value is an array of objects.
+#
+# flat_object has always accepted this, flattening every element into the same term set. One doc-values column per
+# document cannot take an element at a time, so the whole array is encoded as a Variant array and the read path
+# descends it. Pinned here: such a document still indexes, its terms are still searchable, and its values are now
+# readable from the column too.
+#
+# Three shards, for the same reason as 93.
+
+setup:
+  - skip:
+      version: " - 3.8.99"
+      reason: "flat_object values became readable from a doc-values column in 3.9.0"
+
+  - do:
+      indices.create:
+        index: flat_object_arrays
+        body:
+          settings:
+            number_of_shards: 3
+            number_of_replicas: 0
+          mappings:
+            properties:
+              attributes:
+                type: "flat_object"
+
+  - do:
+      bulk:
+        refresh: true
+        index: flat_object_arrays
+        body: |
+          {"index":{"_id":"1"}}
+          {"attributes":[{"status":200,"host":"a"},{"status":500,"code":404}]}
+          {"index":{"_id":"2"}}
+          {"attributes":[{"status":300}]}
+          {"index":{"_id":"3"}}
+          {"attributes":{"status":100,"spans":[{"ms":40},{"ms":10}]}}
+          {"index":{"_id":"4"}}
+          {"attributes":[]}
+          {"index":{"_id":"5"}}
+          {"attributes":[{"status":50},[{"status":25}]]}
+          {"index":{"_id":"6"}}
+          {"attributes":[{"host":"a","status":200},{"host":"b","status":500}]}
+
+---
+"Every element of the array contributes":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.status
+            counted:
+              value_count:
+                field: attributes.status
+            lowest:
+              min:
+                field: attributes.status
+            highest:
+              max:
+                field: attributes.status
+
+  - match: { aggregations.total.value: 1875.0 }
+  - match: { aggregations.counted.value: 8 }
+  # min and max catch ordering: MultiValueMode takes the first and last value of each document, so a document whose
+  # elements arrived out of order would report the wrong one.
+  - match: { aggregations.lowest.value: 25.0 }
+  - match: { aggregations.highest.value: 500.0 }
+
+---
+"A key only the second element has":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.code
+            counted:
+              value_count:
+                field: attributes.code
+
+  - match: { aggregations.total.value: 404.0 }
+  - match: { aggregations.counted.value: 1 }
+
+---
+"An array of objects inside the value":
+  # The write path always encoded this faithfully; the read path used to stop at the array and report the path absent,
+  # while a search for the same path matched. Two stores disagreeing with no error, so it is pinned.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.spans.ms
+            counted:
+              value_count:
+                field: attributes.spans.ms
+            lowest:
+              min:
+                field: attributes.spans.ms
+            highest:
+              max:
+                field: attributes.spans.ms
+
+  - match: { aggregations.total.value: 50.0 }
+  - match: { aggregations.counted.value: 2 }
+  - match: { aggregations.lowest.value: 10.0 }
+  - match: { aggregations.highest.value: 40.0 }
+
+---
+"Terms from every element are still searchable":
+  # The field's terms for such a document are exactly what they were before, so a query against a key that only the
+  # second element carries still matches it.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          query:
+            term:
+              attributes.code: 404
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "1" }
+
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          query:
+            term:
+              attributes.status: 25
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "5" }
+
+---
+"An empty array indexes no value at all":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          query:
+            exists:
+              field: attributes
+
+  - match: { hits.total: 5 }
+
+---
+"A script reads the array as the union of its elements":
+  # doc['attributes'] is typed as a map and the field's terms record nothing about which element a key came from, so
+  # the view is the union and a repeated key resolves to its first occurrence.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          size: 0
+          derived:
+            key_count:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { emit(a.size()); }"
+            first_status:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null && a.containsKey('status')) { emit(a['status']); }"
+          aggs:
+            keys:
+              sum:
+                field: key_count
+            statuses:
+              sum:
+                field: first_status
+
+  - match: { aggregations.keys.value: 9.0 }
+  - match: { aggregations.statuses.value: 850.0 }
+
+---
+"A key in one element, aggregated over the whole document":
+  # Document 6 has two elements whose fields belong together. Every element's values are indexed and readable.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          query:
+            term:
+              attributes.host: "b"
+
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "6" }
+
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          size: 0
+          query:
+            term:
+              attributes.host: "b"
+          aggs:
+            total:
+              sum:
+                field: attributes.status
+
+  # Both elements of the matched document contribute, 200 and 500, even though only one of them carries host "b".
+  - match: { aggregations.total.value: 700.0 }
+
+---
+"Element boundaries are not preserved":
+  # flat_object flattens an array of objects into one term set, so nothing records which element a value came from, and a
+  # query for two keys that never co-occur in the same element matches anyway. Unchanged behaviour -- the same terms are
+  # written today -- pinned so it is a contract rather than a surprise.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_arrays
+        body:
+          query:
+            bool:
+              must:
+                - term: { attributes.host: "b" }
+                - term: { attributes.status: 200 }
+
+  # Document 6 has host "b" and status 200, but in different elements.
+  - match: { hits.total: 1 }
+  - match: { hits.hits.0._id: "6" }

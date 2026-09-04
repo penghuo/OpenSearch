@@ -1,0 +1,329 @@
+---
+# Aggregating and sorting a flat_object subfield directly, with no derived field and no script.
+#
+# Three shards deliberately: an aggregation ships its DocValueFormat to the coordinator only when there is more than
+# one shard to reduce, so a single-shard test would pass while the feature was broken for every real cluster.
+
+setup:
+  - skip:
+      version: " - 3.8.99"
+      reason: "flat_object values became readable from a doc-values column in 3.9.0"
+
+  - do:
+      indices.create:
+        index: flat_object_columnar
+        body:
+          settings:
+            number_of_shards: 3
+            number_of_replicas: 0
+          mappings:
+            properties:
+              attributes:
+                type: "flat_object"
+
+  - do:
+      bulk:
+        refresh: true
+        index: flat_object_columnar
+        body: |
+          {"index":{"_id":"1"}}
+          {"attributes":{"status":200,"code":200,"ports":[443,80],"k8s.namespace":"ns-a","nested":{"deep":{"value":11}}}}
+          {"index":{"_id":"2"}}
+          {"attributes":{"status":300,"code":404,"ports":[[8080,22],1],"k8s.namespace":"ns-b","nested":{"deep":{"value":22}}}}
+          {"index":{"_id":"3"}}
+          {"attributes":{"status":400,"code":"OK","k8s.namespace":"ns-a"}}
+          {"index":{"_id":"4"}}
+          {"attributes":{"status":500,"code":"FAIL","k8s.namespace":"ns-b"}}
+          {"index":{"_id":"5"}}
+          {"attributes":{"status":600,"code":"500","k8s.namespace":"ns-a"}}
+
+---
+"Aggregate a subfield with no script":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.status
+            mean:
+              avg:
+                field: attributes.status
+            lowest:
+              min:
+                field: attributes.status
+            highest:
+              max:
+                field: attributes.status
+            counted:
+              value_count:
+                field: attributes.status
+
+  - match: { aggregations.total.value: 2000.0 }
+  - match: { aggregations.mean.value: 400.0 }
+  - match: { aggregations.lowest.value: 200.0 }
+  - match: { aggregations.highest.value: 600.0 }
+  - match: { aggregations.counted.value: 5 }
+
+---
+"Group by a string subfield":
+  # value_type is required for a path holding words, because the column is schemaless and the field reports itself as
+  # numeric -- which is what makes sum/avg/min/max and numeric sort work with no hint. Its absence is pinned below.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            by_namespace:
+              terms:
+                field: attributes.k8s.namespace
+                value_type: string
+                size: 10
+              aggs:
+                total:
+                  sum:
+                    field: attributes.status
+
+  - length: { aggregations.by_namespace.buckets: 2 }
+  - match: { aggregations.by_namespace.buckets.0.key: "ns-a" }
+  - match: { aggregations.by_namespace.buckets.0.doc_count: 3 }
+  - match: { aggregations.by_namespace.buckets.0.total.value: 1200.0 }
+  - match: { aggregations.by_namespace.buckets.1.key: "ns-b" }
+  - match: { aggregations.by_namespace.buckets.1.doc_count: 2 }
+  - match: { aggregations.by_namespace.buckets.1.total.value: 800.0 }
+
+---
+"Grouping a string subfield without value_type finds nothing":
+  # Words through a numeric values source coerce to nothing, so the result is empty rather than an error -- the same
+  # thing a terms aggregation on a declared numeric field does when handed words.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            by_namespace:
+              terms:
+                field: attributes.k8s.namespace
+                size: 10
+
+  - length: { aggregations.by_namespace.buckets: 0 }
+
+---
+"Aggregate a nested path":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.nested.deep.value
+
+  - match: { aggregations.total.value: 33.0 }
+
+---
+"A mixed-type path returns a partial answer rather than failing":
+  # One unreadable value must not fail an aggregation over the whole index, so the request succeeds, the sum covers
+  # only what could be read as a number, and value_count against hits.total is how the gap is reported. A warning
+  # header is not an option: a slice worker's response headers are never merged back, and concurrent segment search is
+  # on by default for aggregations, so it would appear only sometimes.
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          query:
+            exists:
+              field: attributes
+          aggs:
+            total:
+              sum:
+                field: attributes.code
+            counted:
+              value_count:
+                field: attributes.code
+
+  - match: { hits.total: 5 }
+  - match: { aggregations.total.value: 1104.0 }
+  - match: { aggregations.counted.value: 3 }
+
+---
+"An array contributes every element":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.ports
+            counted:
+              value_count:
+                field: attributes.ports
+            highest:
+              max:
+                field: attributes.ports
+            lowest:
+              min:
+                field: attributes.ports
+
+  - match: { aggregations.total.value: 8626.0 }
+  - match: { aggregations.counted.value: 5 }
+  # min and max catch ordering: MultiValueMode takes the first and last value of each document, so these are only
+  # right if expanded values are emitted ascending rather than in document order.
+  - match: { aggregations.highest.value: 8080.0 }
+  - match: { aggregations.lowest.value: 1.0 }
+
+---
+"Sort by a subfield":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 5
+          _source: false
+          sort:
+            - attributes.status:
+                order: desc
+                numeric_type: long
+
+  - match: { hits.total: 5 }
+  - match: { hits.hits.0._id: "5" }
+  - match: { hits.hits.1._id: "4" }
+  - match: { hits.hits.2._id: "3" }
+  - match: { hits.hits.3._id: "2" }
+  - match: { hits.hits.4._id: "1" }
+
+---
+"A path no document has yields nothing rather than failing":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          aggs:
+            total:
+              sum:
+                field: attributes.no_such_key
+            counted:
+              value_count:
+                field: attributes.no_such_key
+
+  - match: { aggregations.total.value: 0.0 }
+  - match: { aggregations.counted.value: 0 }
+
+---
+"docvalue_fields returns the bare value":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 1
+          query:
+            term:
+              _id: "1"
+          docvalue_fields: ["attributes.status"]
+
+  - match: { hits.hits.0.fields.attributes\.status: ["200"] }
+
+---
+"A script reads one key without reconstructing the object":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          derived:
+            status_from_script:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { def s = a['status']; if (s != null) { emit(((Number)s).longValue()); } }"
+          aggs:
+            total:
+              sum:
+                field: status_from_script
+
+  - match: { aggregations.total.value: 2000.0 }
+
+---
+"A script reads a nested path and a dotted key":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          derived:
+            deep_from_script:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { def n = a['nested']; if (n != null) { def d = n['deep']; if (d != null) { def v = d['value']; if (v != null) { emit(((Number)v).longValue()); } } } }"
+            ns_from_script:
+              type: keyword
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { def n = a['k8s.namespace']; if (n != null) { emit(String.valueOf(n)); } }"
+          aggs:
+            deep_total:
+              sum:
+                field: deep_from_script
+            by_ns:
+              terms:
+                field: ns_from_script
+                size: 10
+
+  - match: { aggregations.deep_total.value: 33.0 }
+  - length: { aggregations.by_ns.buckets: 2 }
+  - match: { aggregations.by_ns.buckets.0.key: "ns-a" }
+  - match: { aggregations.by_ns.buckets.0.doc_count: 3 }
+
+---
+"Enumerating the object is what pays for key names":
+  - do:
+      search:
+        rest_total_hits_as_int: true
+        index: flat_object_columnar
+        body:
+          size: 0
+          derived:
+            key_count:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { emit(a.size()); }"
+            has_status:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null && a.containsKey('status')) { emit(1); }"
+            name_length_total:
+              type: long
+              script:
+                source: "def a = doc['attributes'].value; if (a != null) { long t = 0; for (e in a.entrySet()) { t += e.getKey().length(); } emit(t); }"
+          aggs:
+            keys:
+              sum:
+                field: key_count
+            with_status:
+              sum:
+                field: has_status
+            name_lengths:
+              sum:
+                field: name_length_total
+
+  - match: { aggregations.keys.value: 19.0 }
+  - match: { aggregations.with_status.value: 5.0 }
+  - match: { aggregations.name_lengths.value: 137.0 }
