@@ -54,6 +54,7 @@ import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettin
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.fielddata.IndexFieldDataService;
 import org.opensearch.index.mapper.FieldMapper;
+import org.opensearch.index.mapper.FlatObjectFieldMapper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.index.store.FsDirectoryFactory;
@@ -208,6 +209,7 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 MapperService.INDEX_MAPPING_DEPTH_LIMIT_SETTING,
                 MapperService.INDEX_MAPPING_FIELD_NAME_LENGTH_LIMIT_SETTING,
                 MapperService.INDEX_MAPPING_DYNAMIC_PROPERTIES_LUCENE_FIELD_LIMIT_SETTING,
+                FlatObjectFieldMapper.INDEX_FLAT_OBJECT_VARIANT_DOC_VALUES_SETTING,
                 IndicesBitsetFilterCache.INDEX_LOAD_RANDOM_ACCESS_FILTERS_EAGERLY_SETTING,
                 IndexModule.INDEX_STORE_TYPE_SETTING,
                 IndexModule.INDEX_COMPOSITE_STORE_TYPE_SETTING,

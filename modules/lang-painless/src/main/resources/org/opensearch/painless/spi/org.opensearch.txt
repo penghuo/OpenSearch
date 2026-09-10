@@ -106,6 +106,20 @@ class org.opensearch.index.fielddata.ScriptDocValues$GeoPoints {
   double geohashDistanceWithDefault(String,double)
 }
 
+#### A flat_object's whole value. getValue() is declared as Map, so doc['attributes'].value['status'] dispatches through
+#### java.util.Map and needs nothing else allowed here.
+class org.opensearch.index.mapper.flatobject.FlatObjectScriptDocValues {
+  Map get(int)
+  Map getValue()
+}
+
+#### One path inside a flat_object, e.g. doc['attributes.events{}.status']. The value keeps its JSON type, so it is declared
+#### as def: a Long here, a String there, a List for a wildcard or an array, a Map for an object.
+class org.opensearch.index.mapper.flatobject.FlatObjectPathScriptDocValues {
+  def get(int)
+  def getValue()
+}
+
 class org.opensearch.index.fielddata.ScriptDocValues$Booleans {
   Boolean get(int)
   boolean getValue()
